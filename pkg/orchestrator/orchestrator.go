@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/pkg/api/v1"
@@ -36,6 +37,9 @@ type orchestrator struct {
 
 	// httpServer is the underlying HTTP server that handles WebSocket upgrades and SSE connections.
 	httpServer *http.Server
+
+	// globalProbingRatePSPA is the current target probing rate (probes/second/agent).
+	globalProbingRatePSPA atomic.Uint64
 }
 
 // Run starts the orchestrator HTTP server and blocks until the context is cancelled or an unrecoverable error occurs.
@@ -73,11 +77,14 @@ func Run(parent context.Context, address string) error {
 			},
 		},
 	}
+	// Set the initial probing rate as 1 pspa.
+	o.globalProbingRatePSPA.Store(1)
 
 	// Adding handlers here.
 	mux.HandleFunc("/generator", o.handleGenerator)
 	mux.HandleFunc("/agent", o.handleAgent)
 	mux.HandleFunc("/stream", o.handleStream)
+	mux.HandleFunc("/settings/global_probing_rate", o.handleGlobalProbingRate)
 
 	// Start the HTTP server in a separate goroutine.
 	g.Go(func() error {
@@ -138,6 +145,8 @@ func (o *orchestrator) handleGenerator(w http.ResponseWriter, r *http.Request) {
 	log.Printf("generator %s connected", generatorID)
 
 	g, ctx := errgroup.WithContext(r.Context())
+
+	o.notifyGenerators(ctx)
 
 	// Goroutine: Send settings updates to the generator.
 	g.Go(func() error {
@@ -224,6 +233,9 @@ func (o *orchestrator) handleAgent(w http.ResponseWriter, r *http.Request) {
 	log.Printf("agent %s connected", agentID)
 
 	g, ctx := errgroup.WithContext(r.Context())
+
+	o.notifyGenerators(ctx)
+	defer o.notifyGenerators(ctx)
 
 	// Goroutine: Send probing directives to the agent.
 	g.Go(func() error {
@@ -325,4 +337,99 @@ func (o *orchestrator) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("client %s disconnected", clientID)
+}
+
+// handleGlobalProbingRate serves the global probing rate configuration endpoint.
+//
+// Route:
+//   - GET  /settings/global_probing_rate
+//   - POST /settings/global_probing_rate
+//
+// Semantics:
+//   - GET returns the currently configured probing rate as JSON.
+//   - POST validates and persists a new probing rate, then publishes an updated
+//     SystemStatus snapshot to all connected generators.
+//
+// Concurrency:
+//   - The probing rate is stored in an atomic, so reads/writes are lock-free and
+//     safe under concurrent access.
+//   - Generator notification is best-effort with respect to client connectivity;
+//     if a generator disconnects during broadcast, that should not crash the server.
+//
+// Input validation:
+//   - The POST body must be valid JSON and must not contain unknown fields.
+//   - This handler intentionally does not enforce authentication/authorization yet.
+//
+// Responses:
+//   - 200 OK with a JSON body on success.
+//   - 400 Bad Request for invalid JSON payloads.
+//   - 405 Method Not Allowed for unsupported methods (with an Allow header).
+func (o *orchestrator) handleGlobalProbingRate(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			GlobalProbingRatePSPA uint `json:"global_probing_rate_pspa"`
+		}{
+			GlobalProbingRatePSPA: uint(o.globalProbingRatePSPA.Load()),
+		})
+		return
+
+	case http.MethodPost:
+		var req struct {
+			GlobalProbingRatePSPA uint `json:"global_probing_rate_pspa"`
+		}
+
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+
+		o.globalProbingRatePSPA.Store(uint64(req.GlobalProbingRatePSPA))
+
+		if err := o.notifyGenerators(r.Context()); err != nil {
+			log.Printf("failed not notify at least one generator")
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(req)
+		return
+
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+}
+
+// notifyGenerators publishes the current SystemStatus snapshot to all generators.
+//
+// This method is used after settings changes so generators can immediately adapt their directive generation to the new
+// configuration and current agent population.
+//
+// Cancellation:
+//   - The provided context controls how long the broadcast may block. If ctx is cancelled, Broadcast may return
+//     ctx.Err(); this is treated as a non-error because shutdown / client disconnect paths commonly cancel contexts.
+//
+// Returns
+//   - nil when the generators are notified.
+//   - ctx.Err() if the context is cancelled.
+//   - ErrQueueClosed when the pdQueue is closed
+//   - ErrSubscriberDoesNotExist at least one of the generators are disconnected.
+func (o *orchestrator) notifyGenerators(ctx context.Context) error {
+	ids, err := o.pdQueue.GetIDs()
+	if err != nil {
+		return err
+	}
+
+	status := &api.SystemStatus{
+		GlobalProbingRatePSPA: uint(o.globalProbingRatePSPA.Load()),
+		ActiveAgentIDs:        ids,
+	}
+	if err := o.settingsQueue.Broadcast(ctx, status); err != nil && err != ctx.Err() {
+		return err
+	}
+	return nil
 }
