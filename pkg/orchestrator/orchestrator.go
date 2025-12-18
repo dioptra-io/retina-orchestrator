@@ -11,23 +11,22 @@ import (
 	"time"
 
 	"github.com/dioptra-io/retina-commons/pkg/api/v1"
+	settings "github.com/dioptra-io/retina-orchestrator/pkg/api"
+	"github.com/dioptra-io/retina-orchestrator/pkg/queue"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
 )
 
-type settings struct {
-	ProbingRate uint `json:"probing_rate"`
-}
+var (
+	ErrDisconnected          = errors.New("disconnected")
+	ErrStreamingNotSupported = errors.New("streaming not supported")
+)
 
 type orchestrator struct {
-	connectedAgents     *set[string]
-	connectedClients    *set[string]
-	connectedGenerators *set[string]
-	agentQueue          *queue[*api.ProbingDirective]
-	clientBroadcaster   *broadcaster[*api.ForwardingInfoElement]
-	settingsBroadcaster *broadcaster[*settings]
-
-	httpServer *http.Server
+	pdQueue       *queue.Queue[api.ProbingDirective]
+	fieQueue      *queue.Queue[api.ForwardingInfoElement]
+	settingsQueue *queue.Queue[settings.Settings]
+	httpServer    *http.Server
 }
 
 func Run(parent context.Context, address string) error {
@@ -35,12 +34,9 @@ func Run(parent context.Context, address string) error {
 
 	mux := http.NewServeMux()
 	o := &orchestrator{
-		connectedAgents:     newSet[string](),
-		connectedClients:    newSet[string](),
-		connectedGenerators: newSet[string](),
-		agentQueue:          newQueue[*api.ProbingDirective](ctx, 1024),
-		clientBroadcaster:   newBroadcaster[*api.ForwardingInfoElement](ctx, true),
-		settingsBroadcaster: newBroadcaster[*settings](ctx, true),
+		pdQueue:       queue.NewQueue[api.ProbingDirective](1024),
+		settingsQueue: queue.NewQueue[settings.Settings](1024),
+		fieQueue:      queue.NewQueue[api.ForwardingInfoElement](1024),
 		httpServer: &http.Server{
 			Addr:    address,
 			Handler: mux,
@@ -86,31 +82,25 @@ func (o *orchestrator) handleGenerator(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	generatorID := uuid.New().String()
-	o.connectedGenerators.Add(generatorID)
-	defer o.connectedGenerators.Remove(generatorID)
+	if err := o.settingsQueue.SubscribeWithID(generatorID); err != nil {
+		log.Printf("failed to register generator %s to settings queue: %v", generatorID, err)
+		return
+	}
+	defer o.settingsQueue.Unsubscribe(generatorID)
+
 	log.Printf("generator %s connected", generatorID)
 
 	g, ctx := errgroup.WithContext(r.Context())
 
 	g.Go(func() error {
-		settingsChan, err := o.settingsBroadcaster.Subscribe(ctx, 1024)
-		if err != nil {
-			return err
-		}
-
 		for {
-			select {
-			case <-ctx.Done():
-				return nil
+			settings, err := o.settingsQueue.Get(ctx, generatorID)
+			if err != nil {
+				return err
+			}
 
-			case settings, ok := <-settingsChan:
-				if !ok {
-					return nil
-				}
-
-				if err := conn.WriteJSON(settings); err != nil {
-					return err
-				}
+			if err := conn.WriteJSON(settings); err != nil {
+				return ErrDisconnected
 			}
 		}
 	})
@@ -119,7 +109,7 @@ func (o *orchestrator) handleGenerator(w http.ResponseWriter, r *http.Request) {
 		for {
 			_, pdJSONString, err := conn.ReadMessage()
 			if err != nil {
-				return err
+				return ErrDisconnected
 			}
 
 			pd := new(api.ProbingDirective)
@@ -127,18 +117,17 @@ func (o *orchestrator) handleGenerator(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 
-			if !o.connectedAgents.Contains(pd.AgentID) {
-				log.Printf("ignoring the probing directive with an unexisting agent id: %s", pd.AgentID)
-				continue
-			}
-
-			if err := o.agentQueue.Push(ctx, pd.AgentID, pd); err != nil {
+			if err := o.pdQueue.Whisper(ctx, pd.AgentID, pd); err != nil {
+				if err == queue.ErrSubscriberDoesNotExist {
+					log.Printf("generator %s generated pd for a non existing agent, ignoring...", generatorID)
+					continue
+				}
 				return err
 			}
 		}
 	})
 
-	if err := g.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+	if err := g.Wait(); err != nil && err != ctx.Err() && err != ErrDisconnected {
 		log.Printf("generator %s disconnected with error: %v", generatorID, err)
 		return
 	}
@@ -154,22 +143,24 @@ func (o *orchestrator) handleAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	agentID, err := getAgentID(w, r)
-	if err != nil {
+	agentID := r.URL.Query().Get("agent_id")
+	if agentID == "" {
+		log.Println("agent without an agent_id tried to establish connection.")
 		return
 	}
 
-	if ok := o.connectedAgents.Add(agentID); !ok {
+	if err := o.pdQueue.SubscribeWithID(agentID); err != nil {
+		log.Printf("failed to register agent %s to pd queue: %v", agentID, err)
 		return
 	}
-	defer o.connectedAgents.Remove(agentID)
+	defer o.pdQueue.Unsubscribe(agentID)
 	log.Printf("agent %s connected", agentID)
 
 	g, ctx := errgroup.WithContext(r.Context())
 
 	g.Go(func() error {
 		for {
-			pd, err := o.agentQueue.Get(ctx, agentID)
+			pd, err := o.pdQueue.Get(ctx, agentID)
 			if err != nil {
 				return err
 			}
@@ -184,7 +175,7 @@ func (o *orchestrator) handleAgent(w http.ResponseWriter, r *http.Request) {
 		for {
 			_, fieJSONString, err := conn.ReadMessage()
 			if err != nil {
-				return err
+				return ErrDisconnected
 			}
 
 			fie := new(api.ForwardingInfoElement)
@@ -192,13 +183,13 @@ func (o *orchestrator) handleAgent(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 
-			if err := o.clientBroadcaster.Broadcast(ctx, fie); err != nil {
+			if err := o.fieQueue.Broadcast(ctx, fie); err != nil {
 				return err
 			}
 		}
 	})
 
-	if err := g.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+	if err := g.Wait(); err != nil && err != ctx.Err() && err != ErrDisconnected {
 		log.Printf("agent %s disconnected with error: %v", agentID, err)
 		return
 	}
@@ -215,37 +206,36 @@ func (o *orchestrator) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	clientID := uuid.New().String()
 
-	if ok := o.connectedClients.Add(clientID); !ok {
+	if err := o.fieQueue.SubscribeWithID(clientID); err != nil {
+		log.Printf("failed to register client %s to fie queue: %v", clientID, err)
 		return
 	}
-	defer o.connectedClients.Remove(clientID)
-	defer log.Printf("client %s disconnected", clientID)
+	defer o.fieQueue.Unsubscribe(clientID)
 	log.Printf("client %s connected", clientID)
 
-	ctx := r.Context()
+	g, ctx := errgroup.WithContext(r.Context())
 
-	clientChan, err := o.clientBroadcaster.Subscribe(ctx, 1024)
-	if err != nil {
-		return
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case fie, ok := <-clientChan:
-			if !ok {
-				return
+	g.Go(func() error {
+		for {
+			fie, err := o.fieQueue.Get(ctx, clientID)
+			if err != nil {
+				return err
 			}
 
 			fieJSONBytes, err := json.Marshal(fie)
 			if err != nil {
-				return
+				return err
 			}
 
 			fmt.Fprintf(w, "%s\n", string(fieJSONBytes))
 			f.Flush()
 		}
+	})
+
+	if err := g.Wait(); err != nil && err != ctx.Err() {
+		log.Printf("client %s disconnected with error: %v", clientID, err)
+		return
 	}
 
+	log.Printf("client %s disconnected", clientID)
 }

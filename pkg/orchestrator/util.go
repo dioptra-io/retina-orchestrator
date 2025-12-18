@@ -30,13 +30,3 @@ func upgradeToSSE(w http.ResponseWriter, _ *http.Request) (http.Flusher, error) 
 	}
 	return flusher, nil
 }
-
-func getAgentID(w http.ResponseWriter, r *http.Request) (string, error) {
-	// agentID := r.Header.Get("agent_id")
-	agentID := r.URL.Query().Get("agent_id")
-	if agentID == "" {
-		return "", ErrAgentIDMissing
-	}
-
-	return agentID, nil
-}
