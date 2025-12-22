@@ -4,6 +4,8 @@ package orchestrator
 
 import (
 	"errors"
+	"math"
+	"net"
 	"net/http"
 
 	"github.com/gorilla/websocket"
@@ -53,4 +55,51 @@ func upgradeToSSE(w http.ResponseWriter, _ *http.Request) (http.Flusher, error) 
 		return nil, ErrStreamingNotSupported
 	}
 	return flusher, nil
+}
+
+// castJSONValueToUInt is used my the set settings handler, it expects a decoded value from a json reader. Since the JSON decoder
+// returns float64 for all number types this is the type we expects. Do not use this function somewhere else.
+func castJSONValueToUInt(v any) (uint, bool) {
+	f, ok := v.(float64)
+	if !ok {
+		return 0, false
+	}
+
+	// Must be non-negative and integral
+	if f < 0 || f != math.Trunc(f) {
+		return 0, false
+	}
+
+	// Protect against overflow on 32-bit systems
+	if f > float64(^uint(0)) {
+		return 0, false
+	}
+
+	return uint(f), true
+}
+
+// castJSONValueToIPArray casets the JSON decoded value to an array of IP addresses, it expects to receive a JSON array of
+// strings, where each string is an IP address, IPv4, IPv4-mapped IPv6 or IPv6. Do not use this function somewhere else.
+func castJSONValueToIPArray(v any) ([]net.IP, bool) {
+	raw, ok := v.([]any)
+	if !ok {
+		return nil, false
+	}
+
+	addrs := make([]net.IP, 0, len(raw))
+	for _, elem := range raw {
+		s, ok := elem.(string)
+		if !ok {
+			return nil, false
+		}
+
+		ip := net.ParseIP(s)
+		if ip == nil {
+			return nil, false
+		}
+
+		addrs = append(addrs, ip)
+	}
+
+	return addrs, true
 }

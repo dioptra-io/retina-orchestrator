@@ -5,71 +5,39 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/pkg/api/v1"
-	"github.com/dioptra-io/retina-commons/pkg/queue/v1"
-	"github.com/google/uuid"
+	"github.com/gorilla/mux"
 	"golang.org/x/sync/errgroup"
 )
 
-// orchestrator manages the routing of messages between generators, agents, and streaming clients. It maintains separate
-// queues for each message type and handles the lifecycle of the HTTP server.
-//
-// The orchestrator is not safe for concurrent modification after Run() is called, but handles concurrent connections
-// safely through its internal queue implementations.
 type orchestrator struct {
-	// pdQueue holds probing directives waiting to be delivered to specific agents. Messages are routed using the agent
-	// ID as the subscriber identifier.
-	pdQueue *queue.Queue[api.ProbingDirective]
-
-	// fieQueue holds forwarding information elements collected from agents. These are broadcast to all subscribed
-	// streaming clients.
-	fieQueue *queue.Queue[api.ForwardingInfoElement]
-
-	// settingsQueue distributes configuration updates to all connected generators.
-	settingsQueue *queue.Queue[api.SystemStatus]
-
-	// httpServer is the underlying HTTP server that handles WebSocket upgrades and SSE connections.
 	httpServer *http.Server
 
-	// globalProbingRatePSPA is the current target probing rate (probes/second/agent).
-	globalProbingRatePSPA atomic.Uint64
+	currentStatus api.SystemStatus
+	mu            sync.RWMutex
 }
 
-// Run starts the orchestrator HTTP server and blocks until the context is cancelled or an unrecoverable error occurs.
-//
-// The server exposes three endpoints:
-//   - GET /generator: WebSocket endpoint for generator connections
-//   - GET /agent?agent_id=<id>: WebSocket endpoint for agent connections
-//   - GET /stream: SSE endpoint for streaming forwarding information elements
-//
-// When the parent context is cancelled, the server initiates a graceful shutdown with a 1-second timeout, allowing
-// in-flight requests to complete.
-//
-// Parameters:
-//   - parent: Context that controls the server lifecycle. Cancelling this context
-//     triggers a graceful shutdown.
-//   - address: Network address to listen on (e.g., ":8080" or "127.0.0.1:8080")
-//
-// Returns an error if the server fails to start or encounters an error during shutdown. Returns nil if shutdown
-// completes successfully after context cancellation.
 func Run(parent context.Context, address string) error {
 	g, ctx := errgroup.WithContext(parent)
 
-	mux := http.NewServeMux()
+	r := mux.NewRouter()
 	o := &orchestrator{
-		pdQueue:       queue.NewQueue[api.ProbingDirective](1024),
-		settingsQueue: queue.NewQueue[api.SystemStatus](1024),
-		fieQueue:      queue.NewQueue[api.ForwardingInfoElement](1024),
+		// Defult values of the system status us given here, they are defined in the FSD and DSD.
+		currentStatus: api.SystemStatus{
+			GlobalProbingRatePSPA:          1,
+			ProbingImpactLimitMS:           1000,
+			DisallowedDestinationAddresses: []net.IP{},
+			ActiveAgentIDs:                 []string{},
+		},
 		httpServer: &http.Server{
 			Addr:    address,
-			Handler: mux,
+			Handler: r,
 			// BaseContext injects the errgroup context into all request contexts, ensuring handlers are notified when
 			// shutdown begins.
 			BaseContext: func(_ net.Listener) context.Context {
@@ -77,16 +45,20 @@ func Run(parent context.Context, address string) error {
 			},
 		},
 	}
-	// Set the initial probing rate as 1 pspa.
-	o.globalProbingRatePSPA.Store(1)
 
-	// Adding handlers here.
-	mux.HandleFunc("/generator", o.handleGenerator)
-	mux.HandleFunc("/agent", o.handleAgent)
-	mux.HandleFunc("/stream", o.handleStream)
-	mux.HandleFunc("/settings/global_probing_rate", o.handleGlobalProbingRate)
+	// SSE: clients stream FIEs
+	// r.HandleFunc("/stream", o.handleStream).Methods(http.MethodGet)
 
-	// Start the HTTP server in a separate goroutine.
+	// WebSocket: generator streams SS, receives FIEs
+	// r.HandleFunc("/generator", o.handleGenerator).Methods(http.MethodGet)
+
+	// WebSocket: agents stream PDs, receive FIEs
+	// r.HandleFunc("/agent/{id}", o.handleAgent).Methods(http.MethodGet)
+
+	// Admin: settings
+	r.HandleFunc("/settings/{name}", o.handleGetSetting).Methods(http.MethodGet)
+	r.HandleFunc("/settings/{name}", o.handleSetSetting).Methods(http.MethodPut)
+
 	g.Go(func() error {
 		log.Printf("orchestrator listening on %s", o.httpServer.Addr)
 
@@ -96,13 +68,11 @@ func Run(parent context.Context, address string) error {
 		return nil
 	})
 
-	// Wait for context cancellation and initiate graceful shutdown.
 	g.Go(func() error {
 		<-ctx.Done()
 
 		log.Println("orchestrator shutting down")
 
-		// Use a fresh context for shutdown since the parent is already cancelled.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
 
@@ -112,324 +82,83 @@ func Run(parent context.Context, address string) error {
 	return g.Wait()
 }
 
-// handleGenerator manages WebSocket connections from generator clients.
-//
-// Generators are responsible for creating probing directives based on current settings. This handler:
-//  1. Upgrades the HTTP connection to a WebSocket
-//  2. Subscribes the generator to receive settings updates
-//  3. Forwards received probing directives to the appropriate agent queues
-//
-// The handler runs two concurrent goroutines:
-//   - One reads settings from the queue and writes them to the WebSocket
-//   - One reads probing directives from the WebSocket and routes them to agents
-//
-// The connection is closed when either goroutine encounters an error or when the request context is cancelled.
-//
-// Probing directives targeting non-existent agents are logged and discarded rather than causing an error, allowing
-// generators to speculatively target agents that may connect later.
-func (o *orchestrator) handleGenerator(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgradeToWS(w, r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer conn.Close()
+func (o *orchestrator) handleGetSetting(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	var value any
 
-	generatorID := uuid.New().String()
-	if err := o.settingsQueue.SubscribeWithID(generatorID); err != nil {
-		log.Printf("failed to register generator %s to settings queue: %v", generatorID, err)
-		return
-	}
-	defer o.settingsQueue.Unsubscribe(generatorID)
+	switch name {
+	case "global_probing_rate_pspa":
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		value = o.currentStatus.GlobalProbingRatePSPA
 
-	log.Printf("generator %s connected", generatorID)
+	case "probing_impact_limit_ms":
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		value = o.currentStatus.ProbingImpactLimitMS
 
-	g, ctx := errgroup.WithContext(r.Context())
-
-	o.notifyGenerators(ctx)
-
-	// Goroutine: Send settings updates to the generator.
-	g.Go(func() error {
-		for {
-			settings, err := o.settingsQueue.Get(ctx, generatorID)
-			if err != nil {
-				return err
-			}
-
-			if err := conn.WriteJSON(settings); err != nil {
-				return ErrDisconnected
-			}
-		}
-	})
-
-	// Goroutine: Receive probing directives and route to target agents.
-	g.Go(func() error {
-		for {
-			_, pdJSONString, err := conn.ReadMessage()
-			if err != nil {
-				return ErrDisconnected
-			}
-
-			pd := new(api.ProbingDirective)
-			if err := json.Unmarshal(pdJSONString, pd); err != nil {
-				return err
-			}
-
-			// Whisper sends the directive only to the specific agent identified by pd.AgentID. If the agent doesn't
-			// exist, log and continue rather than failing the generator connection.
-			if err := o.pdQueue.Whisper(ctx, pd.AgentID, pd); err != nil {
-				if err == queue.ErrSubscriberDoesNotExist {
-					log.Printf("generator %s generated pd for a non existing agent, ignoring...", generatorID)
-					continue
-				}
-				return err
-			}
-		}
-	})
-
-	if err := g.Wait(); err != nil && err != ctx.Err() && err != ErrDisconnected {
-		log.Printf("generator %s disconnected with error: %v", generatorID, err)
-		return
-	}
-
-	log.Printf("generator %s disconnected", generatorID)
-}
-
-// handleAgent manages WebSocket connections from measurement agent clients.
-//
-// Agents execute probing directives and report forwarding information elements. This handler:
-//  1. Upgrades the HTTP connection to a WebSocket
-//  2. Validates the required agent_id query parameter
-//  3. Subscribes the agent to receive probing directives targeted at its ID
-//  4. Broadcasts received forwarding information elements to all stream subscribers
-//
-// The handler runs two concurrent goroutines:
-//   - One reads probing directives from the queue and writes them to the WebSocket
-//   - One reads forwarding info elements from the WebSocket and broadcasts them
-//
-// The agent_id query parameter is required and must be unique among connected agents. If an agent connects with an ID
-// that is already subscribed, the subscription will fail and the connection will be closed.
-//
-// URL format: /agent?agent_id=<unique-agent-identifier>
-func (o *orchestrator) handleAgent(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgradeToWS(w, r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer conn.Close()
-
-	agentID := r.URL.Query().Get("agent_id")
-	if agentID == "" {
-		log.Println("agent without an agent_id tried to establish connection.")
-		return
-	}
-
-	if err := o.pdQueue.SubscribeWithID(agentID); err != nil {
-		log.Printf("failed to register agent %s to pd queue: %v", agentID, err)
-		return
-	}
-	defer o.pdQueue.Unsubscribe(agentID)
-	log.Printf("agent %s connected", agentID)
-
-	g, ctx := errgroup.WithContext(r.Context())
-
-	o.notifyGenerators(ctx)
-	defer o.notifyGenerators(ctx)
-
-	// Goroutine: Send probing directives to the agent.
-	g.Go(func() error {
-		for {
-			pd, err := o.pdQueue.Get(ctx, agentID)
-			if err != nil {
-				return err
-			}
-
-			if err := conn.WriteJSON(pd); err != nil {
-				return err
-			}
-		}
-	})
-
-	// Goroutine: Receive forwarding info elements and broadcast to all stream clients.
-	g.Go(func() error {
-		for {
-			_, fieJSONString, err := conn.ReadMessage()
-			if err != nil {
-				return ErrDisconnected
-			}
-
-			fie := new(api.ForwardingInfoElement)
-			if err := json.Unmarshal(fieJSONString, fie); err != nil {
-				return err
-			}
-
-			// Broadcast sends the element to all subscribed stream clients.
-			if err := o.fieQueue.Broadcast(ctx, fie); err != nil {
-				return err
-			}
-		}
-	})
-
-	if err := g.Wait(); err != nil && err != ctx.Err() && err != ErrDisconnected {
-		log.Printf("agent %s disconnected with error: %v", agentID, err)
-		return
-	}
-
-	log.Printf("agent %s disconnected", agentID)
-}
-
-// handleStream provides a Server-Sent Events (SSE) endpoint for consuming forwarding information elements in real-time.
-//
-// This handler:
-//  1. Upgrades the HTTP connection to support SSE streaming
-//  2. Subscribes the client to receive all broadcasted forwarding info elements
-//  3. Streams each element as a newline-delimited JSON object
-//
-// The stream remains open until either the client disconnects or the server shuts down. Each forwarding information
-// element is written as a single line of JSON followed by a newline character, then immediately flushed to the client.
-//
-// Output format: One JSON object per line (newline-delimited JSON / NDJSON)
-//
-// Note: This endpoint requires the ResponseWriter to implement http.Flusher. If streaming is not supported, an error
-// is returned during the SSE upgrade.
-func (o *orchestrator) handleStream(w http.ResponseWriter, r *http.Request) {
-	f, err := upgradeToSSE(w, r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	clientID := uuid.New().String()
-
-	if err := o.fieQueue.SubscribeWithID(clientID); err != nil {
-		log.Printf("failed to register client %s to fie queue: %v", clientID, err)
-		return
-	}
-	defer o.fieQueue.Unsubscribe(clientID)
-	log.Printf("client %s connected", clientID)
-
-	g, ctx := errgroup.WithContext(r.Context())
-
-	// Goroutine: Stream forwarding info elements to the client as NDJSON.
-	g.Go(func() error {
-		for {
-			fie, err := o.fieQueue.Get(ctx, clientID)
-			if err != nil {
-				return err
-			}
-
-			fieJSONBytes, err := json.Marshal(fie)
-			if err != nil {
-				return err
-			}
-
-			// Write the JSON line and flush immediately to ensure low-latency delivery. This can be improved by
-			// chunking the fies.
-			fmt.Fprintf(w, "%s\n", string(fieJSONBytes))
-			f.Flush()
-		}
-	})
-
-	if err := g.Wait(); err != nil && err != ctx.Err() {
-		log.Printf("client %s disconnected with error: %v", clientID, err)
-		return
-	}
-
-	log.Printf("client %s disconnected", clientID)
-}
-
-// handleGlobalProbingRate serves the global probing rate configuration endpoint.
-//
-// Route:
-//   - GET  /settings/global_probing_rate
-//   - POST /settings/global_probing_rate
-//
-// Semantics:
-//   - GET returns the currently configured probing rate as JSON.
-//   - POST validates and persists a new probing rate, then publishes an updated
-//     SystemStatus snapshot to all connected generators.
-//
-// Concurrency:
-//   - The probing rate is stored in an atomic, so reads/writes are lock-free and
-//     safe under concurrent access.
-//   - Generator notification is best-effort with respect to client connectivity;
-//     if a generator disconnects during broadcast, that should not crash the server.
-//
-// Input validation:
-//   - The POST body must be valid JSON and must not contain unknown fields.
-//   - This handler intentionally does not enforce authentication/authorization yet.
-//
-// Responses:
-//   - 200 OK with a JSON body on success.
-//   - 400 Bad Request for invalid JSON payloads.
-//   - 405 Method Not Allowed for unsupported methods (with an Allow header).
-func (o *orchestrator) handleGlobalProbingRate(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(struct {
-			GlobalProbingRatePSPA uint `json:"global_probing_rate_pspa"`
-		}{
-			GlobalProbingRatePSPA: uint(o.globalProbingRatePSPA.Load()),
-		})
-		return
-
-	case http.MethodPost:
-		var req struct {
-			GlobalProbingRatePSPA uint `json:"global_probing_rate_pspa"`
-		}
-
-		dec := json.NewDecoder(r.Body)
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil {
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
-			return
-		}
-
-		o.globalProbingRatePSPA.Store(uint64(req.GlobalProbingRatePSPA))
-
-		if err := o.notifyGenerators(r.Context()); err != nil {
-			log.Printf("failed not notify at least one generator")
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(req)
-		return
+	case "disallowed_destination_addresses":
+		o.mu.RLock()
+		defer o.mu.RUnlock()
+		value = o.currentStatus.DisallowedDestinationAddresses
 
 	default:
-		w.Header().Set("Allow", "GET, POST")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "unknown or missing setting name", http.StatusBadRequest)
 		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 
-// notifyGenerators publishes the current SystemStatus snapshot to all generators.
-//
-// This method is used after settings changes so generators can immediately adapt their directive generation to the new
-// configuration and current agent population.
-//
-// Cancellation:
-//   - The provided context controls how long the broadcast may block. If ctx is cancelled, Broadcast may return
-//     ctx.Err(); this is treated as a non-error because shutdown / client disconnect paths commonly cancel contexts.
-//
-// Returns
-//   - nil when the generators are notified.
-//   - ctx.Err() if the context is cancelled.
-//   - ErrQueueClosed when the pdQueue is closed
-//   - ErrSubscriberDoesNotExist at least one of the generators are disconnected.
-func (o *orchestrator) notifyGenerators(ctx context.Context) error {
-	ids, err := o.pdQueue.GetIDs()
-	if err != nil {
-		return err
+func (o *orchestrator) handleSetSetting(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	defer r.Body.Close()
+
+	var value any
+	updatedSetting := false
+
+	if err := json.NewDecoder(r.Body).Decode(&value); err != nil {
+		http.Error(w, "invalid JSON payload", http.StatusBadRequest)
+		return
 	}
 
-	status := &api.SystemStatus{
-		GlobalProbingRatePSPA: uint(o.globalProbingRatePSPA.Load()),
-		ActiveAgentIDs:        ids,
+	switch name {
+	case "global_probing_rate_pspa":
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if newValue, ok := castJSONValueToUInt(value); ok {
+			o.currentStatus.GlobalProbingRatePSPA = newValue
+			updatedSetting = true
+		}
+
+	case "probing_impact_limit_ms":
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if newValue, ok := castJSONValueToUInt(value); ok {
+			o.currentStatus.ProbingImpactLimitMS = newValue
+			updatedSetting = true
+		}
+
+	case "disallowed_destination_addresses":
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if newValue, ok := castJSONValueToIPArray(value); ok {
+			o.currentStatus.DisallowedDestinationAddresses = newValue
+			updatedSetting = true
+		}
+
+	default:
+		http.Error(w, "unknown or missing setting name", http.StatusBadRequest)
+		return
 	}
-	if err := o.settingsQueue.Broadcast(ctx, status); err != nil && err != ctx.Err() {
-		return err
+
+	if !updatedSetting {
+		http.Error(w, "type mismatch", http.StatusBadRequest)
+		return
 	}
-	return nil
+
+	w.WriteHeader(http.StatusNoContent)
 }
