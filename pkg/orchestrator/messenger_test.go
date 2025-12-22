@@ -8,7 +8,7 @@ import (
 )
 
 func TestRegisterAndUnregister(t *testing.T) {
-	m := NewMessenger[string]()
+	m := NewMessenger[string](100)
 
 	// Register should succeed
 	if err := m.RegisterAs("consumer1"); err != nil {
@@ -30,7 +30,7 @@ func TestRegisterAndUnregister(t *testing.T) {
 }
 
 func TestSendAndReceive(t *testing.T) {
-	m := NewMessenger[string]()
+	m := NewMessenger[string](100)
 	ctx := context.Background()
 
 	if err := m.RegisterAs("consumer1"); err != nil {
@@ -53,7 +53,7 @@ func TestSendAndReceive(t *testing.T) {
 }
 
 func TestSendToNonExistent(t *testing.T) {
-	m := NewMessenger[string]()
+	m := NewMessenger[string](100)
 	ctx := context.Background()
 
 	msg := "hello"
@@ -63,7 +63,7 @@ func TestSendToNonExistent(t *testing.T) {
 }
 
 func TestGetAsNonExistent(t *testing.T) {
-	m := NewMessenger[string]()
+	m := NewMessenger[string](100)
 	ctx := context.Background()
 
 	if _, err := m.GetAs(ctx, "nonexistent"); err != ErrIDDoesNotExist {
@@ -72,7 +72,7 @@ func TestGetAsNonExistent(t *testing.T) {
 }
 
 func TestContextCancellation(t *testing.T) {
-	m := NewMessenger[string]()
+	m := NewMessenger[string](100)
 
 	if err := m.RegisterAs("consumer1"); err != nil {
 		t.Fatal(err)
@@ -92,7 +92,7 @@ func TestContextCancellation(t *testing.T) {
 }
 
 func TestUnregisterWhileBlocking(t *testing.T) {
-	m := NewMessenger[string]()
+	m := NewMessenger[string](100)
 
 	if err := m.RegisterAs("consumer1"); err != nil {
 		t.Fatal(err)
@@ -128,7 +128,7 @@ func TestUnregisterWhileBlocking(t *testing.T) {
 }
 
 func TestSendAll(t *testing.T) {
-	m := NewMessenger[string]()
+	m := NewMessenger[string](100)
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
@@ -157,7 +157,7 @@ func TestSendAll(t *testing.T) {
 // Race condition tests - run with -race flag
 
 func TestConcurrentProducers(t *testing.T) {
-	m := NewMessenger[int]()
+	m := NewMessenger[int](100)
 	ctx := context.Background()
 
 	const numConsumers = 10
@@ -203,7 +203,7 @@ func TestConcurrentProducers(t *testing.T) {
 }
 
 func TestConcurrentRegisterUnregister(t *testing.T) {
-	m := NewMessenger[int]()
+	m := NewMessenger[int](100)
 	ctx := context.Background()
 
 	const iterations = 100
@@ -237,7 +237,7 @@ func TestConcurrentRegisterUnregister(t *testing.T) {
 }
 
 func TestProducerUnregisterRace(t *testing.T) {
-	m := NewMessenger[int]()
+	m := NewMessenger[int](100)
 	ctx := context.Background()
 
 	const iterations = 100
@@ -281,7 +281,7 @@ func TestProducerUnregisterRace(t *testing.T) {
 }
 
 func TestMultipleProducersSameConsumer(t *testing.T) {
-	m := NewMessenger[int]()
+	m := NewMessenger[int](100)
 	ctx := context.Background()
 
 	const numProducers = 10
@@ -335,7 +335,7 @@ func TestMultipleProducersSameConsumer(t *testing.T) {
 }
 
 func TestCleanupRace(t *testing.T) {
-	m := NewMessenger[int]()
+	m := NewMessenger[int](100)
 	ctx := context.Background()
 
 	const numProducers = 10
@@ -372,7 +372,7 @@ func TestCleanupRace(t *testing.T) {
 }
 
 func TestGetAsChannelReplacement(t *testing.T) {
-	m := NewMessenger[int]()
+	m := NewMessenger[int](100)
 	ctx := context.Background()
 
 	const iterations = 100
@@ -405,7 +405,7 @@ func TestGetAsChannelReplacement(t *testing.T) {
 }
 
 func BenchmarkSendTo(b *testing.B) {
-	m := NewMessenger[int]()
+	m := NewMessenger[int](100)
 	ctx := context.Background()
 
 	m.RegisterAs("consumer")
@@ -425,7 +425,7 @@ func BenchmarkSendTo(b *testing.B) {
 }
 
 func BenchmarkSendAllMultipleConsumers(b *testing.B) {
-	m := NewMessenger[int]()
+	m := NewMessenger[int](100)
 	ctx := context.Background()
 
 	const numConsumers = 10

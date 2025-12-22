@@ -15,7 +15,7 @@ var (
 
 type consumer[T any] struct {
 	consumerChan chan *T
-	done         chan struct{} // Closed when consumer is unregistered
+	done         chan struct{}
 	unregistered atomic.Bool
 }
 
@@ -23,12 +23,15 @@ type Messenger[T any] struct {
 	mu               sync.RWMutex
 	consumers        map[string]*consumer[T]
 	notificationChan chan struct{}
+
+	buffer uint
 }
 
-func NewMessenger[T any]() *Messenger[T] {
+func NewMessenger[T any](buffer uint) *Messenger[T] {
 	return &Messenger[T]{
 		consumers:        make(map[string]*consumer[T]),
 		notificationChan: make(chan struct{}),
+		buffer:           buffer,
 	}
 }
 
@@ -39,15 +42,21 @@ func (m *Messenger[T]) RegisterAs(id string) error {
 	cons, ok := m.consumers[id]
 
 	if ok && !cons.unregistered.Load() {
+		// If there is an entry and it is marked as registered.
+
 		return ErrIDAlreadyExist
 	} else if ok && cons.unregistered.Load() {
+		// If there is an entry and it is marked as unregistered.
+
 		cons.unregistered.Store(false)
-		cons.consumerChan = make(chan *T, 100)
+		cons.consumerChan = make(chan *T, m.buffer)
 		cons.done = make(chan struct{})
 		return nil
 	} else {
+		// If there is no entry.
+
 		m.consumers[id] = &consumer[T]{
-			consumerChan: make(chan *T, 100),
+			consumerChan: make(chan *T, m.buffer),
 			done:         make(chan struct{}),
 		}
 		return nil
@@ -61,6 +70,8 @@ func (m *Messenger[T]) UnregisterAs(id string) {
 	cons, ok := m.consumers[id]
 
 	if ok && !cons.unregistered.Load() {
+		// If there is an entry and it is marked as registered.
+
 		cons.unregistered.Store(true)
 
 		// Close done channel to unblock any GetAs calls
@@ -70,6 +81,7 @@ func (m *Messenger[T]) UnregisterAs(id string) {
 		select {
 		case <-m.notificationChan:
 			return
+
 		default:
 			close(m.notificationChan)
 			return
