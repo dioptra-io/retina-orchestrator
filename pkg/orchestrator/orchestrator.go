@@ -186,14 +186,7 @@ func (o *orchestrator) handleGenerator(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 
-			if err := o.messengerProbingDirective.SendTo(ctx, pd.AgentID, pd); err != nil {
-				if err == ErrIDDoesNotExist {
-					log.Printf("generator %s generated pd for a non existing agent, ignoring...", generatorID)
-					o.notifyGenerator(ctx)
-					continue
-				}
-				return err
-			}
+			o.messengerProbingDirective.SendTo(ctx, pd.AgentID, pd)
 		}
 	})
 
@@ -259,9 +252,7 @@ func (o *orchestrator) handleAgent(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Broadcast sends the element to all subscribed stream clients.
-			if err := o.messengerForwardingInfoElement.SendAll(ctx, fie); err != nil {
-				return err
-			}
+			o.messengerForwardingInfoElement.SendAll(ctx, fie)
 		}
 	})
 
