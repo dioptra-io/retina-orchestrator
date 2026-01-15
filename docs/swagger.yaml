@@ -1,0 +1,25 @@
+basePath: /
+definitions:
+  main.PingResponse:
+    properties:
+      message:
+        type: string
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: Minimal net/http API with swaggo
+  title: Simple API
+  version: "1.0"
+paths:
+  /ping:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/main.PingResponse'
+      summary: Ping endpoint
+swagger: "2.0"

@@ -1,35 +1,39 @@
 package main
 
 import (
-	"context"
-	"errors"
-	"flag"
-	"io"
 	"log"
-	"os/signal"
-	"syscall"
+	"net/http"
+
+	_ "github.com/dioptra-io/retina-orchestrator/docs"
+
+	httpSwagger "github.com/swaggo/http-swagger"
 )
 
+// @title Simple API
+// @version 1.0
+// @description Minimal net/http API with swaggo
+// @host localhost:8080
+// @BasePath /
 func main() {
-	var (
-		maxAgentProbingRate = flag.Uint("max_agent_probing_rate", 1, "Maximum number of probes an agent can send.")
-		messengerBuffer     = flag.Uint("messenger_buffer", 1, "Number of elements in messenger's buffer.")
-	)
-	flag.Parse()
+	http.HandleFunc("/ping", ping)
 
-	// Create a root context that is canceled on SIGINT or SIGTERM.
-	// This allows the orchestrator to shut down gracefully.
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	http.Handle("/swagger/", httpSwagger.WrapHandler)
 
-	cfg := Config{
-		MaxAgentProbingRate: *maxAgentProbingRate,
-		MessengerBuffer:     *messengerBuffer,
-	}
+	log.Println("listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
 
-	// Run the orchestrator until an error occurs.
-	// Ignore the context cancellation error, as it represents an expected shutdown.
-	if err := RunOrchestrator(ctx, cfg); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
-		log.Fatal("Orchestrator failed: ", err)
-	}
+type PingResponse struct {
+	Message string `json:"message"`
+}
+
+// ping godoc
+// @Summary Ping endpoint
+// @Produce json
+// @Success 200 {object} PingResponse
+// @Router /ping [get]
+func ping(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"message":"pong"}`))
 }
