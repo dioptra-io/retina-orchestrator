@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,11 +20,8 @@ type Config struct {
 	// per second.
 	MaxAgentProbingRate uint
 
-	// GeneratorReader is the stream that the SS structs are encoded to.
-	GeneratorReader io.Reader
-
-	// GeneratorWriter is the stream that the generated PDs are decoded from.
-	GeneratorWriter io.Writer
+	// MessengerBuffer is the number of elements allocated in the messenger buffers.
+	MessengerBuffer uint
 }
 
 // state represents the internal state of the orchestrator.
@@ -47,26 +45,19 @@ type orchestrator struct {
 	// mutex protects access to state.
 	mutex sync.Mutex
 
-	// All the channels:
+	// All the messengers:
 
-	// generatorSSChan is the channel to hold SS structs.
-	generatorSSChan chan *api.SystemStatus
+	// generatorSSMessenger is the messenger used to send SSes to the generator.
+	// We assume there is only one generator who is registered with ID "default".
+	generatorSSMessenger *Messenger[api.SystemStatus]
 
-	// generatorPDChan is the channel to hold PD structs.
-	generatorPDChan chan *api.ProbingDirective
+	// agentPDMessenger is the messenger used to receive PDs from the generator and send it to an assigned agent.
+	// We assume each agent is registered with their agentID.
+	agentPDMessenger *Messenger[api.ProbingDirective]
 
-	// agentPDChans is the map of channels to hold PD structs.
-	agentPDChans map[string]chan *api.ProbingDirective
-	// agentPDChansMutex protects agentPDChans.
-	agentPDChansMutex sync.Mutex
-
-	// agentFIEChan is the channel to hold FIE structs.
-	agentFIEChan chan *api.ForwardingInfoElement
-
-	// clientFIEChans is the map of channels to hold FIE structs.
-	clientFIEChans map[string]chan *api.ForwardingInfoElement
-	// clientFIEChansMutex protects clientFIEChans.
-	clientFIEChansMutex sync.Mutex
+	// clientFIEMessenger is the messenger used to receive FIEs from the agents and send it to all clients.
+	// We assume each client is registered with a randomly generated unique ID.
+	clientFIEMessenger *Messenger[api.ForwardingInfoElement]
 }
 
 func RunOrchestrator(parentCtx context.Context, config Config) error {
@@ -75,125 +66,182 @@ func RunOrchestrator(parentCtx context.Context, config Config) error {
 			disallowedDestinations: make(map[[16]byte]struct{}),
 			activeAgentIDs:         []string{},
 		},
-		config: config,
+		config:               config,
+		generatorSSMessenger: NewMessenger[api.SystemStatus](config.MessengerBuffer),
+		agentPDMessenger:     NewMessenger[api.ProbingDirective](config.MessengerBuffer),
+		clientFIEMessenger:   NewMessenger[api.ForwardingInfoElement](config.MessengerBuffer),
 	}
 
-	group, ctx := errgroup.WithContext(parentCtx)
-
-	// Goroutine: goroutine that sends SS from generatorSSChan to generator.
-	group.Go(func() error {
-		return dequeueAndWriteJSON(ctx,
-			orchestrator.config.GeneratorWriter,
-			orchestrator.generatorSSChan)
-	})
-
-	// Goroutine: goroutine that sends PD from generator to generatorPDChan.
-	group.Go(func() error {
-		return readJSONAndEnqueue(ctx,
-			orchestrator.config.GeneratorReader,
-			orchestrator.generatorPDChan)
-	})
-
-	// Goroutine: goroutine that sends PD from generatorPDChan to agentFIEChans[agentID].
-	group.Go(func() error {
-		return readAssignAndSend(ctx,
-			orchestrator.generatorPDChan,
-			orchestrator.agentPDChans,
-			&orchestrator.agentPDChansMutex,
-			func(pd *api.ProbingDirective) string {
-				return pd.AgentID
-			})
-	})
-
-	// Wait until both loops end.
-	if err := group.Wait(); err != nil && errors.Is(err, ctx.Err()) {
-		return fmt.Errorf("generator failed: %w", err)
-	}
-
-	log.Println("Generator stopped.")
+	log.Println("Orchestrator stopped.")
 
 	return nil
 }
 
-func readAssignAndSend[T any](ctx context.Context, inChan chan *T, outChan map[string]chan *T, outMutex *sync.Mutex, selectFn func(t *T) string) error {
-	var (
-		obj   *T
-		objCh chan *T
-		ok    bool
-		err   error
+func (o *orchestrator) handleGenerator(parentCtx context.Context, rw io.ReadWriter) error {
+	// Try to register itself to the messenger with the name "default".
+	// This ensures there can be only one generator.
+	if err := o.agentPDMessenger.RegisterAs("default"); err != nil {
+		return err
+	}
+	defer o.agentPDMessenger.UnregisterAs("default")
+
+	group, ctx := errgroup.WithContext(parentCtx)
+
+	// Goroutine: decode PD, send to assigned agent.
+	// Lifetime is limited to this method.
+	group.Go(func() error {
+		var (
+			decoder = json.NewDecoder(rw)
+			pd      *api.ProbingDirective
+			err     error
+		)
+
+		for {
+			if err = decoder.Decode(pd); err != nil {
+				return err
+			}
+			if err = o.agentPDMessenger.SendTo(ctx, pd.AgentID, pd); err != nil {
+				log.Printf("Cannot find the agentID %q from the PD. Skipping.", pd.AgentID)
+				continue
+			}
+		}
+	})
+
+	// Goroutine: get SS from default generator, encode SS.
+	// Lifetime is limited to this method.
+	group.Go(func() error {
+		var (
+			encoder = json.NewEncoder(rw)
+			ss      *api.SystemStatus
+			err     error
+		)
+
+		for {
+			// We have only one generator and it has the ID: "default".
+			if ss, err = o.generatorSSMessenger.GetAs(ctx, "default"); err != nil {
+				return err
+			}
+			if err = encoder.Encode(ss); err != nil {
+				return err
+			}
+		}
+	})
+
+	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+		return fmt.Errorf("handle generator failed: %w", err)
+	}
+
+	return nil
+}
+
+func (o *orchestrator) handleAgent(parentCtx context.Context, agentID string, rw io.ReadWriter) error {
+	// Try to register itself to the messenger.
+	if err := o.agentPDMessenger.RegisterAs(agentID); err != nil {
+		return err
+	}
+	defer o.agentPDMessenger.UnregisterAs(agentID)
+
+	group, ctx := errgroup.WithContext(parentCtx)
+
+	// Goroutine: decode FIE, send to all clients.
+	// Lifetime is limited to this method.
+	group.Go(func() error {
+		var (
+			decoder = json.NewDecoder(rw)
+			fie     *api.ForwardingInfoElement
+			err     error
+		)
+
+		for {
+			if err = decoder.Decode(fie); err != nil {
+				return err
+			}
+			if err = o.clientFIEMessenger.SendAll(ctx, fie); err != nil && err == ErrDroppedAtLeastOneMessage {
+				log.Println("At least one client disconnected, cannot send FIE. Skipping.")
+				continue
+			} else {
+				return err
+			}
+		}
+	})
+
+	// Goroutine: get PD from agent with the agentID, encode PD.
+	// Lifetime is limited to this method.
+	group.Go(func() error {
+		var (
+			encoder = json.NewEncoder(rw)
+			pd      *api.ProbingDirective
+			err     error
+		)
+
+		for {
+			if pd, err = o.agentPDMessenger.GetAs(ctx, agentID); err != nil {
+				return err
+			}
+			if err = encoder.Encode(pd); err != nil {
+				return err
+			}
+		}
+	})
+
+	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+		return fmt.Errorf("handle agent failed: %w", err)
+	}
+
+	return nil
+}
+
+func (o *orchestrator) handleClient(parentCtx context.Context, w io.Writer) error {
+	clientID := newUUID()
+	// Try to register itself to the messenger.
+	if err := o.clientFIEMessenger.RegisterAs(clientID); err != nil {
+		return err
+	}
+	defer o.clientFIEMessenger.UnregisterAs(clientID)
+
+	group, ctx := errgroup.WithContext(parentCtx)
+
+	// Goroutine: get FIE from agents, encode FIE.
+	// Lifetime is limited to this method.
+	group.Go(func() error {
+		var (
+			encoder = json.NewEncoder(w)
+			fie     *api.ForwardingInfoElement
+			err     error
+		)
+
+		for {
+			if fie, err = o.clientFIEMessenger.GetAs(ctx, clientID); err != nil {
+				return err
+			}
+			if err = encoder.Encode(fie); err != nil {
+				return err
+			}
+		}
+	})
+
+	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+		return fmt.Errorf("handle client failed: %w", err)
+	}
+
+	return nil
+}
+
+func newUUID() string {
+	var b [16]byte
+	// rand.Rand never returns an error.
+	_, _ = rand.Read(b[:])
+
+	// Set version (4) and variant (RFC 4122)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+
+	return fmt.Sprintf(
+		"%08x-%04x-%04x-%04x-%012x",
+		b[0:4],
+		b[4:6],
+		b[6:8],
+		b[8:10],
+		b[10:16],
 	)
-
-	for {
-		if obj, err = dequeue(ctx, inChan); err != nil {
-			return err
-		}
-
-		outMutex.Lock()
-		objCh, ok = outChan[selectFn(obj)]
-		outMutex.Unlock()
-
-		// The channel does not exist, drop the struct.
-		if !ok {
-			continue
-		}
-
-		if err = enqueue(ctx, objCh, obj); err != nil {
-			return err
-		}
-	}
-
-}
-
-func readJSONAndEnqueue[T any](ctx context.Context, reader io.Reader, ch chan *T) error {
-	var (
-		decoder = json.NewDecoder(reader)
-		obj     *T
-		err     error
-	)
-
-	for {
-		if err = decoder.Decode(obj); err != nil {
-			return err
-		}
-		if err = enqueue(ctx, ch, obj); err != nil {
-			return err
-		}
-	}
-}
-
-func dequeueAndWriteJSON[T any](ctx context.Context, w io.Writer, ch chan *T) error {
-	var (
-		encoder = json.NewEncoder(w)
-		ss      *T
-		err     error
-	)
-
-	for {
-		if ss, err = dequeue(ctx, ch); err != nil {
-			return err
-		}
-		if err = encoder.Encode(ss); err != nil {
-			return err
-		}
-	}
-}
-
-func enqueue[T any](ctx context.Context, ch chan<- *T, v *T) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-
-	case ch <- v:
-		return nil
-	}
-}
-
-func dequeue[T any](ctx context.Context, ch <-chan *T) (*T, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-
-	case v := <-ch:
-		return v, nil
-	}
 }
