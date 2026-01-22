@@ -22,4 +22,15 @@ paths:
           schema:
             $ref: '#/definitions/main.PingResponse'
       summary: Ping endpoint
+  /stream:
+    get:
+      description: Sends a message every second
+      produces:
+      - text/event-stream
+      responses:
+        "200":
+          description: OK
+      summary: Stream server-sent events
+      tags:
+      - stream
 swagger: "2.0"

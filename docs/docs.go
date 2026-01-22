@@ -30,6 +30,23 @@ const docTemplate = `{
                     }
                 }
             }
+        },
+        "/stream": {
+            "get": {
+                "description": "Sends a message every second",
+                "produces": [
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "stream"
+                ],
+                "summary": "Stream server-sent events",
+                "responses": {
+                    "200": {
+                        "description": "OK"
+                    }
+                }
+            }
         }
     },
     "definitions": {

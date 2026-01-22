@@ -1,39 +1,44 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"flag"
 	"log"
-	"net/http"
+	"os/signal"
+	"syscall"
+	"time"
 
-	_ "github.com/dioptra-io/retina-orchestrator/docs"
-
-	httpSwagger "github.com/swaggo/http-swagger"
+	"github.com/dioptra-io/retina-orchestrator/internal/retina"
 )
 
-// @title Simple API
-// @version 1.0
-// @description Minimal net/http API with swaggo
-// @host localhost:8080
-// @BasePath /
 func main() {
-	http.HandleFunc("/ping", ping)
+	var (
+		httpAddr            = flag.String("http-addr", ":80", "Listening address of the http server")
+		jsonlAddr           = flag.String("jsonl-addr", ":50050", "Listening address JSONL server")
+		tcpBuffer           = flag.Int("jsonl-buffer", 8*1024, "JSONL connection buffer size")
+		tcpTimeout          = flag.Duration("jsonl-timeout", 5*time.Minute, "JSONL connection timeout")
+		ringBufferCapacity  = flag.Uint64("rb-cap", 64*1024, "Capacity of the ring buffer")
+		pdSchedulerCooldown = flag.Duration("scheduler-cooldown", time.Second, "Probing directive scheduler's cooldown")
+	)
+	flag.Parse()
 
-	http.Handle("/swagger/", httpSwagger.WrapHandler)
+	// Setup the context from the signal handlers.
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
-	log.Println("listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
+	orch := retina.NewOrchFromConfig(&retina.Config{
+		HTTPAddress:         *httpAddr,
+		JSONLAddress:        *jsonlAddr,
+		AgentTCPBufferSize:  *tcpBuffer,
+		AgentTCPTimeout:     *tcpTimeout,
+		RingBufferCapacity:  *ringBufferCapacity,
+		PDSchedulerCooldown: *pdSchedulerCooldown,
+	})
 
-type PingResponse struct {
-	Message string `json:"message"`
-}
+	if err := orch.Run(ctx); err != nil && !errors.Is(err, ctx.Err()) {
+		log.Fatalf("orchestrator failed: %v", err)
+	}
 
-// ping godoc
-// @Summary Ping endpoint
-// @Produce json
-// @Success 200 {object} PingResponse
-// @Router /ping [get]
-func ping(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{"message":"pong"}`))
+	log.Println("Shutting down gracefuly")
 }
