@@ -28,6 +28,8 @@ type Config struct {
 	RingBufferCapacity uint64
 	// PDSchedulerCooldown is the cooldown period for the scheduler.
 	PDSchedulerCooldown time.Duration
+	// PDSleepDuration is the time to sleep if there are no probing directives.
+	PDSleepDuration time.Duration
 }
 
 // orch is the implementation of the retina orchestrator.
@@ -191,11 +193,19 @@ func (o *orch) handleScheduler(ctx context.Context) error {
 		default:
 		}
 
-		// time.Sleep(time.Second)
-
+		// If the Select fails the only other option is to wait until there are
+		// probing directives. Instead of making this event driven make it sleep
+		// for a duration. If the context is cancelled then return the cancelled
+		// error.
 		probingDirective, err := o.pdScheduler.Select(ctx)
 		if err != nil {
-			return err
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+
+			case <-time.After(o.config.PDSleepDuration):
+				continue
+			}
 		}
 
 		// The agent can be disconnected, in this case we ignore the error. Note
