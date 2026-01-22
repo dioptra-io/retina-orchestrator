@@ -2,10 +2,14 @@ package retina
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"time"
+
+	_ "github.com/dioptra-io/retina-orchestrator/docs"
+	httpSwagger "github.com/swaggo/http-swagger"
 
 	"github.com/dioptra-io/retina-commons/pkg/api/v1"
 	"golang.org/x/sync/errgroup"
@@ -72,6 +76,8 @@ func NewOrchFromConfig(config *Config) *orch {
 
 	// Add the http handlers.
 	mux.HandleFunc("/stream", orch.handleStream)
+	mux.HandleFunc("/directives", orch.handleInsertDirectives)
+	mux.HandleFunc("/swagger/", httpSwagger.WrapHandler)
 
 	// Add the tcp handler.
 	orch.jsonlServer.HandleFunc(orch.handleJSONLStream)
@@ -88,6 +94,7 @@ func (o *orch) Run(parentCtx context.Context) error {
 	// Goroutine: Starts the http server.
 	group.Go(func() error {
 		log.Printf("Started HTTP Server on %s", o.config.HTTPAddress)
+		log.Printf("Swagger can be reached on http://%s/swagger/index.html", o.config.HTTPAddress)
 
 		if err := o.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			return fmt.Errorf("http server failed: %w", err)
@@ -213,7 +220,7 @@ func (o *orch) handleScheduler(ctx context.Context) error {
 		// needs to be notified. Otherwise the logs will be flodded with this
 		// message.
 		if err := o.connectedAgents.Send(ctx, probingDirective.AgentID, probingDirective); err != nil {
-			log.Panicf("Cannot assign probing directive to any of the active agents. Required ID is %v.\n", probingDirective.AgentID)
+			log.Printf("Cannot assign probing directive to any of the active agents. Required ID is %v.\n", probingDirective.AgentID)
 		}
 	}
 }
@@ -241,4 +248,32 @@ func (o *orch) handleStream(w http.ResponseWriter, r *http.Request) {
 	// TODO: In a loop get the ForwardingInfoElement from the ring buffer and
 	// flush.
 	log.Println("not implemented")
+}
+
+// insertDirectives godoc
+// @Summary Insert probing directives
+// @Description Inserts a list of probing directives into the scheduler.
+// @Tags scheduler
+// @Accept json
+// @Produce json
+// @Param directives body []api.ProbingDirective true "List of probing directives"
+// @Success 200 {string} string "OK"
+// @Failure 400 {string} string "Bad Request"
+// @Failure 500 {string} string "Internal Server Error"
+// @Router /directives [post]
+func (o *orch) handleInsertDirectives(w http.ResponseWriter, r *http.Request) {
+	var directives []*api.ProbingDirective
+
+	if err := json.NewDecoder(r.Body).Decode(&directives); err != nil {
+		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if err := o.pdScheduler.Set(directives); err != nil {
+		http.Error(w, "failed to insert directives: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
 }

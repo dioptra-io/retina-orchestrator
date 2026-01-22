@@ -15,17 +15,50 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
-        "/ping": {
-            "get": {
+        "/directives": {
+            "post": {
+                "description": "Inserts a list of probing directives into the scheduler.",
+                "consumes": [
+                    "application/json"
+                ],
                 "produces": [
                     "application/json"
                 ],
-                "summary": "Ping endpoint",
+                "tags": [
+                    "scheduler"
+                ],
+                "summary": "Insert probing directives",
+                "parameters": [
+                    {
+                        "description": "List of probing directives",
+                        "name": "directives",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/definitions/api.ProbingDirective"
+                            }
+                        }
+                    }
+                ],
                 "responses": {
                     "200": {
                         "description": "OK",
                         "schema": {
-                            "$ref": "#/definitions/main.PingResponse"
+                            "type": "string"
+                        }
+                    },
+                    "400": {
+                        "description": "Bad Request",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal Server Error",
+                        "schema": {
+                            "type": "string"
                         }
                     }
                 }
@@ -33,7 +66,7 @@ const docTemplate = `{
         },
         "/stream": {
             "get": {
-                "description": "Sends a message every second",
+                "description": "Streams ForwardingInfoElement the latest updates to the connected clients as SSE.",
                 "produces": [
                     "text/event-stream"
                 ],
@@ -50,11 +83,137 @@ const docTemplate = `{
         }
     },
     "definitions": {
-        "main.PingResponse": {
+        "api.ICMPNextHeader": {
             "type": "object",
             "properties": {
-                "message": {
+                "first_half_word": {
+                    "type": "integer"
+                },
+                "second_half_word": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.ICMPv6NextHeader": {
+            "type": "object",
+            "properties": {
+                "first_half_word": {
+                    "type": "integer"
+                },
+                "second_half_word": {
+                    "type": "integer"
+                }
+            }
+        },
+        "api.IPVersion": {
+            "type": "integer",
+            "format": "int32",
+            "enum": [
+                4,
+                6
+            ],
+            "x-enum-varnames": [
+                "TypeIPv4",
+                "TypeIPv6"
+            ]
+        },
+        "api.NextHeader": {
+            "type": "object",
+            "properties": {
+                "icmp_next_header": {
+                    "description": "ICMPNextHeader is set when Protocol == ICMP.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/api.ICMPNextHeader"
+                        }
+                    ]
+                },
+                "icmpv6_next_header": {
+                    "description": "ICMPNextHeader is set when Protocol == ICMPv6.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/api.ICMPv6NextHeader"
+                        }
+                    ]
+                },
+                "udp_next_header": {
+                    "description": "ICMPNextHeader is set when Protocol == UDP.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/api.UDPNextHeader"
+                        }
+                    ]
+                }
+            }
+        },
+        "api.ProbingDirective": {
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "description": "AgentID identifies the agent that should execute this directive.",
                     "type": "string"
+                },
+                "destination_address": {
+                    "description": "DestinationAddress is the target IP address to probe.",
+                    "type": "array",
+                    "items": {
+                        "type": "integer"
+                    }
+                },
+                "ip_version": {
+                    "description": "IPVersion selects IPv4 vs IPv6 for the probe packet.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/api.IPVersion"
+                        }
+                    ]
+                },
+                "near_ttl": {
+                    "description": "NearTTL is the TTL/hop-limit value used for the \"near\" probe (typically close to the destination).",
+                    "type": "integer"
+                },
+                "next_header": {
+                    "description": "NextHeader contains protocol-specific fields needed to craft the packet\n(e.g., UDP ports, ICMP words). Should match Protocol.",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/api.NextHeader"
+                        }
+                    ]
+                },
+                "protocol": {
+                    "description": "Protocol selects the transport protocol used for probing (ICMP/UDP/ICMPv6).",
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/api.Protocol"
+                        }
+                    ]
+                }
+            }
+        },
+        "api.Protocol": {
+            "type": "integer",
+            "format": "int32",
+            "enum": [
+                1,
+                17,
+                58
+            ],
+            "x-enum-varnames": [
+                "ICMP",
+                "UDP",
+                "ICMPv6"
+            ]
+        },
+        "api.UDPNextHeader": {
+            "type": "object",
+            "properties": {
+                "destination_port": {
+                    "description": "DestinationPort is the UDP destination port used in the probe packet.",
+                    "type": "integer"
+                },
+                "source_port": {
+                    "description": "SourcePort is the UDP source port used in the probe packet.",
+                    "type": "integer"
                 }
             }
         }
@@ -63,12 +222,12 @@ const docTemplate = `{
 
 // SwaggerInfo holds exported Swagger Info so clients can modify it
 var SwaggerInfo = &swag.Spec{
-	Version:          "1.0",
-	Host:             "localhost:8080",
-	BasePath:         "/",
+	Version:          "",
+	Host:             "",
+	BasePath:         "",
 	Schemes:          []string{},
-	Title:            "Simple API",
-	Description:      "Minimal net/http API with swaggo",
+	Title:            "",
+	Description:      "",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

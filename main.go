@@ -14,8 +14,8 @@ import (
 
 func main() {
 	var (
-		httpAddr            = flag.String("http-addr", ":80", "Listening address of the http server")
-		jsonlAddr           = flag.String("jsonl-addr", ":50050", "Listening address JSONL server")
+		httpAddr            = flag.String("http-addr", "localhost:8080", "Listening address of the http server")
+		jsonlAddr           = flag.String("jsonl-addr", "localhost:50050", "Listening address JSONL server")
 		tcpBuffer           = flag.Int("jsonl-buffer", 8*1024, "JSONL connection buffer size")
 		tcpTimeout          = flag.Duration("jsonl-timeout", 5*time.Minute, "JSONL connection timeout")
 		ringBufferCapacity  = flag.Uint64("rb-cap", 64*1024, "Capacity of the ring buffer")
