@@ -156,13 +156,15 @@ func (o *orch) handleTCPStream(agentInfo *api.AgentInfo, s *JSONLStreamer[api.Pr
 	// it to the ring buffer.
 	group.Go(func() error {
 		// TODO: Implement.
-		panic("not implemented")
+		log.Println("not implemented")
+		return nil
 	})
 
 	// Goroutine: Pops from the agents queue, and sends it to agent.
 	group.Go(func() error {
 		// TODO: Implement.
-		panic("not implemented")
+		log.Println("not implemented")
+		return nil
 	})
 
 	if err := group.Wait(); err != nil {
@@ -174,7 +176,8 @@ func (o *orch) handleTCPStream(agentInfo *api.AgentInfo, s *JSONLStreamer[api.Pr
 // assigns them to the agents.
 func (o *orch) handleScheduler(ctx context.Context) error {
 	// TODO: Implement.
-	panic("not implemented")
+	log.Println("not implemented")
+	return nil
 }
 
 // stream godoc
@@ -199,5 +202,5 @@ func (o *orch) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// TODO: In a loop get the ForwardingInfoElement from the ring buffer and
 	// flush.
-	panic("not implemented")
+	log.Println("not implemented")
 }
