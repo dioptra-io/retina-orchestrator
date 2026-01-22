@@ -120,7 +120,9 @@ func (s *JSONLServer[S, R]) Shutdown(ctx context.Context) error {
 		return nil
 	}
 
-	_ = s.listener.Close()
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
 
 	for _, streamer := range s.activeStreamers {
 		s.removeStreamer(streamer)

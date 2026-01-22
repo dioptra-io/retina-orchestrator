@@ -15,9 +15,9 @@ var (
 	ErrNoDirectives = errors.New("there needs to be at least one directive")
 )
 
-// ProbingDirectiveScheduler is a set of probing directives. It is used to generate
-// the probing directives and implement reponsible probing.
-type ProbingDirectiveScheduler struct {
+// PDScheduler is a set of probing directives. It is used to generate the
+// probing directives and implement reponsible probing.
+type PDScheduler struct {
 	// mutex protects the set state.
 	mutex sync.Mutex
 	// directives is the set of directives that is used.
@@ -32,8 +32,8 @@ type ProbingDirectiveScheduler struct {
 
 // NewProbingDirectiveScheduler creates a new set with a cooldown interwal of 1
 // seconds.
-func NewProbingDirectiveScheduler(cooldown time.Duration) *ProbingDirectiveScheduler {
-	return &ProbingDirectiveScheduler{
+func NewProbingDirectiveScheduler(cooldown time.Duration) *PDScheduler {
+	return &PDScheduler{
 		directives:     make([]*api.ProbingDirective, 0),
 		cooldowns:      make([]time.Time, 0),
 		cooldownPeriod: cooldown,
@@ -43,7 +43,7 @@ func NewProbingDirectiveScheduler(cooldown time.Duration) *ProbingDirectiveSched
 // Select selects a probing directive from the list. If the earliest one has a
 // cooldown then it waits for the cooldown. If the context is cancelled during
 // the wait then it returns the context cancelled error.
-func (s *ProbingDirectiveScheduler) Select(ctx context.Context) (*api.ProbingDirective, error) {
+func (s *PDScheduler) Select(ctx context.Context) (*api.ProbingDirective, error) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
@@ -72,7 +72,7 @@ func (s *ProbingDirectiveScheduler) Select(ctx context.Context) (*api.ProbingDir
 
 // Set sets the current set with the given set of probing directives. When added
 // the array is shuffled to ensure pseudo-randomness.
-func (s *ProbingDirectiveScheduler) Set(directives []*api.ProbingDirective) error {
+func (s *PDScheduler) Set(directives []*api.ProbingDirective) error {
 	if len(directives) == 0 {
 		return ErrNoDirectives
 	}
@@ -103,7 +103,9 @@ func (s *ProbingDirectiveScheduler) Set(directives []*api.ProbingDirective) erro
 // thread safe.
 // The current implementation does the selection by linear search, this can be
 // more efficient if a heap is used.
-func (s *ProbingDirectiveScheduler) earliest() int {
+//
+// TODO: implement this using a heap to reduce the complexity.
+func (s *PDScheduler) earliest() int {
 	// This needs to be done via heap to reduce complexity from O(n) to O(logn)
 	earliestIndex := 0
 	for i := range len(s.directives) {

@@ -39,12 +39,12 @@ type orch struct {
 	// tcpserver handles communication with the agents.
 	jsonlServer *JSONLServer[api.ProbingDirective, api.ForwardingInfoElement]
 	// connectedAgents holds a set of connected agents.
-	connectedAgents *SafeMap[api.AgentInfo]
+	connectedAgents *AgentQueue[api.ProbingDirective]
 	// ringBuffer is the rungbuffer used by the clients to stream
 	// ForwardingInfoElement.
 	ringBuffer *RingBuffer[api.ForwardingInfoElement]
 	// pdScheduler is the generator that picks new PDs.
-	pdScheduler *ProbingDirectiveScheduler
+	pdScheduler *PDScheduler
 }
 
 // NewOrchFromConfig creates a new orchestrator from the config.
@@ -63,7 +63,7 @@ func NewOrchFromConfig(config *Config) *orch {
 			TCPBufferLength: config.AgentTCPBufferSize,
 			TCPDeadline:     config.AgentTCPTimeout,
 		},
-		connectedAgents: NewSafeMap[api.AgentInfo](),
+		connectedAgents: NewSafeMap[api.ProbingDirective](),
 		ringBuffer:      NewRingBuffer[api.ForwardingInfoElement](config.RingBufferCapacity),
 		pdScheduler:     NewProbingDirectiveScheduler(config.PDSchedulerCooldown),
 	}
@@ -72,7 +72,7 @@ func NewOrchFromConfig(config *Config) *orch {
 	mux.HandleFunc("/stream", orch.handleStream)
 
 	// Add the tcp handler.
-	orch.jsonlServer.HandleFunc(orch.handleTCPStream)
+	orch.jsonlServer.HandleFunc(orch.handleJSONLStream)
 
 	return &orch
 }
@@ -143,12 +143,19 @@ func (o *orch) Run(parentCtx context.Context) error {
 	return group.Wait()
 }
 
-// handleTCPStream handles a newly connected agent and streams Probing
+// handleJSONLStream handles a newly connected agent and streams Probing
 // Directives and Forwarding Info Elements.
-func (o *orch) handleTCPStream(agentInfo *api.AgentInfo, s *JSONLStreamer[api.ProbingDirective, api.ForwardingInfoElement]) {
+func (o *orch) handleJSONLStream(agentInfo *api.AgentInfo, s *JSONLStreamer[api.ProbingDirective, api.ForwardingInfoElement]) {
 	// Add and remove the currently connected agent.
-	o.connectedAgents.Add(agentInfo.AgentID, agentInfo)
-	defer o.connectedAgents.Pop(agentInfo.AgentID)
+	if err := o.connectedAgents.AddAgent(agentInfo.AgentID, agentInfo); err != nil {
+		log.Printf("Agent with ID %s is already connected, dropping second connection.\n", agentInfo.AgentID)
+		return
+	}
+	defer func() {
+		if err := o.connectedAgents.RemoveAgent(agentInfo.AgentID); err != nil {
+			log.Printf("Cannot remove active agent with ID %s, it is already removed.\n", agentInfo.AgentID)
+		}
+	}()
 
 	group, _ := errgroup.WithContext(s.Context())
 
@@ -175,9 +182,30 @@ func (o *orch) handleTCPStream(agentInfo *api.AgentInfo, s *JSONLStreamer[api.Pr
 // handleScheduler invokes scheduler to generate new probing directives and
 // assigns them to the agents.
 func (o *orch) handleScheduler(ctx context.Context) error {
-	// TODO: Implement.
-	log.Println("not implemented")
-	return nil
+	for {
+		// Check for the context cancellation.
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
+		default:
+		}
+
+		// time.Sleep(time.Second)
+
+		probingDirective, err := o.pdScheduler.Select(ctx)
+		if err != nil {
+			return err
+		}
+
+		// The agent can be disconnected, in this case we ignore the error. Note
+		// that if an agent us disconnected the probing directive scheduler
+		// needs to be notified. Otherwise the logs will be flodded with this
+		// message.
+		if err := o.connectedAgents.Send(ctx, probingDirective.AgentID, probingDirective); err != nil {
+			log.Panicf("Cannot assign probing directive to any of the active agents. Required ID is %v.\n", probingDirective.AgentID)
+		}
+	}
 }
 
 // stream godoc

@@ -11,10 +11,12 @@ var (
 	ErrClosed = errors.New("closed")
 )
 
-// RingBuffer is an implementation of for the orchestrator. It is intended to
-// have many consumers identified with clientids.
-// If the client is slow then the tails are pushed meaning slow consumers can
-// miss elements.
+// RingBuffer is an implementation for the orchestrator specifically to be used
+// by the streaming clients. The main goal is to make sure multiple readers can
+// access the elements pushed to the ring buffer. If the ring buffer is full
+// then adding a new element would override the last added element, so all the
+// slow consumers would miss that element. Missing an element is communicated to
+// the consumers via the sequence numbers returned by the Next() method.
 //
 // TODO: The implementation is not tested. This may need some changes.
 type RingBuffer[T any] struct {
@@ -131,11 +133,11 @@ type RingBufferConsumer[T any] struct {
 	closed bool
 }
 
-// Pop pops the element from the ring buffer and retuns the element and the
+// Next pops the element from the ring buffer and retuns the element and the
 // sequenceNumber. If there are no new elements then it blocks.
 // If the context is cancelled it returns the context's error.
 // If the consumer is closed it returns ErrClosed error.
-func (rbc *RingBufferConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
+func (rbc *RingBufferConsumer[T]) Next(ctx context.Context) (*T, uint64, error) {
 	rb := rbc.ringBuffer
 
 	rb.mutex.Lock()
