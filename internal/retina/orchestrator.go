@@ -268,7 +268,9 @@ func (o *orch) handleInsertDirectives(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	defer r.Body.Close()
+	defer func() {
+		_ = r.Body.Close()
+	}()
 
 	if err := o.pdScheduler.Set(directives); err != nil {
 		http.Error(w, "failed to insert directives: "+err.Error(), http.StatusInternalServerError)
