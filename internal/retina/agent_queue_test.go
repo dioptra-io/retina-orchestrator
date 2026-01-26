@@ -114,8 +114,6 @@ func TestElements(t *testing.T) {
 
 	// Test empty queue
 	elements := q.Elements()
-	// Note: The implementation has a bug - it creates an array with len(s.set)
-	// and then appends, so for empty set we get empty slice
 	if elements == nil {
 		t.Error("Elements returned nil")
 	}
@@ -127,10 +125,8 @@ func TestElements(t *testing.T) {
 	_ = q.AddAgent("key2", agent2)
 
 	elements = q.Elements()
-	// Note: Due to bug in implementation, length will be 4 (2 nil + 2 agents)
-	// This test documents the current behavior
-	if len(elements) != 4 {
-		t.Errorf("expected 4 elements (due to implementation bug), got %d", len(elements))
+	if len(elements) != 2 {
+		t.Errorf("expected 2 elements, got %d", len(elements))
 	}
 }
 
