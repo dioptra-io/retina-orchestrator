@@ -16,7 +16,7 @@ var (
 )
 
 // PDScheduler is a set of probing directives. It is used to generate the
-// probing directives and implement reponsible probing.
+// probing directives and implement responsible probing.
 type PDScheduler struct {
 	// mutex protects the set state.
 	mutex sync.Mutex
