@@ -66,7 +66,7 @@ const docTemplate = `{
         },
         "/stream": {
             "get": {
-                "description": "Streams ForwardingInfoElement the latest updates to the connected clients as SSE.",
+                "description": "Streams ForwardingInfoElementWithSeq the latest updates to the connected clients as SSE.",
                 "produces": [
                     "text/event-stream"
                 ],

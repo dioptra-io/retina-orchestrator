@@ -15,6 +15,18 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// ForwardingInfoElementWithSeq represents a ForwardingInfoElement with a
+// sequence number. It is used on the streaming to clients.
+type ForwardingInfoElementWithSeq struct {
+	api.ForwardingInfoElement
+
+	// SequenceNumber is used to communicate if there is a skip on the stream.
+	// This skip can be caused because of a slow reader. Since we don't want the
+	// whole system to throttle down by a slow client, this is a solution we
+	// decided.
+	SequenceNumber uint64
+}
+
 // Config is the configuration struct used by Orch.
 type Config struct {
 	// HTTPAddress is the address to listen.
@@ -166,22 +178,49 @@ func (o *orch) handleJSONLStream(agentInfo *api.AgentInfo, s *JSONLStreamer[api.
 		}
 	}()
 
-	group, _ := errgroup.WithContext(s.Context())
+	group, ctx := errgroup.WithContext(s.Context())
 
 	// Goroutine: Receives the ForwardingInfoElements from the agent and pushes
 	// it to the ring buffer.
 	group.Go(func() error {
-		// TODO: Implement.
-		log.Println("not implemented")
-		return nil
+		var (
+			fie *api.ForwardingInfoElement
+			err error
+		)
+
+		// Do this until the context is cancelled.
+		for {
+			if fie, err = s.Receive(); err != nil {
+				return err
+			}
+
+			if err = o.ringBuffer.Push(ctx, fie); err != nil {
+				return err
+			}
+		}
 	})
 
 	// Goroutine: Pops from the agents queue, and sends it to agent.
 	group.Go(func() error {
-		// TODO: Implement.
-		log.Println("not implemented")
-		return nil
+		var (
+			pd  *api.ProbingDirective
+			err error
+		)
+
+		// Do this until the context is cancelled.
+		for {
+			if pd, err = o.connectedAgents.Receive(ctx, agentInfo.AgentID); err != nil {
+				return err
+			}
+
+			if err = s.Send(pd); err != nil {
+				return err
+			}
+		}
 	})
+
+	// Note: Here the stream send and receive does not take a context because
+	// their cancellation is connected to the streams own context.
 
 	if err := group.Wait(); err != nil {
 		log.Printf("Error on the connection with agent %q: %v.\n", agentInfo.AgentID, err)
@@ -227,7 +266,7 @@ func (o *orch) handleScheduler(ctx context.Context) error {
 
 // stream godoc
 // @Summary Stream server-sent events
-// @Description Streams ForwardingInfoElement the latest updates to the connected clients as SSE.
+// @Description Streams ForwardingInfoElementWithSeq the latest updates to the connected clients as SSE.
 // @Tags stream
 // @Produce text/event-stream
 // @Success 200
@@ -237,17 +276,45 @@ func (o *orch) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	_, ok := w.(http.Flusher)
+	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
 
-	log.Println("SSE client connected")
+	ctx := r.Context()
 
-	// TODO: In a loop get the ForwardingInfoElement from the ring buffer and
-	// flush.
-	log.Println("not implemented")
+	ringBufferClient := o.ringBuffer.NewConsumer()
+	defer ringBufferClient.Close()
+
+	encoder := json.NewEncoder(w)
+
+	var (
+		fie         *api.ForwardingInfoElement
+		fieSeq      *ForwardingInfoElementWithSeq
+		err         error
+		sequenceNum uint64
+	)
+
+	for {
+		fie, sequenceNum, err = ringBufferClient.Next(ctx)
+		if err != nil {
+			return
+		}
+
+		// Add the sequence number as an additional field.
+		fieSeq = &ForwardingInfoElementWithSeq{
+			ForwardingInfoElement: *fie,
+			SequenceNumber:        sequenceNum,
+		}
+
+		if err = encoder.Encode(fieSeq); err != nil {
+			return
+		}
+
+		// Send the encoded data after every write.
+		flusher.Flush()
+	}
 }
 
 // insertDirectives godoc
