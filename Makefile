@@ -15,6 +15,6 @@ docs:
 test:
 	go test ./...
 orch: 
-	go build -o orch .
+	go build -o retina-orchestrator .
 clean:
-	rm -f orch
+	rm -f retina-orchestrator
