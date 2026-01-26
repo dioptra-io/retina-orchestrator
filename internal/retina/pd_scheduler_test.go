@@ -2,6 +2,7 @@ package retina
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -174,6 +175,7 @@ func TestPDScheduler_Select_ContextCancelled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
+	time.Sleep(time.Millisecond)
 
 	_, err := scheduler.Select(ctx)
 	if err != context.Canceled {
@@ -194,6 +196,7 @@ func TestPDScheduler_Select_ContextTimeout(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
+	time.Sleep(time.Millisecond)
 
 	_, err := scheduler.Select(ctx)
 	if err != context.DeadlineExceeded {
@@ -254,7 +257,7 @@ func TestPDScheduler_earliest_AllSameTime(t *testing.T) {
 func TestPDScheduler_Set_OverwritesPrevious(t *testing.T) {
 	scheduler := NewProbingDirectiveScheduler(time.Second)
 
-	directives1 := []*api.ProbingDirective{{AgentID: "1"}, {Id: "2"}}
+	directives1 := []*api.ProbingDirective{{AgentID: "1"}, {AgentID: "2"}}
 	_ = scheduler.Set(directives1)
 
 	directives2 := []*api.ProbingDirective{{AgentID: "3"}}
@@ -269,7 +272,7 @@ func TestPDScheduler_CooldownInitialization(t *testing.T) {
 	scheduler := NewProbingDirectiveScheduler(time.Second)
 
 	before := time.Now()
-	directives := []*api.ProbingDirective{{AgentID: "1"}, {Id: "2"}}
+	directives := []*api.ProbingDirective{{AgentID: "1"}, {AgentID: "2"}}
 	_ = scheduler.Set(directives)
 	after := time.Now()
 
@@ -358,13 +361,9 @@ func TestPDScheduler_Select_AfterSet(t *testing.T) {
 	}
 
 	// Verify selected is one of our directives
-	found := false
-	for _, d := range directives {
-		if selected == d {
-			found = true
-			break
-		}
-	}
+	found := slices.ContainsFunc(directives, func(d *api.ProbingDirective) bool {
+		return selected == d
+	})
 	if !found {
 		t.Error("selected directive not in original set")
 	}

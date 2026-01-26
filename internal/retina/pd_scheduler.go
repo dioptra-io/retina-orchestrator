@@ -44,6 +44,13 @@ func NewProbingDirectiveScheduler(cooldown time.Duration) *PDScheduler {
 // cooldown then it waits for the cooldown. If the context is cancelled during
 // the wait then it returns the context cancelled error.
 func (s *PDScheduler) Select(ctx context.Context) (*api.ProbingDirective, error) {
+	// If the given context is cancelled, then immediately return the error.
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
@@ -60,7 +67,7 @@ func (s *PDScheduler) Select(ctx context.Context) (*api.ProbingDirective, error)
 
 	// We take the current time again because otherwise we will be waiting
 	// little longer.
-	timer := time.NewTimer(time.Since(s.cooldowns[earliestIndex]))
+	timer := time.NewTimer(time.Until(s.cooldowns[earliestIndex]))
 	defer timer.Stop()
 
 	select {
