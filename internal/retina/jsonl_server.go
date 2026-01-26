@@ -173,8 +173,11 @@ func (s *JSONLServer[S, R]) handleConnection(streamer *JSONLStreamer[S, R]) {
 // This method is not protected by the mutex.
 func (s *JSONLServer[S, R]) removeStreamer(streamer *JSONLStreamer[S, R]) {
 	_ = streamer.conn.Close()
-	delete(s.activeStreamers, streamer.id)
-	s.closeWG.Done()
+	// Only call Done if streamer is still in the map (not already removed)
+	if _, exists := s.activeStreamers[streamer.id]; exists {
+		delete(s.activeStreamers, streamer.id)
+		s.closeWG.Done()
+	}
 }
 
 // JSONLStreamer is the streamer struct that is returned on the handle function.
