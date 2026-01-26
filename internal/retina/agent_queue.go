@@ -39,7 +39,7 @@ func (s *AgentQueue[T]) Elements() []*api.AgentInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	array := make([]*api.AgentInfo, len(s.set))
+	array := make([]*api.AgentInfo, 0, len(s.set))
 	for _, e := range s.set {
 		array = append(array, e)
 	}
