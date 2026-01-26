@@ -37,8 +37,9 @@ func main() {
 	})
 
 	if err := orch.Run(ctx); err != nil && !errors.Is(err, ctx.Err()) {
-		log.Fatalf("orchestrator failed: %v", err)
+		log.Printf("orchestrator failed: %v", err)
+		return
 	}
 
-	log.Println("Shutting down gracefuly")
+	log.Println("Shutting down gracefully")
 }
