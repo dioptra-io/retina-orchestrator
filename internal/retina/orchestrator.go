@@ -73,8 +73,9 @@ func NewOrchFromConfig(config *Config) *orch {
 	orch := orch{
 		config: config,
 		server: &http.Server{
-			Addr:    config.HTTPAddress,
-			Handler: mux,
+			Addr:              config.HTTPAddress,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
 		},
 		jsonlServer: &JSONLServer[api.ProbingDirective, api.ForwardingInfoElement]{
 			Address:         config.JSONLAddress,
