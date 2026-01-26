@@ -61,6 +61,8 @@ func (s *PDScheduler) Select(ctx context.Context) (*api.ProbingDirective, error)
 	// We take the current time again because otherwise we will be waiting
 	// little longer.
 	timer := time.NewTimer(time.Since(s.cooldowns[earliestIndex]))
+	defer timer.Stop()
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
