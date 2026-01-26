@@ -1,7 +1,7 @@
-.PHONY: build proper help
+.PHONY: build proper help docs test
 help:
-	@echo valid targets: build proper clean
-build: proper orch prober
+	@echo valid targets: build proper clean docs test
+build: proper orch 
 proper:
 	find . -name '*.go' ! -name '*_test.go' | sort | xargs wc -l
 	gofmt -s -w $(shell go list -f '{{.Dir}}' ./...)
@@ -10,9 +10,11 @@ proper:
 		goimports -w $(shell go list -f '{{.Dir}}' ./...); \
 	fi
 	golangci-lint run --tests=false
-orch: cmd/orch/orch.go common/common.go
-	go build -o orch cmd/orch/orch.go
-prober: cmd/prober/prober.go common/common.go
-	go build -o prober cmd/prober/prober.go
+docs:
+	swag init --parseDependency
+test:
+	go test ./...
+orch: 
+	go build -o orch .
 clean:
-	rm -f orch prober
+	rm -f orch
