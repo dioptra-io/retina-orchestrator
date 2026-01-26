@@ -18,48 +18,33 @@ var (
 // slow consumers would miss that element. Missing an element is communicated to
 // the consumers via the sequence numbers returned by the Next() method.
 type RingBuffer[T any] struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	buffer   []T
+	// mu protects against races.
+	mu sync.Mutex
+	// buffer is the actual buffer.
+	buffer []T
+	// capacity is the capacity of the buffer.
 	capacity uint64
-	// writePos is where the next element will be written
-	writePos uint64
-	// totalPushed tracks total number of elements pushed (used for sequence numbers)
-	totalPushed  uint64
-	consumers    map[uint64]*RingBufferConsumer[T]
-	nextConsumer uint64
-	closed       bool
+	// totalPushed tracks total number of elements pushed (used for sequence
+	// numbers).
+	totalPushed uint64
+	// closed indicates if the ring buffer has been closed.
+	closed bool
+	// notify is used to signal consumers when new data is available.
+	notify chan struct{}
 }
 
 // NewRingBuffer creates a new ring buffer with the specified type and capacity.
 func NewRingBuffer[T any](capacity uint64) *RingBuffer[T] {
-	rb := &RingBuffer[T]{
-		buffer:    make([]T, capacity),
-		capacity:  capacity,
-		consumers: make(map[uint64]*RingBufferConsumer[T]),
+	return &RingBuffer[T]{
+		buffer:   make([]T, capacity),
+		capacity: capacity,
+		notify:   make(chan struct{}),
 	}
-	rb.cond = sync.NewCond(&rb.mu)
-	return rb
-}
-
-// NewConsumer creates a new consumer starting from the current position.
-func (rb *RingBuffer[T]) NewConsumer() *RingBufferConsumer[T] {
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-
-	consumer := &RingBufferConsumer[T]{
-		id:         rb.nextConsumer,
-		nextSeq:    rb.totalPushed,
-		ringBuffer: rb,
-	}
-
-	rb.consumers[rb.nextConsumer] = consumer
-	rb.nextConsumer++
-
-	return consumer
 }
 
 // Push adds a new element to the buffer.
+// If the context is cancelled it returns the context's error.
+// If the ring buffer is closed it returns ErrClosed.
 func (rb *RingBuffer[T]) Push(ctx context.Context, element *T) error {
 	select {
 	case <-ctx.Done():
@@ -68,100 +53,108 @@ func (rb *RingBuffer[T]) Push(ctx context.Context, element *T) error {
 	}
 
 	rb.mu.Lock()
-	defer rb.mu.Unlock()
-
 	if rb.closed {
+		rb.mu.Unlock()
 		return ErrClosed
 	}
 
-	rb.buffer[rb.writePos%rb.capacity] = *element
-	rb.writePos++
+	rb.buffer[rb.totalPushed%rb.capacity] = *element
 	rb.totalPushed++
 
-	rb.cond.Broadcast()
+	// Signal waiters by closing and replacing the channel.
+	old := rb.notify
+	rb.notify = make(chan struct{})
+	rb.mu.Unlock()
+
+	close(old)
 	return nil
 }
 
 // Close closes the ring buffer and wakes all waiting consumers.
 func (rb *RingBuffer[T]) Close() {
 	rb.mu.Lock()
-	defer rb.mu.Unlock()
-
+	if rb.closed {
+		rb.mu.Unlock()
+		return
+	}
 	rb.closed = true
-	rb.cond.Broadcast()
+	old := rb.notify
+	rb.notify = make(chan struct{})
+	rb.mu.Unlock()
+
+	close(old)
 }
 
-// RingBufferConsumer is the client of the RingBuffer.
-type RingBufferConsumer[T any] struct {
-	id         uint64
-	nextSeq    uint64
-	ringBuffer *RingBuffer[T]
-	closed     bool
-}
-
-// Next returns the next element. Blocks if no element is available.
-// Returns the element, its sequence number, and any error.
-// If elements were skipped (slow consumer), the sequence number will show the gap.
-func (c *RingBufferConsumer[T]) Next(ctx context.Context) (*T, uint64, error) {
-	rb := c.ringBuffer
-
+// NewConsumer creates a new consumer starting from the current position.
+func (rb *RingBuffer[T]) NewConsumer() *RingBufferConsumer[T] {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 
+	return &RingBufferConsumer[T]{
+		nextSeq:    rb.totalPushed,
+		ringBuffer: rb,
+	}
+}
+
+// RingBufferConsumer is the consumer of the RingBuffer.
+type RingBufferConsumer[T any] struct {
+	// nextSeq is the sequence number of the next item to consume.
+	nextSeq uint64
+	// ringBuffer is the pointer to the ring buffer.
+	ringBuffer *RingBuffer[T]
+	// closed tells if the consumer is closed.
+	closed bool
+}
+
+// Next returns the next element from the ring buffer. Blocks if no element is
+// available. Returns the element, its sequence number, and any error.
+// If the context is cancelled it returns the context's error.
+// If the consumer or ring buffer is closed it returns ErrClosed.
+// If elements were skipped (slow consumer), the sequence number will show the gap.
+func (c *RingBufferConsumer[T]) Next(ctx context.Context) (*T, uint64, error) {
 	for {
-		// Check if consumer is closed
 		if c.closed {
 			return nil, 0, ErrClosed
 		}
 
-		// Check if ring buffer is closed
+		rb := c.ringBuffer
+		rb.mu.Lock()
+
 		if rb.closed {
+			rb.mu.Unlock()
 			return nil, 0, ErrClosed
 		}
 
-		// Check context
+		// Check if we're too far behind (data was overwritten).
+		if rb.totalPushed > rb.capacity && c.nextSeq < rb.totalPushed-rb.capacity {
+			c.nextSeq = rb.totalPushed - rb.capacity
+		}
+
+		// Check if data is available.
+		if c.nextSeq < rb.totalPushed {
+			elem := rb.buffer[c.nextSeq%rb.capacity]
+			seq := c.nextSeq
+			c.nextSeq++
+			rb.mu.Unlock()
+			return &elem, seq, nil
+		}
+
+		// Get notify channel while holding lock.
+		notify := rb.notify
+		rb.mu.Unlock()
+
+		// Wait for data or cancellation.
 		select {
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
-		default:
+		case <-notify:
+			// Loop and check again.
 		}
-
-		// Check if consumer is too far behind (data was overwritten)
-		oldestAvailable := uint64(0)
-		if rb.totalPushed > rb.capacity {
-			oldestAvailable = rb.totalPushed - rb.capacity
-		}
-		if c.nextSeq < oldestAvailable {
-			// Skip to oldest available
-			c.nextSeq = oldestAvailable
-		}
-
-		// Check if data is available
-		if c.nextSeq < rb.totalPushed {
-			idx := c.nextSeq % rb.capacity
-			element := rb.buffer[idx]
-			seq := c.nextSeq
-			c.nextSeq++
-			return &element, seq, nil
-		}
-
-		// No data available, wait
-		rb.cond.Wait()
 	}
 }
 
-// Close closes the consumer and removes it from the ring buffer.
+// Close closes the consumer. After this point the consumer cannot be used.
+// It is idempotent meaning Close can be called multiple times.
 func (c *RingBufferConsumer[T]) Close() {
-	rb := c.ringBuffer
-
-	rb.mu.Lock()
-	defer rb.mu.Unlock()
-
-	if c.closed {
-		return
-	}
-
 	c.closed = true
-	delete(rb.consumers, c.id)
-	rb.cond.Broadcast()
 }
