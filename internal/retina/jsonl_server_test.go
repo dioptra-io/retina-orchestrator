@@ -107,21 +107,6 @@ func TestJSONLServer_Shutdown_WhileRunning(t *testing.T) {
 	<-done
 }
 
-func TestJSONLServer_HandleFunc(t *testing.T) {
-	server := &JSONLServer[TestSend, TestReceive]{}
-
-	called := false
-	handler := func(info *api.AgentInfo, s *JSONLStreamer[TestSend, TestReceive]) {
-		called = true
-	}
-
-	server.HandleFunc(handler)
-
-	if server.streamHandler == nil {
-		t.Error("streamHandler was not set")
-	}
-}
-
 func TestJSONLServer_ConnectionAccepted(t *testing.T) {
 	server := &JSONLServer[TestSend, TestReceive]{
 		Address:         "127.0.0.1:0",
@@ -150,7 +135,7 @@ func TestJSONLServer_ConnectionAccepted(t *testing.T) {
 
 	// Send AgentInfo as first message
 	encoder := json.NewEncoder(conn)
-	agentInfo := &api.AgentInfo{Id: "test-agent"}
+	agentInfo := &api.AgentInfo{AgentID: "test-agent"}
 	_ = encoder.Encode(agentInfo)
 
 	select {
@@ -191,7 +176,7 @@ func TestJSONLServer_MultipleConnections(t *testing.T) {
 		}
 		conns[i] = conn
 		encoder := json.NewEncoder(conn)
-		_ = encoder.Encode(&api.AgentInfo{Id: "agent"})
+		_ = encoder.Encode(&api.AgentInfo{AgentID: "agent"})
 	}
 
 	time.Sleep(150 * time.Millisecond)

@@ -147,7 +147,7 @@ func (s *JSONLServer[S, R]) handleConnection(streamer *JSONLStreamer[S, R]) {
 	}()
 
 	// The first line agent sends should be the AgentInfo.
-	var agentInfo *api.AgentInfo
+	var agentInfo api.AgentInfo
 
 	if err := streamer.conn.SetReadDeadline(time.Now().Add(s.TCPDeadline)); err != nil {
 		log.Printf("Initial handshake failed on set connection deadline: %v.\n", err)
@@ -157,14 +157,14 @@ func (s *JSONLServer[S, R]) handleConnection(streamer *JSONLStreamer[S, R]) {
 		log.Printf("Initial handshake failed on set connection buffer: %v.\n", err)
 		return
 	}
-	if err := streamer.decoder.Decode(agentInfo); err != nil {
+	if err := streamer.decoder.Decode(&agentInfo); err != nil {
 		log.Printf("Initial handshake failed on decode AgentInfo: %v.\n", err)
 		return
 	}
 
 	// Then call the handler if it is set.
 	if s.streamHandler != nil {
-		s.streamHandler(agentInfo, streamer)
+		s.streamHandler(&agentInfo, streamer)
 	}
 }
 
