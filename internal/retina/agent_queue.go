@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-
-	"github.com/dioptra-io/retina-commons/pkg/api/v1"
 )
 
 var (
@@ -20,26 +18,33 @@ var (
 	ErrKeyExists = errors.New("key already exists")
 )
 
+// AgentInfo is used to represent the connected agent an it's properties. It is
+// imported so that it can be used in other places.
+type AgentInfo struct {
+	// AgentID is the string version of the agent's identifier.
+	AgentID string
+}
+
 // AgentQueue is an implementation of a thread safe set of agents and channels.
 type AgentQueue[T any] struct {
-	set     map[string]*api.AgentInfo
+	set     map[string]*AgentInfo
 	channel map[string]chan *T
 	mu      sync.Mutex
 }
 
 func NewSafeMap[T any]() *AgentQueue[T] {
 	return &AgentQueue[T]{
-		set:     make(map[string]*api.AgentInfo),
+		set:     make(map[string]*AgentInfo),
 		channel: make(map[string]chan *T),
 	}
 }
 
 // Elements returns the current set of elements.
-func (s *AgentQueue[T]) Elements() []*api.AgentInfo {
+func (s *AgentQueue[T]) Elements() []*AgentInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	array := make([]*api.AgentInfo, 0, len(s.set))
+	array := make([]*AgentInfo, 0, len(s.set))
 	for _, e := range s.set {
 		array = append(array, e)
 	}
@@ -47,7 +52,7 @@ func (s *AgentQueue[T]) Elements() []*api.AgentInfo {
 }
 
 // Contains checks if the given key is in the map. Check is done in O(1).
-func (s *AgentQueue[T]) Contains(key string) (*api.AgentInfo, error) {
+func (s *AgentQueue[T]) Contains(key string) (*AgentInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -59,7 +64,7 @@ func (s *AgentQueue[T]) Contains(key string) (*api.AgentInfo, error) {
 
 // AddAgent adds the element to the map. Returns true if element does not
 // already exist.
-func (s *AgentQueue[T]) AddAgent(key string, e *api.AgentInfo) error {
+func (s *AgentQueue[T]) AddAgent(key string, e *AgentInfo) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

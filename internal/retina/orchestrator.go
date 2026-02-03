@@ -11,7 +11,7 @@ import (
 	_ "github.com/dioptra-io/retina-orchestrator/docs"
 	httpSwagger "github.com/swaggo/http-swagger"
 
-	"github.com/dioptra-io/retina-commons/pkg/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v1"
 	"golang.org/x/sync/errgroup"
 )
 

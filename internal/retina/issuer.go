@@ -6,7 +6,7 @@ import (
 	"math/rand"
 	"sync"
 
-	"github.com/dioptra-io/retina-commons/pkg/api/v1"
+	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
 var (
