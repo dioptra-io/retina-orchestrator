@@ -92,8 +92,11 @@ func NewOrchFromConfig(config *Config) *orch {
 	mux.HandleFunc("/directives", orch.handleInsertDirectives)
 	mux.HandleFunc("/swagger/", httpSwagger.WrapHandler)
 
-	// Add the tcp handler.
+	// Add the JSONLServer stream handler.
 	orch.jsonlServer.HandleFunc(orch.handleJSONLStream)
+
+	// Add the JSONLServer's auth handler.
+	orch.jsonlServer.AuthHandleFunc(orch.handleJSONLAuth)
 
 	return &orch
 }
@@ -165,9 +168,16 @@ func (o *orch) Run(parentCtx context.Context) error {
 	return group.Wait()
 }
 
+func (o *orch) handleJSONLAuth(req api.AuthRequest) api.AuthResponse {
+	return api.AuthResponse{
+		Authenticated: true,
+		Message:       "LGTM",
+	}
+}
+
 // handleJSONLStream handles a newly connected agent and streams Probing
 // Directives and Forwarding Info Elements.
-func (o *orch) handleJSONLStream(agentInfo *api.AgentInfo, s *JSONLStreamer[api.ProbingDirective, api.ForwardingInfoElement]) {
+func (o *orch) handleJSONLStream(agentInfo *AgentInfo, s *JSONLStreamer[api.ProbingDirective, api.ForwardingInfoElement]) {
 	// Add and remove the currently connected agent.
 	if err := o.connectedAgents.AddAgent(agentInfo.AgentID, agentInfo); err != nil {
 		log.Printf("Agent with ID %s is already connected, dropping second connection.\n", agentInfo.AgentID)

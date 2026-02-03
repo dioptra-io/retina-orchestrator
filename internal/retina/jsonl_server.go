@@ -20,7 +20,13 @@ var (
 // HandleFunc is the handling function for the stream. If it exists then the
 // stream is closed. It is called in a separate goroutine for each new
 // connection.
-type HandleFunc[S any, R any] func(info *api.AgentInfo, s *JSONLStreamer[S, R])
+type HandleFunc[S any, R any] func(info *AgentInfo, s *JSONLStreamer[S, R])
+
+// AuthHandleFunc is the handling function for the stream. It gets the
+// api.AuthRequest from the agent and returns the api.AuthResponse. If the
+// Authenticated field is false then the connection closed. The api.AuthResponse
+// object is send to the agent all the times.
+type AuthHandleFunc func(req api.AuthRequest) api.AuthResponse
 
 // JSONLServer is the implementation of the tcp socket where the type S is sent,
 // and R is received as json lines.
@@ -34,6 +40,9 @@ type JSONLServer[S any, R any] struct {
 
 	// streamHandler is the function called for each new connection.
 	streamHandler HandleFunc[S, R]
+	// authHandler is the function called for each new connection's
+	// authentification handling.
+	authHandler AuthHandleFunc
 	// closed indicates if the server has been shut down.
 	closed bool
 	// mutex protects the server state.
@@ -51,6 +60,11 @@ type JSONLServer[S any, R any] struct {
 // HandleFunc sets the handler to the given function.
 func (s *JSONLServer[S, R]) HandleFunc(handler HandleFunc[S, R]) {
 	s.streamHandler = handler
+}
+
+// AuthHandleFunc sets the authentification handler to the given function.
+func (s *JSONLServer[S, R]) AuthHandleFunc(handler AuthHandleFunc) {
+	s.authHandler = handler
 }
 
 // ListenAndServe starts the server. It spawns a new goroutine for each new
@@ -146,8 +160,8 @@ func (s *JSONLServer[S, R]) handleConnection(streamer *JSONLStreamer[S, R]) {
 		s.removeStreamer(streamer)
 	}()
 
-	// The first line agent sends should be the AgentInfo.
-	var agentInfo api.AgentInfo
+	// The first line agent sends should be the AuthRequest.
+	var agentAuthRequest api.AuthRequest
 
 	if err := streamer.conn.SetReadDeadline(time.Now().Add(s.TCPDeadline)); err != nil {
 		log.Printf("Initial handshake failed on set connection deadline: %v.\n", err)
@@ -157,14 +171,34 @@ func (s *JSONLServer[S, R]) handleConnection(streamer *JSONLStreamer[S, R]) {
 		log.Printf("Initial handshake failed on set connection buffer: %v.\n", err)
 		return
 	}
-	if err := streamer.decoder.Decode(&agentInfo); err != nil {
-		log.Printf("Initial handshake failed on decode AgentInfo: %v.\n", err)
+	if err := streamer.decoder.Decode(&agentAuthRequest); err != nil {
+		log.Printf("Initial handshake failed on decode AuthRequest: %v.\n", err)
 		return
 	}
 
+	// Get the authentification response from the auth handler.
+	var agentInfo *AgentInfo
+	var agentAuthResponse api.AuthResponse
+	if s.authHandler != nil {
+		agentAuthResponse = s.authHandler(agentAuthRequest)
+	}
+
+	// Send the api.AuthResponse to the agent.
+	if err := streamer.encoder.Encode(agentAuthResponse); err != nil {
+		log.Printf("Initial handshake failed on decode AuthResponse: %v.\n", err)
+	}
+
+	// If the auth handler fails then close the connection.
+	if !agentAuthResponse.Authenticated {
+		log.Printf("Agent authentification failed on request from: %v.\n", streamer.conn.RemoteAddr())
+		return
+	}
+
+	log.Printf("Agent authentification succeeded from %v.\n", streamer.conn.RemoteAddr())
+
 	// Then call the handler if it is set.
 	if s.streamHandler != nil {
-		s.streamHandler(&agentInfo, streamer)
+		s.streamHandler(agentInfo, streamer)
 	}
 }
 
