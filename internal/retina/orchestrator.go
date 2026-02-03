@@ -46,6 +46,8 @@ type Config struct {
 	PDSchedulerCooldown time.Duration
 	// PDSleepDuration is the time to sleep if there are no probing directives.
 	PDSleepDuration time.Duration
+	// AgentAuthSecret is the secret used by agents to authenticate.
+	AgentAuthSecret string
 }
 
 // orch is the implementation of the retina orchestrator.
@@ -168,10 +170,27 @@ func (o *orch) Run(parentCtx context.Context) error {
 	return group.Wait()
 }
 
+// handleJSONLAuth is used to handle the incoming connections from agents. It
+// checks for two conditions. First, it checks is the secrets match. Second, it
+// checks if the AgentID on the request is already connected.
 func (o *orch) handleJSONLAuth(req api.AuthRequest) api.AuthResponse {
+	if req.Secret != o.config.AgentAuthSecret {
+		return api.AuthResponse{
+			Authenticated: false,
+			Message:       "Secrets does not match.",
+		}
+	}
+
+	if _, err := o.connectedAgents.Contains(req.AgentID); err == nil {
+		return api.AuthResponse{
+			Authenticated: false,
+			Message:       "Agent with that AgentID is already connected.",
+		}
+	}
+
 	return api.AuthResponse{
 		Authenticated: true,
-		Message:       "LGTM",
+		Message:       "Succes.",
 	}
 }
 

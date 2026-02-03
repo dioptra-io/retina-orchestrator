@@ -20,6 +20,7 @@ func main() {
 		tcpTimeout          = flag.Duration("jsonl-timeout", 5*time.Minute, "JSONL connection timeout")
 		ringBufferCapacity  = flag.Uint64("rb-cap", 64*1024, "Capacity of the ring buffer")
 		pdSchedulerCooldown = flag.Duration("scheduler-cooldown", time.Second, "Probing directive scheduler's cooldown")
+		agentAuthSecret     = flag.String("agent-auth-secret", "", "Secret used by the agents to authenticate.")
 	)
 	flag.Parse()
 
@@ -34,6 +35,7 @@ func main() {
 		AgentTCPTimeout:     *tcpTimeout,
 		RingBufferCapacity:  *ringBufferCapacity,
 		PDSchedulerCooldown: *pdSchedulerCooldown,
+		AgentAuthSecret:     *agentAuthSecret,
 	})
 
 	if err := orch.Run(ctx); err != nil && !errors.Is(err, ctx.Err()) {
