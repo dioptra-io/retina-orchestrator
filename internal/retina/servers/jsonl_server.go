@@ -13,9 +13,16 @@ import (
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
+// JSONLAuthStatus contains the information after agent's authentication.
+type JSONLAuthStatus struct {
+	AgentID       string
+	RemoteAddress net.Addr
+	LocalAddress  net.Addr
+}
+
 // StreamHandleFunc is the handling function for the stream. It is called in a
 // separate goroutine for each new connection.
-type StreamHandleFunc func(s *JSONLStream)
+type StreamHandleFunc func(status *JSONLAuthStatus, s *JSONLStream)
 
 // AuthHandleFunc is the handling function for the stream. It gets the
 // api.AuthRequest from the agent and returns the api.AuthResponse. If the
@@ -56,17 +63,16 @@ type JSONLServer struct {
 	closeWG sync.WaitGroup
 }
 
-// newJSONLServer creates a new JSONL server from the provided arguments.
+// NewJSONLServer creates a new JSONL server from the provided arguments.
 func NewJSONLServer(config *JSONLServerConfig) (*JSONLServer, error) {
-	// Check config values.
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
-	if config.TCPBufferLength <= 8192 {
+	if config.TCPBufferLength < 8192 {
 		return nil, fmt.Errorf("tcp buffer length is too small: got %d, minimum 8192", config.TCPBufferLength)
 	}
-	if config.TCPTimeout.Seconds() == 0.0 {
-		return nil, fmt.Errorf("tcp timeout is not valid: got %s", config.TCPTimeout.String())
+	if config.TCPTimeout <= 0 {
+		return nil, fmt.Errorf("tcp timeout must be positive: got %s", config.TCPTimeout)
 	}
 	if config.Address == "" {
 		return nil, fmt.Errorf("jsonl server address cannot be empty")
@@ -90,12 +96,13 @@ func (s *JSONLServer) ListenAndServe() error {
 		return ErrServerClosed
 	}
 
-	// This listener is closed by the Close method.
 	listener, err := net.Listen("tcp", s.config.Address)
 	if err != nil {
 		return err
 	}
+	s.mutex.Lock()
 	s.listener = listener
+	s.mutex.Unlock()
 
 	if s.closed.Load() {
 		return ErrServerClosed
@@ -115,6 +122,7 @@ func (s *JSONLServer) ListenAndServe() error {
 		streamer := newJSONLStreamer(s.nextID, tcpConn, s)
 		s.activeStreamers[s.nextID] = streamer
 		s.nextID++
+		s.closeWG.Add(1)
 		s.mutex.Unlock()
 
 		go s.handleConnection(streamer)
@@ -124,94 +132,85 @@ func (s *JSONLServer) ListenAndServe() error {
 // Shutdown closes the listener and all open connections. Calling this method
 // will cancel the context of all the JSONLStreamers.
 func (s *JSONLServer) Shutdown(ctx context.Context) error {
-	if s.closed.Load() {
+	if s.closed.Swap(true) {
 		return nil
 	}
 
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	if s.listener != nil {
 		_ = s.listener.Close()
+		s.listener = nil
 	}
-
 	for _, streamer := range s.activeStreamers {
 		s.removeStreamer(streamer)
 	}
+	s.mutex.Unlock()
 
-	s.closed.Store(true)
-
-	// Waits until all of the streamers are closed.
-	s.closeWG.Wait()
-	return nil
+	// Wait for active goroutines to finish, but respect the deadline.
+	done := make(chan struct{})
+	go func() {
+		s.closeWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // handleConnection invokes the handler with the newly created JSONLStreamer,
 // then it closes it.
 func (s *JSONLServer) handleConnection(stream *JSONLStream) {
-	s.closeWG.Add(1)
-
 	defer func() {
 		s.mutex.Lock()
 		defer s.mutex.Unlock()
 		s.removeStreamer(stream)
 	}()
 
-	// The first line agent sends should be the AuthRequest.
-	var agentAuthRequest api.AuthRequest
-	if err := stream.conn.SetReadDeadline(time.Now().Add(s.config.TCPTimeout)); err != nil {
-		log.Printf("Initial handshake failed on set connection deadline: %v.\n", err)
+	// Initial handshake.
+	agentAuthRequest, err := receive[api.AuthRequest](stream.conn, stream.decoder, s.config.TCPTimeout, s.config.TCPBufferLength)
+	if err != nil {
+		log.Printf("Initial handshake failed: cannot receive api.AuthRequest: %v.\n", err)
 		return
 	}
-	if err := stream.conn.SetReadBuffer(s.config.TCPBufferLength); err != nil {
-		log.Printf("Initial handshake failed on set connection buffer: %v.\n", err)
+	agentAuthResponse := s.config.AuthHandler(*agentAuthRequest)
+	err = send[api.AuthResponse](stream.conn, stream.encoder, s.config.TCPTimeout, s.config.TCPBufferLength, &agentAuthResponse)
+	if err != nil {
+		log.Printf("Initial handshake failed: cannot send api.AuthResponse: %v.\n", err)
 		return
 	}
-	if err := stream.decoder.Decode(&agentAuthRequest); err != nil {
-		log.Printf("Initial handshake failed on decode AuthRequest: %v.\n", err)
-		return
-	}
-
-	// Get the authentification response from the auth handler.
-	var agentAuthResponse api.AuthResponse
-	agentAuthResponse = s.config.AuthHandler(agentAuthRequest)
-
-	// Send the api.AuthResponse to the agent.
-	if err := stream.encoder.Encode(agentAuthResponse); err != nil {
-		log.Printf("Initial handshake failed on decode AuthResponse: %v.\n", err)
-	}
-
-	// If the auth handler fails then close the connection.
 	if !agentAuthResponse.Authenticated {
-		log.Printf("Agent authentification failed on request from: %v.\n", stream.conn.RemoteAddr())
+		log.Printf("Initial handshake failed: agent is not authenticated.\n")
 		return
 	}
 
-	// Populate the agentID from the authentification request.
-	stream.agentID = agentAuthRequest.AgentID
-
+	// Agent is authenticated, invoke stream handler.
+	status := &JSONLAuthStatus{
+		AgentID:       agentAuthRequest.AgentID,
+		LocalAddress:  stream.conn.LocalAddr(),
+		RemoteAddress: stream.conn.RemoteAddr(),
+	}
 	log.Printf("Agent authentification succeeded from %v.\n", stream.conn.RemoteAddr())
-
-	// Then call the handler if it is set.
-	s.config.StreamHandler(stream)
+	s.config.StreamHandler(status, stream)
 }
 
-// removeStreamer closes the streamer's connection, cancels it context, removes
-// it from the active streamers set, and releases the close waiting group.
-// This method is not protected by the mutex.
+// removeStreamer cancels the streamer's context, closes its connection, removes
+// it from the active streamers map, and releases the WaitGroup slot.
+// Must be called with s.mutex held. Must only be called once per streamer.
 func (s *JSONLServer) removeStreamer(streamer *JSONLStream) {
-	_ = streamer.conn.Close()
-	// Only call Done if streamer is still in the map (not already removed)
-	if _, exists := s.activeStreamers[streamer.id]; exists {
-		delete(s.activeStreamers, streamer.id)
-		s.closeWG.Done()
+	if _, ok := s.activeStreamers[streamer.id]; !ok {
+		return
 	}
+	streamer.cancel()
+	_ = streamer.conn.Close()
+	delete(s.activeStreamers, streamer.id)
+	s.closeWG.Done()
 }
 
 // JSONLStream is the streamer struct that is returned on the handle function.
 type JSONLStream struct {
-	// agentID is the id of the connected agent.
-	agentID string
 	// id is the identifier in the server.
 	id int
 	// ctx is the context of the JSONLStreamer.
@@ -222,7 +221,7 @@ type JSONLStream struct {
 	conn *net.TCPConn
 	// encoder is the JSON encoder that writes to the tcp socket.
 	encoder *json.Encoder
-	// decoder is the JSON decoder that reads from the tcp scoket.
+	// decoder is the JSON decoder that reads from the tcp socket.
 	decoder *json.Decoder
 	// server is the JSONLServer.
 	server *JSONLServer
@@ -239,7 +238,6 @@ func newJSONLStreamer(id int, conn *net.TCPConn, server *JSONLServer) *JSONLStre
 		encoder: json.NewEncoder(conn),
 		decoder: json.NewDecoder(conn),
 		server:  server,
-		agentID: "", // This will be populated later after authentification.
 	}
 }
 
@@ -253,38 +251,47 @@ func (s *JSONLStream) ID() int {
 	return s.id
 }
 
-// AgentID returns the connected agent's id.
-func (s *JSONLStream) AgentID() string {
-	return s.agentID
+// Send sends the given element to the tcp connection encoded as a JSON line.
+func (s *JSONLStream) Send(e *api.ProbingDirective) error {
+	return send[api.ProbingDirective](s.conn, s.encoder, s.server.config.TCPTimeout, s.server.config.TCPBufferLength, e)
 }
 
-// Send sends the given element to the tcp encoded as a JSON. If the streamer is
-// closed the Send method unblocks.
-func (s *JSONLStream) Send(e *api.ProbingDirective) error {
-	if err := s.conn.SetWriteDeadline(time.Now().Add(s.server.config.TCPTimeout)); err != nil {
-		return err
+// Receive reads the next element from the tcp connection decoded from a JSON line.
+func (s *JSONLStream) Receive() (*api.ForwardingInfoElement, error) {
+	return receive[api.ForwardingInfoElement](s.conn, s.decoder, s.server.config.TCPTimeout, s.server.config.TCPBufferLength)
+}
+
+// send tries to send the specified type of object from the tcp connection while
+// setting up the write deadline and write buffer.
+//
+// It returns the wrapped error if any of the operations fail.
+func send[E any](conn *net.TCPConn, encoder *json.Encoder, timeout time.Duration, buffer int, e *E) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("send failed: cannot set write deadline: %w", err)
 	}
-	if err := s.conn.SetWriteBuffer(s.server.config.TCPBufferLength); err != nil {
-		return err
+	if err := conn.SetWriteBuffer(buffer); err != nil {
+		return fmt.Errorf("send failed: cannot set write buffer: %w", err)
 	}
-	if err := s.encoder.Encode(e); err != nil {
-		return err
+	if err := encoder.Encode(e); err != nil {
+		return fmt.Errorf("send failed: cannot encode: %w", err)
 	}
 	return nil
 }
 
-// Receive sends the given element to the tcp encoded as a JSON. If the streamer
-// is closed the Receive method unblocks.
-func (s *JSONLStream) Receive() (*api.ForwardingInfoElement, error) {
-	var e *api.ForwardingInfoElement
-	if err := s.conn.SetReadDeadline(time.Now().Add(s.server.config.TCPTimeout)); err != nil {
-		return nil, err
+// receive tries to receive the specified type of object from the tcp
+// connection while setting up the read deadline and read buffer.
+//
+// It returns the wrapped error if any of the operations fail.
+func receive[E any](conn *net.TCPConn, decoder *json.Decoder, timeout time.Duration, buffer int) (*E, error) {
+	var e E
+	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, fmt.Errorf("receive failed: cannot set read deadline: %w", err)
 	}
-	if err := s.conn.SetReadBuffer(s.server.config.TCPBufferLength); err != nil {
-		return nil, err
+	if err := conn.SetReadBuffer(buffer); err != nil {
+		return nil, fmt.Errorf("receive failed: cannot set read buffer: %w", err)
 	}
-	if err := s.decoder.Decode(e); err != nil {
-		return nil, err
+	if err := decoder.Decode(&e); err != nil {
+		return nil, fmt.Errorf("receive failed: cannot decode: %w", err)
 	}
-	return e, nil
+	return &e, nil
 }
