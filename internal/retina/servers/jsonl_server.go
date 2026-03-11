@@ -131,10 +131,15 @@ func (s *JSONLServer) ListenAndServe() error {
 
 // Shutdown closes the listener and all open connections. Calling this method
 // will cancel the context of all the JSONLStreamers.
-func (s *JSONLServer) Shutdown(ctx context.Context) error {
+//
+// Multiple calls would not change the status and return a nil error.
+func (s *JSONLServer) Shutdown(timeout time.Duration) error {
 	if s.closed.Swap(true) {
 		return nil
 	}
+
+	exitCtx, exitCancel := context.WithTimeout(context.Background(), timeout)
+	defer exitCancel()
 
 	s.mutex.Lock()
 	if s.listener != nil {
@@ -152,11 +157,12 @@ func (s *JSONLServer) Shutdown(ctx context.Context) error {
 		s.closeWG.Wait()
 		close(done)
 	}()
+
 	select {
 	case <-done:
 		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	case <-exitCtx.Done():
+		return exitCtx.Err()
 	}
 }
 
@@ -176,7 +182,7 @@ func (s *JSONLServer) handleConnection(stream *JSONLStream) {
 		return
 	}
 	agentAuthResponse := s.config.AuthHandler(*agentAuthRequest)
-	err = send[api.AuthResponse](stream.conn, stream.encoder, s.config.TCPTimeout, s.config.TCPBufferLength, &agentAuthResponse)
+	err = send(stream.conn, stream.encoder, s.config.TCPTimeout, s.config.TCPBufferLength, &agentAuthResponse)
 	if err != nil {
 		log.Printf("Initial handshake failed: cannot send api.AuthResponse: %v.\n", err)
 		return
