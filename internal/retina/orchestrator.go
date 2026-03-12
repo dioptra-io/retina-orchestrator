@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/probing"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/servers"
+	"github.com/dioptra-io/retina-orchestrator/internal/retina/structures"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -53,6 +55,8 @@ type orch struct {
 	// jsonlServer is the jsonl server implementation used to communicate PDs
 	// and FIEs.
 	jsonlServer *servers.JSONLServer
+	// pdQueue is the queue for generated probing directives.
+	pdQueue *structures.Queue[api.ProbingDirective]
 }
 
 func NewOrchFromConfig(config *Config) (*orch, error) {
@@ -87,6 +91,10 @@ func NewOrchFromConfig(config *Config) (*orch, error) {
 		return nil, fmt.Errorf("error on creating jsonl server: %w", err)
 	}
 	o.jsonlServer = jsonlServer
+
+	// Create pd queue
+	pdQueue := structures.NewQueue[api.ProbingDirective](100)
+	o.pdQueue = pdQueue
 
 	return o, nil
 }
@@ -123,10 +131,12 @@ func (o *orch) runScheduler(ctx context.Context) error {
 		pd = o.scheduler.Issue()
 		if pd == nil {
 			log.Println("Bernoulli experiment failed, skipping PD.")
+			continue
 		}
 
-		// TODO: implement.
-		fmt.Printf("pd: %v\n", pd)
+		if err := o.pdQueue.Push(ctx, pd.AgentID, pd); err != nil {
+			log.Printf("Cannot find the queue for agent id %v", pd.AgentID)
+		}
 	}
 }
 
@@ -163,14 +173,73 @@ func (o *orch) runJSONLServer(ctx context.Context) error {
 // httpStreamHandler is the http handler for the http server.
 func (o *orch) httpStreamHandler(info *servers.FIEStreamerInfo, s *servers.FIEStreamer) {
 	// TODO: implement.
+	// for {
+	// 	select {
+	// 	case <-s.Context().Done():
+	// 		return
+	// 	default:
+	// 	}
+	//
+	// 	fie, err := o.ringBuffer.Pull()
+	// 	if err != nil {
+	// 		return
+	// 	}
+	//
+	// 	err = s.Send(fie)
+	// 	if err != nil {
+	// 		return
+	// 	}
+	// }
 }
 
 // jsonlStreamHandler is the handler for streaming.
 func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JSONLStream) {
-	// TODO: implement.
+	o.pdQueue.Subscribe(status.AgentID)
+	defer o.pdQueue.Unsubscribe(status.AgentID)
+
+	group, ctx := errgroup.WithContext(s.Context())
+
+	group.Go(func() error {
+		for {
+			_, err := s.Receive()
+			if err != nil {
+				return err
+			}
+
+			// TODO: implement.
+			// o.ringBuffer.Push(fie)
+		}
+	})
+	group.Go(func() error {
+		for {
+			pd, err := o.pdQueue.Pop(ctx, status.AgentID)
+			if err != nil {
+				return err
+			}
+
+			err = s.Send(pd)
+			if err != nil {
+				return err
+			}
+		}
+	})
+
+	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+		log.Printf("jsonl stream handler failed: %v\n", err)
+	}
+	log.Println("jsonl stream handler exited")
 }
 
 // jsonlAuthHandler is the auth handler for the jsonl server.
 func (o *orch) jsonlAuthHandler(auth api.AuthRequest) api.AuthResponse {
-	return api.AuthResponse{}
+	if strings.Compare(auth.Secret, o.config.SecretString) == 0 {
+		return api.AuthResponse{
+			Authenticated: true,
+			Message:       "authenticated",
+		}
+	}
+	return api.AuthResponse{
+		Authenticated: false,
+		Message:       "secret is not correct",
+	}
 }
