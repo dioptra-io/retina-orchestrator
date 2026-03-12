@@ -156,6 +156,10 @@ func (s *FIEStreamer) Send(fie *api.ForwardingInfoElement) error {
 	return nil
 }
 
+func (s *FIEStreamer) Context() context.Context {
+	return s.ctx
+}
+
 type FIEStreamerInfo struct {
 	UserAgent     string
 	RemoteAddress string
