@@ -1,0 +1,245 @@
+package retina
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-orchestrator/internal/retina/probing"
+	"github.com/dioptra-io/retina-orchestrator/internal/retina/servers"
+	"github.com/dioptra-io/retina-orchestrator/internal/retina/structures"
+	"golang.org/x/sync/errgroup"
+)
+
+// Config is the main configuration struct used in the orchestrator.
+type Config struct {
+	// JSONLServerAddress is the listening address of the JSONL server between
+	// retina-orchestrator and retina-agent.
+	JSONLServerAddress string
+	// JSONLBufferLength is the allocated send and receive buffer length for JSONL
+	// server.
+	JSONLBufferLength int
+	// JSONLTimeout is the timeout value for JSONL server.
+	JSONLTimeout time.Duration
+
+	// HTTPServerAddress is the address of the HTTP server used to add
+	// directives and stream data.
+	HTTPServerAddress string
+	// HTTPTimeout is the timeout value for the http server.
+	HTTPTimeout time.Duration
+
+	// PDPath is the filepath of the file that stores the ProbingDirectives.
+	PDPath string
+	// Seed is the seed used in the randomizer.
+	Seed uint64
+	// IssueRate denotes the number of PDs issued per second.
+	IssueRate float64
+	// ImpactCap is desired maximum impact capacity per address for the system.
+	ImpactCap float64
+	// SecretString is the provided secret via command lines. This is an MVS
+	// feature and will be removed soon.
+	SecretString string
+}
+
+type orch struct {
+	config *Config
+	// scheduler schedules the ProbingDirectives and updates by the responses
+	// from ForwardingInfoElements and implements respoinsible probing.
+	scheduler *probing.Scheduler
+	// httpServer is used to provide an server to explore orchestrator.
+	httpServer *servers.HTTPServer
+	// jsonlServer is the jsonl server implementation used to communicate PDs
+	// and FIEs.
+	jsonlServer *servers.JSONLServer
+	// pdQueue is the queue for generated probing directives.
+	pdQueue *structures.Queue[api.ProbingDirective]
+}
+
+func NewOrchFromConfig(config *Config) (*orch, error) {
+	o := &orch{config: config}
+
+	// Create the Scheduler.
+	scheduler, err := probing.NewScheduler(config.Seed, config.IssueRate, config.PDPath)
+	if err != nil {
+		return nil, fmt.Errorf("error on creating scheduler: %w", err)
+	}
+	o.scheduler = scheduler
+
+	// Create the http server.
+	httpServer, err := servers.NewHTTPServer(&servers.HTTPServerConfig{
+		Address:       config.HTTPServerAddress,
+		StreamHandler: o.httpStreamHandler,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error on creating http server: %w", err)
+	}
+	o.httpServer = httpServer
+
+	// Create the jsonl server.
+	jsonlServer, err := servers.NewJSONLServer(&servers.JSONLServerConfig{
+		TCPBufferLength: config.JSONLBufferLength,
+		TCPTimeout:      config.JSONLTimeout,
+		Address:         config.JSONLServerAddress,
+		StreamHandler:   o.jsonlStreamHandler,
+		AuthHandler:     o.jsonlAuthHandler,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error on creating jsonl server: %w", err)
+	}
+	o.jsonlServer = jsonlServer
+
+	// Create pd queue
+	pdQueue := structures.NewQueue[api.ProbingDirective](100)
+	o.pdQueue = pdQueue
+
+	return o, nil
+}
+
+func (o *orch) Run(parentCtx context.Context) error {
+	// Create a errgroup and run each components individually. If the context is
+	// cancelled then the whole system is cancelled.
+	group, ctx := errgroup.WithContext(parentCtx)
+	group.Go(func() error {
+		return o.runHTTPServer(ctx)
+	})
+	group.Go(func() error {
+		return o.runJSONLServer(ctx)
+	})
+	group.Go(func() error {
+		return o.runScheduler(ctx)
+	})
+
+	return group.Wait()
+}
+
+// runScheduler starts the scheduler loop for issuing new ProbingDirectives
+// using the respoinsible probing algorithm.
+func (o *orch) runScheduler(ctx context.Context) error {
+	var pd *api.ProbingDirective
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		pd = o.scheduler.Issue()
+		if pd == nil {
+			log.Println("Bernoulli experiment failed, skipping PD.")
+			continue
+		}
+
+		if err := o.pdQueue.Push(ctx, pd.AgentID, pd); err != nil {
+			log.Printf("Cannot find the queue for agent id %v", pd.AgentID)
+		}
+	}
+}
+
+func (o *orch) runHTTPServer(ctx context.Context) error {
+	group, ctx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		return o.httpServer.ListenAndServe()
+	})
+	group.Go(func() error {
+		<-ctx.Done()
+		return o.httpServer.Shutdown(3 * time.Second)
+	})
+	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+		return err
+	}
+	return nil
+}
+
+func (o *orch) runJSONLServer(ctx context.Context) error {
+	group, ctx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		return o.jsonlServer.ListenAndServe()
+	})
+	group.Go(func() error {
+		<-ctx.Done()
+		return o.jsonlServer.Shutdown(3 * time.Second)
+	})
+	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+		return err
+	}
+	return nil
+}
+
+// httpStreamHandler is the http handler for the http server.
+func (o *orch) httpStreamHandler(info *servers.FIEStreamerInfo, s *servers.FIEStreamer) {
+	// TODO: implement.
+	// for {
+	// 	select {
+	// 	case <-s.Context().Done():
+	// 		return
+	// 	default:
+	// 	}
+	//
+	// 	fie, err := o.ringBuffer.Pull()
+	// 	if err != nil {
+	// 		return
+	// 	}
+	//
+	// 	err = s.Send(fie)
+	// 	if err != nil {
+	// 		return
+	// 	}
+	// }
+}
+
+// jsonlStreamHandler is the handler for streaming.
+func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JSONLStream) {
+	o.pdQueue.Subscribe(status.AgentID)
+	defer o.pdQueue.Unsubscribe(status.AgentID)
+
+	group, ctx := errgroup.WithContext(s.Context())
+
+	group.Go(func() error {
+		for {
+			_, err := s.Receive()
+			if err != nil {
+				return err
+			}
+
+			// TODO: implement.
+			// o.ringBuffer.Push(fie)
+		}
+	})
+	group.Go(func() error {
+		for {
+			pd, err := o.pdQueue.Pop(ctx, status.AgentID)
+			if err != nil {
+				return err
+			}
+
+			err = s.Send(pd)
+			if err != nil {
+				return err
+			}
+		}
+	})
+
+	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+		log.Printf("jsonl stream handler failed: %v\n", err)
+	}
+	log.Println("jsonl stream handler exited")
+}
+
+// jsonlAuthHandler is the auth handler for the jsonl server.
+func (o *orch) jsonlAuthHandler(auth api.AuthRequest) api.AuthResponse {
+	if strings.Compare(auth.Secret, o.config.SecretString) == 0 {
+		return api.AuthResponse{
+			Authenticated: true,
+			Message:       "authenticated",
+		}
+	}
+	return api.AuthResponse{
+		Authenticated: false,
+		Message:       "secret is not correct",
+	}
+}
