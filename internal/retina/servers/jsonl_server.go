@@ -118,7 +118,11 @@ func (s *JSONLServer) ListenAndServe() error {
 		}
 
 		s.mutex.Lock()
-		tcpConn, _ := conn.(*net.TCPConn)
+		tcpConn, ok := conn.(*net.TCPConn)
+		if !ok {
+			s.mutex.Unlock()
+			return fmt.Errorf("expected TCP connection, got %T", conn)
+		}
 		streamer := newJSONLStreamer(s.nextID, tcpConn, s)
 		s.activeStreamers[s.nextID] = streamer
 		s.nextID++
