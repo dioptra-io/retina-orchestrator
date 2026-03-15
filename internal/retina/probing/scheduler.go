@@ -50,7 +50,7 @@ type Scheduler struct {
 	cyclePeriod time.Duration
 	// issuePeriod is the time between two directive issues.
 	issuePeriod time.Duration
-	// randomizer is used to randomize the indicies.
+	// randomizer is used to randomize the indices.
 	randomizer *randomizer
 	// random used for bernoulli experiment.
 	random *rand.Rand
@@ -76,7 +76,7 @@ func newSchedulerFromPDs(seed uint64, issueRate float64, pds []*api.ProbingDirec
 
 	// Create the directiveMap and populate with the given set of directives.
 	directiveMap := make(map[uint64]*directiveEntry, len(pds))
-	indicies := make([]uint64, 0, len(pds))
+	indices := make([]uint64, 0, len(pds))
 	for _, pd := range pds {
 		// Register to the directive map.
 		// Default values is issuance prob of 1.0 and nil near and far
@@ -88,11 +88,11 @@ func newSchedulerFromPDs(seed uint64, issueRate float64, pds []*api.ProbingDirec
 			issuanceProb:       1.0,
 		}
 
-		// Add to the indicies array.
-		indicies = append(indicies, pd.ProbingDirectiveID)
+		// Add to the indices array.
+		indices = append(indices, pd.ProbingDirectiveID)
 	}
 
-	randomizer, err := newRandomizer(seed, indicies)
+	randomizer, err := newRandomizer(seed, indices)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create randomizer: %w", err)
 	}
@@ -123,7 +123,9 @@ func (s *Scheduler) Issue() *api.ProbingDirective {
 	s.current = (s.current + 1) % uint64(s.numPDs) // #nosec G115
 
 	// Apply rate-limiting.
-	time.Sleep(time.Until(s.lastIssue.Add(s.issuePeriod)))
+	if !s.lastIssue.IsZero() {
+		time.Sleep(time.Until(s.lastIssue.Add(s.issuePeriod)))
+	}
 	s.lastIssue = time.Now()
 
 	if s.random.Float64() < dEntry.issuanceProb {
@@ -164,10 +166,14 @@ func (s *Scheduler) Update(fie *api.ForwardingInfoElement) error {
 	// Update the issuance probability.
 	numNearImpacts, numFarImpacts := 0, 0
 	if dEntry.lastHitNearAddress != nil {
-		numNearImpacts = len(s.addressImpactMap[dEntry.lastHitNearAddress.To16().String()].directives)
+		if entry, ok := s.addressImpactMap[dEntry.lastHitNearAddress.To16().String()]; ok {
+			numNearImpacts = len(entry.directives)
+		}
 	}
 	if dEntry.lastHitFarAddress != nil {
-		numFarImpacts = len(s.addressImpactMap[dEntry.lastHitFarAddress.To16().String()].directives)
+		if entry, ok := s.addressImpactMap[dEntry.lastHitFarAddress.To16().String()]; ok {
+			numFarImpacts = len(entry.directives)
+		}
 	}
 
 	denominator := max(numNearImpacts, numFarImpacts)
