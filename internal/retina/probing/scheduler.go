@@ -50,7 +50,7 @@ type Scheduler struct {
 	cyclePeriod time.Duration
 	// issuePeriod is the time between two directive issues.
 	issuePeriod time.Duration
-	// randomizer is used to randomize the indicies.
+	// randomizer is used to randomize the indices.
 	randomizer *randomizer
 	// random used for bernoulli experiment.
 	random *rand.Rand
@@ -76,7 +76,7 @@ func newSchedulerFromPDs(seed uint64, issueRate float64, pds []*api.ProbingDirec
 
 	// Create the directiveMap and populate with the given set of directives.
 	directiveMap := make(map[uint64]*directiveEntry, len(pds))
-	indicies := make([]uint64, 0, len(pds))
+	indices := make([]uint64, 0, len(pds))
 	for _, pd := range pds {
 		// Register to the directive map.
 		// Default values is issuance prob of 1.0 and nil near and far
@@ -88,11 +88,11 @@ func newSchedulerFromPDs(seed uint64, issueRate float64, pds []*api.ProbingDirec
 			issuanceProb:       1.0,
 		}
 
-		// Add to the indicies array.
-		indicies = append(indicies, pd.ProbingDirectiveID)
+		// Add to the indices array.
+		indices = append(indices, pd.ProbingDirectiveID)
 	}
 
-	randomizer, err := newRandomizer(seed, indicies)
+	randomizer, err := newRandomizer(seed, indices)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create randomizer: %w", err)
 	}
