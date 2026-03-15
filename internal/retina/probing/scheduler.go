@@ -123,7 +123,9 @@ func (s *Scheduler) Issue() *api.ProbingDirective {
 	s.current = (s.current + 1) % uint64(s.numPDs) // #nosec G115
 
 	// Apply rate-limiting.
-	time.Sleep(time.Until(s.lastIssue.Add(s.issuePeriod)))
+	if !s.lastIssue.IsZero() {
+		time.Sleep(time.Until(s.lastIssue.Add(s.issuePeriod)))
+	}
 	s.lastIssue = time.Now()
 
 	if s.random.Float64() < dEntry.issuanceProb {
