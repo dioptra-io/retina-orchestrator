@@ -35,11 +35,10 @@ func (q *Queue[T]) Unsubscribe(id string) {
 }
 
 func (q *Queue[T]) Push(ctx context.Context, id string, item *T) (err error) {
-	q.mu.RLock()
+	q.mu.Lock()
 	ch, ok := q.subscribers[id]
-	q.mu.RUnlock()
-
 	if !ok {
+		q.mu.Unlock()
 		return fmt.Errorf("subscriber %q not found", id)
 	}
 
@@ -51,28 +50,32 @@ func (q *Queue[T]) Push(ctx context.Context, id string, item *T) (err error) {
 
 	select {
 	case ch <- item:
+		q.mu.Unlock()
 		return nil
 	case <-ctx.Done():
+		q.mu.Unlock()
 		return ctx.Err()
 	}
 }
 
 func (q *Queue[T]) Pop(ctx context.Context, id string) (*T, error) {
-	q.mu.RLock()
+	q.mu.Lock()
 	ch, ok := q.subscribers[id]
-	q.mu.RUnlock()
-
 	if !ok {
+		q.mu.Unlock()
 		return nil, fmt.Errorf("subscriber %q not found", id)
 	}
 
 	select {
 	case item, open := <-ch:
 		if !open {
+			q.mu.Unlock()
 			return nil, fmt.Errorf("subscriber %q queue is closed", id)
 		}
+		q.mu.Unlock()
 		return item, nil
 	case <-ctx.Done():
+		q.mu.Unlock()
 		return nil, ctx.Err()
 	}
 }
