@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
@@ -232,7 +231,7 @@ func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JS
 
 // jsonlAuthHandler is the auth handler for the jsonl server.
 func (o *orch) jsonlAuthHandler(auth api.AuthRequest) api.AuthResponse {
-	if strings.Compare(auth.Secret, o.config.SecretString) == 0 {
+	if auth.Secret == o.config.SecretString {
 		return api.AuthResponse{
 			Authenticated: true,
 			Message:       "authenticated",
