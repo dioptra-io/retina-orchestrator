@@ -1,6 +1,6 @@
 module github.com/dioptra-io/retina-orchestrator
 
-go 1.24.4
+go 1.25.7
 
 require (
 	github.com/dioptra-io/retina-commons v0.3.0
