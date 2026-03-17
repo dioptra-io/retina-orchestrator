@@ -37,8 +37,9 @@ func (rbc *RingBufferConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
 
 	// Attach a broadcast to wake waiting goroutines if this consumer's context
 	// is cancelled.
+	cond := rbc.rb.cond
 	stop := context.AfterFunc(ctx, func() {
-		rbc.rb.cond.Broadcast()
+		cond.Broadcast()
 	})
 	defer stop()
 
