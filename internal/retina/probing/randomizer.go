@@ -8,26 +8,26 @@ import (
 // randomizer is the implementation of an index randomizer. It uses the
 // Fisher-Yates shuffle.
 type randomizer struct {
-	random  *rand.Rand
-	indices []uint64
-	i       int
-	length  int
-	cycle   int
+	random   *rand.Rand
+	indicies []uint64
+	i        int
+	length   int
+	cycle    int
 }
 
-// newRandomizer generates a new randomizer. It takes the indices as a
+// newRandomizer generates a new randomizer. It takes the indicies as a
 // parameter.
-func newRandomizer(seed uint64, indices []uint64) (*randomizer, error) {
-	if len(indices) == 0 {
-		return nil, fmt.Errorf("invalid argument: indices array cannot be empty")
+func newRandomizer(seed uint64, indicies []uint64) (*randomizer, error) {
+	if len(indicies) == 0 {
+		return nil, fmt.Errorf("invalid argument: indicies array cannot be empty")
 	}
 
 	return &randomizer{
-		random:  rand.New(rand.NewPCG(seed, 0)), // #nosec G404
-		indices: indices,
-		i:       len(indices) - 1,
-		length:  len(indices),
-		cycle:   0,
+		random:   rand.New(rand.NewPCG(seed, 0)), // #nosec G404
+		indicies: indicies,
+		i:        len(indicies) - 1,
+		length:   len(indicies),
+		cycle:    0,
 	}, nil
 }
 
@@ -42,8 +42,8 @@ func (r *randomizer) Next() uint64 {
 
 	// Generate a random index and swap.
 	j := r.random.IntN(r.i + 1)
-	k := r.indices[j]
-	r.indices[r.i], r.indices[j] = r.indices[j], r.indices[r.i]
+	k := r.indicies[j]
+	r.indicies[r.i], r.indicies[j] = r.indicies[j], r.indicies[r.i]
 	r.i -= 1
 
 	return k
