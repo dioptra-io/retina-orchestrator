@@ -44,6 +44,8 @@ type Config struct {
 	SecretString string
 }
 
+// orch is the main orchestrator struct that holds all the components needed to
+// run the orchestrator.
 type orch struct {
 	config *Config
 	// scheduler schedules the ProbingDirectives and updates by the responses
@@ -60,6 +62,7 @@ type orch struct {
 	ringBuffer *structures.RingBuffer[api.ForwardingInfoElement]
 }
 
+// NewOrchFromConfig creates a new orchestrator from the given configuration.
 func NewOrchFromConfig(config *Config) (*orch, error) {
 	o := &orch{config: config}
 
@@ -107,6 +110,8 @@ func NewOrchFromConfig(config *Config) (*orch, error) {
 	return o, nil
 }
 
+// Run starts all the components of the orchestrator and blocks until the
+// context is cancelled.
 func (o *orch) Run(parentCtx context.Context) error {
 	// Create a errgroup and run each components individually. If the context is
 	// cancelled then the whole system is cancelled.
@@ -148,6 +153,7 @@ func (o *orch) runScheduler(ctx context.Context) error {
 	}
 }
 
+// runHTTPServer starts the HTTP server and waits for it to shut down.
 func (o *orch) runHTTPServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
@@ -163,6 +169,7 @@ func (o *orch) runHTTPServer(ctx context.Context) error {
 	return nil
 }
 
+// runJSONLServer starts the JSONL server and waits for it to shut down.
 func (o *orch) runJSONLServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
