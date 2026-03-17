@@ -1,6 +1,7 @@
 package structures
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -16,17 +17,34 @@ type RingBufferConsumer[T any] struct {
 //
 // All the consumer interactions are assumed to be done using the same
 // goroutine.
-func (rbc *RingBufferConsumer[T]) Pop() (*T, error) {
+func (rbc *RingBufferConsumer[T]) Pop(ctx context.Context) (*T, error) {
 	// Consumer already closed.
 	if rbc.rb == nil {
 		return nil, fmt.Errorf("consumer already closed")
 	}
 
+	// Check ctx exit early without acquiring the lock.
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	// Attach broadcast to wake the routines up if one consumer's context is
+	// cancelled.
+	stop := context.AfterFunc(ctx, func() {
+		rbc.rb.cond.Broadcast()
+	})
+	defer stop() // De-attach the after function.
+
 	rbc.rb.mutex.Lock()
 	defer rbc.rb.mutex.Unlock()
 
-	// Loop until old tail != head.
+	// Loop until tail != head.
 	for rbc.tail == rbc.rb.head {
+		// Check for the ctx cancellation here.
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		// Release the lock and wait, when woken up regain the lock and check.
 		rbc.rb.cond.Wait()
 	}
