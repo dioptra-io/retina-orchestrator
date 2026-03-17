@@ -56,6 +56,8 @@ type orch struct {
 	jsonlServer *servers.JSONLServer
 	// pdQueue is the queue for generated probing directives.
 	pdQueue *structures.Queue[api.ProbingDirective]
+	// ringbuffer is used to stream FIEs to connected clients.
+	ringBuffer *structures.RingBuffer[api.ForwardingInfoElement]
 }
 
 func NewOrchFromConfig(config *Config) (*orch, error) {
@@ -92,8 +94,15 @@ func NewOrchFromConfig(config *Config) (*orch, error) {
 	o.jsonlServer = jsonlServer
 
 	// Create pd queue
-	pdQueue := structures.NewQueue[api.ProbingDirective](100)
+	pdQueue, _ := structures.NewQueue[api.ProbingDirective](100)
 	o.pdQueue = pdQueue
+
+	// Create ringBuffer
+	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](100)
+	if err != nil {
+		return nil, err
+	}
+	o.ringBuffer = ringBuffer
 
 	return o, nil
 }
@@ -171,50 +180,55 @@ func (o *orch) runJSONLServer(ctx context.Context) error {
 
 // httpStreamHandler is the http handler for the http server.
 func (o *orch) httpStreamHandler(info *servers.FIEStreamerInfo, s *servers.FIEStreamer) {
-	// TODO: implement.
-	// for {
-	// 	select {
-	// 	case <-s.Context().Done():
-	// 		return
-	// 	default:
-	// 	}
-	//
-	// 	fie, err := o.ringBuffer.Pull()
-	// 	if err != nil {
-	// 		return
-	// 	}
-	//
-	// 	err = s.Send(fie)
-	// 	if err != nil {
-	// 		return
-	// 	}
-	// }
+	ringBufferConsumer := o.ringBuffer.NewConsumer()
+	defer ringBufferConsumer.Close()
+
+	for {
+		fie, seq, err := ringBufferConsumer.Pop(s.Context())
+		if err != nil {
+			return
+		}
+		// Set the sequence number to the sequence number of the ring buffer.
+		fie.SequenceNumber = seq
+
+		err = s.Send(fie)
+		if err != nil {
+			return
+		}
+	}
 }
 
 // jsonlStreamHandler is the handler for streaming.
 func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JSONLStream) {
-	o.pdQueue.Subscribe(status.AgentID)
-	defer o.pdQueue.Unsubscribe(status.AgentID)
+	pdQueueConsumer, err := o.pdQueue.NewConsumer(status.AgentID)
+	if err != nil {
+		log.Printf("Agent with agent id %q is already connected.", status.AgentID)
+	}
+	defer pdQueueConsumer.Close()
 
 	group, ctx := errgroup.WithContext(s.Context())
 
 	group.Go(func() error {
 		for {
-			_, err := s.Receive()
+			fie, err := s.Receive()
 			if err != nil {
 				return err
 			}
 
-			// TODO: implement.
-			// o.ringBuffer.Push(fie)
+			log.Printf("Received FIE: %v", fie)
+
+			// don't care about the slow consumers
+			_ = o.ringBuffer.Push(fie)
 		}
 	})
 	group.Go(func() error {
 		for {
-			pd, err := o.pdQueue.Pop(ctx, status.AgentID)
+			pd, err := pdQueueConsumer.Pop(ctx)
 			if err != nil {
 				return err
 			}
+
+			log.Printf("Sent PD: %v", pd)
 
 			err = s.Send(pd)
 			if err != nil {
