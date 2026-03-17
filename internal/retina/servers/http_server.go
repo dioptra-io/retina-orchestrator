@@ -142,12 +142,14 @@ func (s *HTTPServer) removeStreamer(streamer *FIEStreamer) {
 	delete(s.streamers, streamer)
 }
 
+// FIEStreamer is used to stream ForwardingInfoElements to an HTTP client.
 type FIEStreamer struct {
 	ctx     context.Context
 	flusher http.Flusher
 	encoder *json.Encoder
 }
 
+// Send encodes and sends the given ForwardingInfoElement to the client.
 func (s *FIEStreamer) Send(fie *api.ForwardingInfoElement) error {
 	if err := s.encoder.Encode(fie); err != nil {
 		return fmt.Errorf("error on sending the fie: %w", err)
@@ -156,10 +158,12 @@ func (s *FIEStreamer) Send(fie *api.ForwardingInfoElement) error {
 	return nil
 }
 
+// Context returns the context of the stream.
 func (s *FIEStreamer) Context() context.Context {
 	return s.ctx
 }
 
+// FIEStreamerInfo holds information about the connected client.
 type FIEStreamerInfo struct {
 	UserAgent     string
 	RemoteAddress string
