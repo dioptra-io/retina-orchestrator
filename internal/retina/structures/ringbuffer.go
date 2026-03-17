@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 // RingBufferConsumer is a consumer of a RingBuffer. Each consumer maintains its
@@ -12,25 +13,26 @@ import (
 //
 // All methods on RingBufferConsumer must be called from the same goroutine.
 type RingBufferConsumer[T any] struct {
-	rb   *RingBuffer[T]
-	tail uint
+	rb           *RingBuffer[T]
+	tail         uint
+	seq          uint64
+	totalSkipped atomic.Uint64
 }
 
-// Pop returns the next element from the buffer and advances the consumer's tail.
-// If no element is available, Pop blocks until one is pushed or the context is
-// cancelled.
+// Pop returns the next element from the buffer, its sequence number in the
+// global push stream (zero-based), and advances the consumer's tail.
 //
 // Returns an error if the context is cancelled or if the consumer is already
 // closed.
-func (rbc *RingBufferConsumer[T]) Pop(ctx context.Context) (*T, error) {
+func (rbc *RingBufferConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
 	// Consumer already closed.
 	if rbc.rb == nil {
-		return nil, fmt.Errorf("consumer already closed")
+		return nil, 0, fmt.Errorf("consumer already closed")
 	}
 
 	// Check ctx exit early without acquiring the lock.
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return nil, 0, ctx.Err()
 	}
 
 	// Attach a broadcast to wake waiting goroutines if this consumer's context
@@ -46,15 +48,16 @@ func (rbc *RingBufferConsumer[T]) Pop(ctx context.Context) (*T, error) {
 	// Loop until tail != head (i.e. there is an element to read).
 	for rbc.tail == rbc.rb.head {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		}
 		// Atomically release the lock and sleep. Reacquires the lock when woken.
 		rbc.rb.cond.Wait()
 	}
 	e := rbc.rb.buffer[rbc.tail]
 	rbc.tail = (rbc.tail + 1) % rbc.rb.cap
+	rbc.seq += 1
 
-	return e, nil
+	return e, rbc.seq - 1 + rbc.Skipped(), nil
 }
 
 // Close removes the consumer from the ring buffer, freeing its slot in the
@@ -74,6 +77,13 @@ func (rbc *RingBufferConsumer[T]) Close() {
 		delete(rbc.rb.consumers, rbc)
 		rbc.rb = nil
 	}
+}
+
+// Skipped returns the total number of elements that were skipped for this
+// consumer due to it being too slow. When the producer laps a consumer, the
+// consumer's tail is advanced automatically and this counter is incremented.
+func (rbc *RingBufferConsumer[T]) Skipped() uint64 {
+	return rbc.totalSkipped.Load()
 }
 
 // RingBuffer is a fixed-capacity circular buffer with support for multiple
@@ -121,6 +131,7 @@ func (rb *RingBuffer[T]) NewConsumer() *RingBufferConsumer[T] {
 	cons := &RingBufferConsumer[T]{
 		tail: rb.head,
 		rb:   rb,
+		seq:  0,
 	}
 	rb.consumers[cons] = struct{}{}
 	return cons
@@ -144,6 +155,7 @@ func (rb *RingBuffer[T]) Push(e *T) int {
 		if rb.head == cons.tail {
 			skipped++
 			cons.tail = (cons.tail + 1) % rb.cap
+			cons.totalSkipped.Add(1)
 		}
 	}
 
