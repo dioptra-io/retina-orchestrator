@@ -219,7 +219,7 @@ func (s *JSONLServer) removeStreamer(streamer *JSONLStream) {
 	s.closeWG.Done()
 }
 
-// JSONLStream is the streamer struct that is returned on the handle function.
+// JSONLStream represents an active JSONL connection to an agent.
 type JSONLStream struct {
 	// id is the identifier in the server.
 	id int
@@ -237,7 +237,7 @@ type JSONLStream struct {
 	server *JSONLServer
 }
 
-// newJSONLStreamer creates a new JSONLStreamer from a connection.
+// newJSONLStreamer creates a new JSONLStream from a connection.
 func newJSONLStreamer(id int, conn *net.TCPConn, server *JSONLServer) *JSONLStream {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &JSONLStream{
@@ -263,7 +263,7 @@ func (s *JSONLStream) ID() int {
 
 // Send sends the given element to the tcp connection encoded as a JSON line.
 func (s *JSONLStream) Send(e *api.ProbingDirective) error {
-	return send[api.ProbingDirective](s.conn, s.encoder, s.server.config.TCPTimeout, s.server.config.TCPBufferLength, e)
+	return send(s.conn, s.encoder, s.server.config.TCPTimeout, s.server.config.TCPBufferLength, e)
 }
 
 // Receive reads the next element from the tcp connection decoded from a JSON line.
