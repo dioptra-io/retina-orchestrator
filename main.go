@@ -20,7 +20,7 @@ func main() {
 		issueRate = flag.Float64("issue-rate", 1.0, "Issue rate of a single probing directive")
 		impactCap = flag.Float64("impact-cap", 1.0, "Impact capacity for a single address")
 		seed      = flag.Uint64("seed", 42, "Seed for the randomizer")
-		secret    = flag.String("sectet", "", "Secret string to share with the agent")
+		secret    = flag.String("secret", "", "Secret string to share with the agent")
 	)
 	flag.Parse()
 

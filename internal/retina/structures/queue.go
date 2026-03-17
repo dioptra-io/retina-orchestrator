@@ -35,10 +35,11 @@ func (q *Queue[T]) Unsubscribe(id string) {
 }
 
 func (q *Queue[T]) Push(ctx context.Context, id string, item *T) (err error) {
-	q.mu.Lock()
+	q.mu.RLock()
 	ch, ok := q.subscribers[id]
+	q.mu.RUnlock()
+
 	if !ok {
-		q.mu.Unlock()
 		return fmt.Errorf("subscriber %q not found", id)
 	}
 
