@@ -7,12 +7,12 @@ import (
 	"sync/atomic"
 )
 
-// RingBufferConsumer is a consumer of a RingBuffer. Each consumer maintains its
+// ringBufferConsumer is a consumer of a RingBuffer. Each consumer maintains its
 // own tail pointer, allowing multiple consumers to independently read from the
 // same buffer at their own pace.
 //
-// All methods on RingBufferConsumer must be called from the same goroutine.
-type RingBufferConsumer[T any] struct {
+// All methods on ringBufferConsumer must be called from the same goroutine.
+type ringBufferConsumer[T any] struct {
 	rb           *RingBuffer[T]
 	tail         uint
 	seq          uint64
@@ -24,7 +24,7 @@ type RingBufferConsumer[T any] struct {
 //
 // Returns an error if the context is cancelled or if the consumer is already
 // closed.
-func (rbc *RingBufferConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
+func (rbc *ringBufferConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
 	// Consumer already closed.
 	if rbc.rb == nil {
 		return nil, 0, fmt.Errorf("consumer already closed")
@@ -66,7 +66,7 @@ func (rbc *RingBufferConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
 // so slow consumer skipping will not apply to it.
 //
 // Calling Close multiple times is a no-op.
-func (rbc *RingBufferConsumer[T]) Close() {
+func (rbc *ringBufferConsumer[T]) Close() {
 	if rbc.rb == nil {
 		return
 	}
@@ -83,7 +83,7 @@ func (rbc *RingBufferConsumer[T]) Close() {
 // Skipped returns the total number of elements that were skipped for this
 // consumer due to it being too slow. When the producer laps a consumer, the
 // consumer's tail is advanced automatically and this counter is incremented.
-func (rbc *RingBufferConsumer[T]) Skipped() uint64 {
+func (rbc *ringBufferConsumer[T]) Skipped() uint64 {
 	return rbc.totalSkipped.Load()
 }
 
@@ -103,7 +103,7 @@ type RingBuffer[T any] struct {
 	head      uint
 	buffer    []*T
 	cap       uint
-	consumers map[*RingBufferConsumer[T]]struct{}
+	consumers map[*ringBufferConsumer[T]]struct{}
 }
 
 // NewRingBuffer creates a new RingBuffer with the given capacity.
@@ -118,18 +118,18 @@ func NewRingBuffer[T any](capacity int) (*RingBuffer[T], error) {
 		head:      0,
 		buffer:    make([]*T, capacity),
 		cap:       uint(capacity),
-		consumers: make(map[*RingBufferConsumer[T]]struct{}),
+		consumers: make(map[*ringBufferConsumer[T]]struct{}),
 		cond:      sync.NewCond(mu),
 	}, nil
 }
 
 // NewConsumer creates a new consumer starting at the current head position.
 // The consumer will only receive elements pushed after its creation.
-func (rb *RingBuffer[T]) NewConsumer() *RingBufferConsumer[T] {
+func (rb *RingBuffer[T]) NewConsumer() *ringBufferConsumer[T] {
 	rb.mutex.Lock()
 	defer rb.mutex.Unlock()
 
-	cons := &RingBufferConsumer[T]{
+	cons := &ringBufferConsumer[T]{
 		tail: rb.head,
 		rb:   rb,
 		seq:  0,
