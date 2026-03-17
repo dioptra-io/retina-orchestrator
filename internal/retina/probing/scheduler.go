@@ -13,8 +13,8 @@ import (
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
-// directiveEntry is the entry of a directive. It contains the last hit
-// addresses, issuance probability and a pointer to the directive itself.
+// directiveEntry holds the state for a single ProbingDirective including last
+// hit addresses and issuance probability.
 type directiveEntry struct {
 	lastHitNearAddress net.IP
 	lastHitFarAddress  net.IP
@@ -56,6 +56,8 @@ type Scheduler struct {
 	random *rand.Rand
 }
 
+// NewScheduler creates a new Scheduler from the given seed, issue rate, and
+// probing directive file path.
 func NewScheduler(seed uint64, issueRate float64, pdFile string) (*Scheduler, error) {
 	pds, err := readPDs(pdFile)
 	if err != nil {
@@ -181,6 +183,7 @@ func (s *Scheduler) Update(fie *api.ForwardingInfoElement) error {
 	return nil
 }
 
+// addImpact adds the given directive entry to the impact map for the address.
 func (s *Scheduler) addImpact(address net.IP, dEntry *directiveEntry) {
 	if address == nil {
 		return
@@ -198,6 +201,8 @@ func (s *Scheduler) addImpact(address net.IP, dEntry *directiveEntry) {
 	iEntry.directives[dEntry.directive.ProbingDirectiveID] = dEntry
 }
 
+// removeImpact removes the given directive entry from the impact map for the
+// address.
 func (s *Scheduler) removeImpact(address net.IP, dEntry *directiveEntry) {
 	if address == nil {
 		return
