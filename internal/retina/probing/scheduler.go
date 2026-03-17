@@ -164,14 +164,10 @@ func (s *Scheduler) Update(fie *api.ForwardingInfoElement) error {
 	// Update the issuance probability.
 	numNearImpacts, numFarImpacts := 0, 0
 	if dEntry.lastHitNearAddress != nil {
-		if entry, ok := s.addressImpactMap[dEntry.lastHitNearAddress.To16().String()]; ok {
-			numNearImpacts = len(entry.directives)
-		}
+		numNearImpacts = len(s.addressImpactMap[dEntry.lastHitNearAddress.To16().String()].directives)
 	}
 	if dEntry.lastHitFarAddress != nil {
-		if entry, ok := s.addressImpactMap[dEntry.lastHitFarAddress.To16().String()]; ok {
-			numFarImpacts = len(entry.directives)
-		}
+		numFarImpacts = len(s.addressImpactMap[dEntry.lastHitFarAddress.To16().String()].directives)
 	}
 
 	denominator := max(numNearImpacts, numFarImpacts)
