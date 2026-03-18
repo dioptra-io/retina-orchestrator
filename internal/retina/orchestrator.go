@@ -45,8 +45,6 @@ type Config struct {
 	SecretString string
 }
 
-// orch is the main orchestrator struct that holds all the components needed to
-// run the orchestrator.
 type orch struct {
 	config *Config
 	// scheduler schedules the ProbingDirectives and updates by the responses
