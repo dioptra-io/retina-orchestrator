@@ -222,6 +222,11 @@ func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JS
 				return err
 			}
 
+			// Make a completeness check.
+			if fie.FarInfo.ReplyAddress == nil || fie.NearInfo.ReplyAddress == nil {
+				continue
+			}
+
 			// don't care about the slow consumers
 			_ = o.ringBuffer.Push(fie)
 		}
