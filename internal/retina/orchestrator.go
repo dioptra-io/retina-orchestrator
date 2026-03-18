@@ -61,8 +61,9 @@ type orch struct {
 	ringBuffer *structures.RingBuffer[api.ForwardingInfoElement]
 }
 
-// NewOrchFromConfig creates a new orchestrator from the given configuration.
-func NewOrchFromConfig(config *Config) (*orch, error) {
+// NewOrch creates a new orchestrator from the given configuration. Returns the
+// error if any of the component creation fails.
+func NewOrch(config *Config) (*orch, error) {
 	o := &orch{config: config}
 
 	// Create the Scheduler.

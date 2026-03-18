@@ -28,7 +28,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	orch, err := retina.NewOrchFromConfig(&retina.Config{
+	orch, err := retina.NewOrch(&retina.Config{
 		JSONLServerAddress: *jsonlAddr,
 		HTTPServerAddress:  *httpAddr,
 		PDPath:             *pdPath,
