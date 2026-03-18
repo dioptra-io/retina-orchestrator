@@ -163,7 +163,6 @@ func (s *FIEStreamer) Context() context.Context {
 	return s.ctx
 }
 
-// FIEStreamerInfo holds information about the connected client.
 type FIEStreamerInfo struct {
 	UserAgent     string
 	RemoteAddress string
