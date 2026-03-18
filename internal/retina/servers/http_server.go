@@ -158,7 +158,6 @@ func (s *FIEStreamer) Send(fie *apiOrch.SequencedForwardingInfoElement) error {
 	return nil
 }
 
-// Context returns the context of the stream.
 func (s *FIEStreamer) Context() context.Context {
 	return s.ctx
 }
