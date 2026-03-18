@@ -58,6 +58,8 @@ type Scheduler struct {
 
 // NewScheduler creates a new Scheduler from the given seed, issue rate, and
 // probing directive file path.
+// Returns an error if the file is not found or if the issueRate is <= 0 or
+// pdFile is empty.
 func NewScheduler(seed uint64, issueRate float64, pdFile string) (*Scheduler, error) {
 	pds, err := readPDs(pdFile)
 	if err != nil {
