@@ -142,7 +142,6 @@ func (s *HTTPServer) removeStreamer(streamer *FIEStreamer) {
 	delete(s.streamers, streamer)
 }
 
-// FIEStreamer is used to stream ForwardingInfoElements to an HTTP client.
 type FIEStreamer struct {
 	ctx     context.Context
 	flusher http.Flusher
