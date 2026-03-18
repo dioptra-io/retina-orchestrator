@@ -64,6 +64,8 @@ type JSONLServer struct {
 }
 
 // NewJSONLServer creates a new JSONL server from the provided arguments.
+// Returns error if config is nil or TCPBufferLength < 8Kb or TCPTimeout is 0 or
+// Address is nil or AuthHandler is not specified.
 func NewJSONLServer(config *JSONLServerConfig) (*JSONLServer, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
