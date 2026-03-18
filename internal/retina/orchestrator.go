@@ -9,7 +9,7 @@ import (
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 	apiOrch "github.com/dioptra-io/retina-orchestrator/internal/retina/api"
-	"github.com/dioptra-io/retina-orchestrator/internal/retina/probing"
+	"github.com/dioptra-io/retina-orchestrator/internal/retina/issuance"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/servers"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/structures"
 	"golang.org/x/sync/errgroup"
@@ -49,7 +49,7 @@ type orch struct {
 	config *Config
 	// scheduler schedules the ProbingDirectives and updates by the responses
 	// from ForwardingInfoElements and implements respoinsible probing.
-	scheduler *probing.Scheduler
+	scheduler *issuance.Scheduler
 	// httpServer is used to provide an server to explore orchestrator.
 	httpServer *servers.HTTPServer
 	// jsonlServer is the jsonl server implementation used to communicate PDs
@@ -67,7 +67,7 @@ func NewOrch(config *Config) (*orch, error) {
 	o := &orch{config: config}
 
 	// Create the Scheduler.
-	scheduler, err := probing.NewScheduler(config.Seed, config.IssueRate, config.PDPath)
+	scheduler, err := issuance.NewScheduler(config.Seed, config.IssueRate, config.PDPath)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
