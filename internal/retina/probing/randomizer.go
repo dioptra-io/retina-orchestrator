@@ -5,8 +5,8 @@ import (
 	"math/rand/v2"
 )
 
-// randomizer is the implementation of an index randomizer. It uses the
-// Fisher-Yates shuffle.
+// randomizer provides randomized iteration over a set of indices using the
+// Fisher-Yates shuffle algorithm.
 type randomizer struct {
 	random   *rand.Rand
 	indicies []uint64
