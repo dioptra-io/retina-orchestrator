@@ -110,8 +110,6 @@ func NewOrch(config *Config) (*orch, error) {
 	return o, nil
 }
 
-// Run starts all the components of the orchestrator and blocks until the
-// context is cancelled.
 func (o *orch) Run(parentCtx context.Context) error {
 	// Create a errgroup and run each components individually. If the context is
 	// cancelled then the whole system is cancelled.
