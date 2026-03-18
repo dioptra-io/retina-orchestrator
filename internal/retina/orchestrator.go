@@ -151,7 +151,6 @@ func (o *orch) runScheduler(ctx context.Context) error {
 	}
 }
 
-// runHTTPServer starts the HTTP server and waits for it to shut down.
 func (o *orch) runHTTPServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
@@ -167,7 +166,6 @@ func (o *orch) runHTTPServer(ctx context.Context) error {
 	return nil
 }
 
-// runJSONLServer starts the JSONL server and waits for it to shut down.
 func (o *orch) runJSONLServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
