@@ -10,13 +10,13 @@ import (
 
 	httpSwagger "github.com/swaggo/http-swagger"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
 	_ "github.com/dioptra-io/retina-orchestrator/docs"
+	apiOrch "github.com/dioptra-io/retina-orchestrator/internal/retina/api"
 )
 
 // StreamForwardingInfoFunc is the handler for the /stream endpoint. It is
 // called for each incoming request and is responsible for writing
-// api.ForwardingInfoElement objects to the response writer.
+// SequencedForwardingInfoElement objects to the response writer.
 type StreamForwardingInfoFunc func(info *FIEStreamerInfo, s *FIEStreamer)
 
 // HTTPServerConfig is the config struct for the HTTP server.
@@ -91,13 +91,13 @@ func (s *HTTPServer) Shutdown(timeout time.Duration) error {
 //	@Summary		Stream forwarding info elements
 //	@Description	Opens a long-lived connection that streams
 //
-// api.ForwardingInfoElement objects encoded as newline-delimited JSON (JSONL)
-// as they are produced by the connected agents.
+// SequencedForwardingInfoElement objects encoded as newline-delimited JSON
+// (JSONL) as they are produced by the connected agents.
 //
 //	@Tags			stream
 //	@Produce		application/event-stream
 //
-//	@Success		200	{object}	api.ForwardingInfoElement
+//	@Success		200	{object}	apiOrch.SequencedForwardingInfoElement
 //	@Failure		500	{string}	string	"internal server error"
 //	@Router			/stream [get]
 func (s *HTTPServer) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -149,8 +149,9 @@ type FIEStreamer struct {
 	encoder *json.Encoder
 }
 
-// Send encodes and sends the given ForwardingInfoElement to the client.
-func (s *FIEStreamer) Send(fie *api.ForwardingInfoElement) error {
+// Send encodes and sends the given SequencedForwardingInfoElement to the
+// client.
+func (s *FIEStreamer) Send(fie *apiOrch.SequencedForwardingInfoElement) error {
 	if err := s.encoder.Encode(fie); err != nil {
 		return fmt.Errorf("error on sending the fie: %w", err)
 	}

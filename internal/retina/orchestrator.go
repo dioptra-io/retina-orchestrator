@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
+	apiOrch "github.com/dioptra-io/retina-orchestrator/internal/retina/api"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/probing"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/servers"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/structures"
@@ -195,10 +196,14 @@ func (o *orch) httpStreamHandler(info *servers.FIEStreamerInfo, s *servers.FIESt
 		if err != nil {
 			return
 		}
-		// Set the sequence number to the sequence number of the ring buffer.
-		fie.SequenceNumber = seq
 
-		err = s.Send(fie)
+		// Set the sequence number to the sequence number of the ring buffer.
+		seqFIE := &apiOrch.SequencedForwardingInfoElement{
+			ForwardingInfoElement: *fie,
+			SequenceNumber:        seq,
+		}
+
+		err = s.Send(seqFIE)
 		if err != nil {
 			return
 		}
@@ -221,8 +226,6 @@ func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JS
 			if err != nil {
 				return err
 			}
-
-			log.Printf("Received FIE: %v", fie)
 
 			// don't care about the slow consumers
 			_ = o.ringBuffer.Push(fie)
