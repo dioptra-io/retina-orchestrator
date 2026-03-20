@@ -1,6 +1,3 @@
-// Copyright (c) 2025 Dioptra
-// SPDX-License-Identifier: MIT
-
 package retina
 
 import (
@@ -20,8 +17,7 @@ import (
 
 // Config is the main configuration struct used in the orchestrator.
 type Config struct {
-	// AgentAddress is the listening address of the JSONL server between
-	// retina-orchestrator and retina-agent.
+	// AgentAddress is the listening address of the agent server.
 	AgentAddress string
 	// AgentBufferLength is the allocated send and receive buffer length for
 	// the agent server.
@@ -54,11 +50,11 @@ type orch struct {
 	// scheduler schedules the ProbingDirectives and updates by the responses
 	// from ForwardingInfoElements and implements respoinsible probing.
 	scheduler *issuance.Scheduler
-	// apiServer serves the HTTP API endpoint.
-	apiServer *servers.HTTPServer
-	// agentServer is the JSONL server used to communicate PDs and FIEs
+	// streamServer serves the HTTP streaming endpoint for FIE consumers.
+	streamServer *servers.HTTPServer
+	// agentServer is the agent server used to communicate PDs and FIEs
 	// with connected agents.
-	agentServer *servers.JSONLServer
+	agentServer *servers.AgentServer
 	// pdQueue is the queue for generated probing directives.
 	pdQueue *structures.Queue[api.ProbingDirective]
 	// ringbuffer is used to stream FIEs to connected clients.
@@ -72,28 +68,29 @@ func NewOrch(config *Config) (*orch, error) {
 
 	// Create the Scheduler.
 	scheduler, err := issuance.NewScheduler(config.Seed, config.IssuanceRate, config.PDPath)
+
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
 	o.scheduler = scheduler
 
-	// Create the API server.
-	apiServer, err := servers.NewHTTPServer(&servers.HTTPServerConfig{
+	// Create the stream server.
+	streamServer, err := servers.NewHTTPServer(&servers.HTTPServerConfig{
 		Address:       config.APIAddress,
 		StreamHandler: o.httpStreamHandler,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error on creating API server: %w", err)
+		return nil, fmt.Errorf("error on creating stream server: %w", err)
 	}
-	o.apiServer = apiServer
+	o.streamServer = streamServer
 
 	// Create the agent server.
-	agentServer, err := servers.NewJSONLServer(&servers.JSONLServerConfig{
-		TCPBufferLength: config.AgentBufferLength,
-		TCPTimeout:      config.AgentTimeout,
-		Address:         config.AgentAddress,
-		StreamHandler:   o.jsonlStreamHandler,
-		AuthHandler:     o.jsonlAuthHandler,
+	agentServer, err := servers.NewAgentServer(&servers.AgentServerConfig{
+		BufferLength: config.AgentBufferLength,
+		Timeout:      config.AgentTimeout,
+		Address:      config.AgentAddress,
+		AgentHandler: o.jsonlStreamHandler,
+		AuthHandler:  o.jsonlAuthHandler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error on creating agent server: %w", err)
@@ -119,7 +116,7 @@ func (o *orch) Run(parentCtx context.Context) error {
 	// cancelled then the whole system is cancelled.
 	group, ctx := errgroup.WithContext(parentCtx)
 	group.Go(func() error {
-		return o.runAPIServer(ctx)
+		return o.runStreamServer(ctx)
 	})
 	group.Go(func() error {
 		return o.runAgentServer(ctx)
@@ -155,14 +152,14 @@ func (o *orch) runScheduler(ctx context.Context) error {
 	}
 }
 
-func (o *orch) runAPIServer(ctx context.Context) error {
+func (o *orch) runStreamServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return o.apiServer.ListenAndServe()
+		return o.streamServer.ListenAndServe()
 	})
 	group.Go(func() error {
 		<-ctx.Done()
-		return o.apiServer.Shutdown(3 * time.Second)
+		return o.streamServer.Shutdown(3 * time.Second)
 	})
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		return err
@@ -210,7 +207,7 @@ func (o *orch) httpStreamHandler(info *servers.FIEStreamerInfo, s *servers.FIESt
 }
 
 // jsonlStreamHandler is the handler for streaming.
-func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JSONLStream) {
+func (o *orch) jsonlStreamHandler(status *servers.AgentAuthStatus, s *servers.AgentStream) {
 	pdQueueConsumer, err := o.pdQueue.NewConsumer(status.AgentID)
 	if err != nil {
 		log.Printf("Agent with agent id %q is already connected.", status.AgentID)
@@ -221,7 +218,7 @@ func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JS
 
 	group.Go(func() error {
 		for {
-			fie, err := s.Receive()
+			fie, err := s.ReceiveFIE()
 			if err != nil {
 				return err
 			}
@@ -244,7 +241,7 @@ func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JS
 
 			log.Printf("Sent PD: %v", pd)
 
-			err = s.Send(pd)
+			err = s.SendPD(pd)
 			if err != nil {
 				return err
 			}
