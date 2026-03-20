@@ -1,9 +1,15 @@
+// Copyright (c) 2025 Dioptra
+// SPDX-License-Identifier: MIT
+
+// Package issuance implements the responsible probing algorithm for scheduling
+// and issuing ProbingDirectives to connected agents.
 package issuance
 
 import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -13,216 +19,204 @@ import (
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
-// directiveEntry holds the state for a single ProbingDirective including last
-// hit addresses and issuance probability.
-type directiveEntry struct {
+// pdState holds the scheduling state for a single ProbingDirective, including
+// the last observed near and far addresses and the current issuance probability.
+type pdState struct {
 	lastHitNearAddress net.IP
 	lastHitFarAddress  net.IP
 	issuanceProb       float64
 	directive          *api.ProbingDirective
 }
 
-// impactEntry stores the current state of the impacts to that address.
-type impactEntry struct {
-	// directives is a set of ProbingDirective IDs that impacts this address.
-	directives map[uint64]*directiveEntry
+// impactRecord stores the current impact state for a single address.
+type impactRecord struct {
+	// pds is the set of ProbingDirective IDs currently impacting this address.
+	pds map[uint64]*pdState
 }
 
-// Scheduler is the implementation of the ProbingDirective Scheduler. It
-// implements the ResponsibleProbing algorithm.
+// Scheduler implements the responsible probing algorithm. It schedules
+// ProbingDirectives for issuance and updates their issuance probabilities
+// based on incoming ForwardingInfoElements.
 type Scheduler struct {
-	// mutex is used to prevent race condiditons.
 	mutex sync.Mutex
-	// directiveMap maps the ProbingDirective's ID into a directiveMapEntry.
-	// Entry contains the reference to the actual ProbingDirective, issuance
-	// probability, near and far address.
-	directiveMap map[uint64]*directiveEntry
-	// addressImpactMap maps an address to an addressImpactMapEntry. Entry
-	// contains a list of directives that impacts this address.
-	addressImpactMap map[string]*impactEntry
-	// current is the current index.
-	current uint64
-	// lastIssue is the last issue time.
-	lastIssue time.Time
-	// numPDs denotes the number of PDs loaded into the scheduler.
-	numPDs int
-	// cyclePeriod is the minimum time required between two directives.
-	cyclePeriod time.Duration
-	// issuePeriod is the time between two directive issues.
-	issuePeriod time.Duration
-	// randomizer is used to randomize the indicies.
-	randomizer *randomizer
-	// random used for bernoulli experiment.
+	// pdMap maps each ProbingDirective ID to its scheduling state, which holds
+	// the directive itself, its issuance probability, and last hit addresses.
+	pdMap map[uint64]*pdState
+	// impactRecords maps each address to the set of directives impacting it.
+	impactRecords map[string]*impactRecord
+	// lastIssuance is the time of the last issued directive, used for rate limiting.
+	lastIssuance time.Time
+	// issuancePeriod is the minimum time between two directive issuances,
+	// derived from issuanceRate as time.Second / issuanceRate.
+	issuancePeriod time.Duration
+	randomizer     *randomizer
+	// random is used for the Bernoulli experiment in NextPD.
 	random *rand.Rand
 }
 
-// NewScheduler creates a new Scheduler from the given seed, issue rate, and
-// probing directive file path.
-// Returns an error if the file is not found or if the issueRate is <= 0 or
-// pdFile is empty.
-func NewScheduler(seed uint64, issueRate float64, pdFile string) (*Scheduler, error) {
+// NewScheduler creates a new Scheduler from the given seed, issuance rate, and
+// path to the probing directives file.
+// Returns an error if the file cannot be read, issuanceRate is <= 0, or the
+// file contains no directives.
+//
+// TODO: validate issuanceRate > 0 at the Config level instead of here.
+func NewScheduler(seed uint64, issuanceRate float64, pdFile string) (*Scheduler, error) {
+	if issuanceRate <= 0.0 {
+		return nil, fmt.Errorf("invalid arguments: issuance rate cannot be zero or negative")
+	}
+
 	pds, err := readPDs(pdFile)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read from file: %w", err)
 	}
-	return newSchedulerFromPDs(seed, issueRate, pds)
-}
-
-// NewScheduler creates a new empty scheduler.
-func newSchedulerFromPDs(seed uint64, issueRate float64, pds []*api.ProbingDirective) (*Scheduler, error) {
 	if len(pds) == 0 {
 		return nil, fmt.Errorf("invalid arguments: pds length cannot be zero")
 	}
 
-	if issueRate <= 0.0 {
-		return nil, fmt.Errorf("invalid arguments: issue rate cannot be zero or negative")
-	}
+	// TODO: downgrade to INFO level once slog is added.
+	log.Printf("Scheduler: loaded %d directives from %s", len(pds), pdFile)
 
-	// Create the directiveMap and populate with the given set of directives.
-	directiveMap := make(map[uint64]*directiveEntry, len(pds))
-	indicies := make([]uint64, 0, len(pds))
+	pdMap := make(map[uint64]*pdState, len(pds))
+	indices := make([]uint64, 0, len(pds))
 	for _, pd := range pds {
-		// Register to the directive map.
-		// Default values is issuance prob of 1.0 and nil near and far
-		// addresses.
-		directiveMap[pd.ProbingDirectiveID] = &directiveEntry{
-			lastHitNearAddress: nil,
-			lastHitFarAddress:  nil,
-			directive:          pd,
-			issuanceProb:       1.0,
+		pdMap[pd.ProbingDirectiveID] = &pdState{
+			directive:    pd,
+			issuanceProb: 1.0,
 		}
-
-		// Add to the indicies array.
-		indicies = append(indicies, pd.ProbingDirectiveID)
+		indices = append(indices, pd.ProbingDirectiveID)
 	}
 
-	randomizer, err := newRandomizer(seed, indicies)
+	randomizer, err := newRandomizer(seed, indices)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create randomizer: %w", err)
 	}
 
 	return &Scheduler{
-		directiveMap:     directiveMap,
-		addressImpactMap: make(map[string]*impactEntry),
-		current:          0,
-		numPDs:           len(pds),
-		cyclePeriod:      time.Duration(len(pds)) * time.Second / time.Duration(issueRate),
-		issuePeriod:      time.Second / time.Duration(issueRate),
-		randomizer:       randomizer,
-		random:           rand.New(rand.NewPCG(seed, 0)), // #nosec G404
+		pdMap:          pdMap,
+		impactRecords:  make(map[string]*impactRecord),
+		issuancePeriod: time.Duration(float64(time.Second) / issuanceRate),
+		randomizer:     randomizer,
+		random:         rand.New(rand.NewPCG(seed, 0)), // #nosec G404
 	}, nil
 }
 
-// Issue issues a new ProbingDirective and also applies ratelimiting. If the
-// expriment fails then it returns nil.
-func (s *Scheduler) Issue() *api.ProbingDirective {
+// NextPD returns the next ProbingDirective candidate. It blocks until the
+// rate limit allows the next issuance, then runs a Bernoulli experiment to
+// decide whether to return or skip the directive. Returns nil if skipped.
+func (s *Scheduler) NextPD() *api.ProbingDirective {
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	pd := s.pdMap[s.randomizer.Next()]
+	nextTime := s.lastIssuance.Add(s.issuancePeriod)
+	issuanceProb := pd.issuanceProb
+	s.mutex.Unlock()
 
-	// Get the corresponding index from the randomizer.
-	randomIndex := s.randomizer.Next()
+	time.Sleep(time.Until(nextTime))
 
-	// Get the directiveMapEntry and increment the current counter.
-	dEntry := s.directiveMap[randomIndex]
-	s.current = (s.current + 1) % uint64(s.numPDs) // #nosec G115
+	s.mutex.Lock()
+	s.lastIssuance = time.Now()
+	s.mutex.Unlock()
 
-	// Apply rate-limiting.
-	time.Sleep(time.Until(s.lastIssue.Add(s.issuePeriod)))
-	s.lastIssue = time.Now()
-
-	if s.random.Float64() < dEntry.issuanceProb {
-		return dEntry.directive
+	if s.random.Float64() < issuanceProb {
+		return pd.directive
 	}
+	// TODO: downgrade to DEBUG level once slog is added.
+	log.Printf("Scheduler: directive %d skipped (issuance probability: %.2f)", pd.directive.ProbingDirectiveID, issuanceProb)
 	return nil
 }
 
-// Update is invoked when there is a returned ForwardingInfoElement returned. It
-// returns a non-nil error.
-func (s *Scheduler) Update(fie *api.ForwardingInfoElement) error {
+// UpdateFromFIE adjusts the issuance probability of a directive based on an
+// incoming ForwardingInfoElement. It records the near and far addresses
+// observed in the FIE and recalculates the probability according to the number
+// of directives currently impacting those addresses.
+// Returns an error if the directive ID is not recognized.
+func (s *Scheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	dEntry, ok := s.directiveMap[fie.ProbingDirectiveID]
+	pd, ok := s.pdMap[fie.ProbingDirectiveID]
 	if !ok {
-		return fmt.Errorf("given probing directive id is not recognized")
+		return fmt.Errorf("probing directive ID %d is not recognized", fie.ProbingDirectiveID)
 	}
 
-	// Get the old addresses.
-	oldNearAddress, oldFarAddress := dEntry.lastHitNearAddress, dEntry.lastHitFarAddress
+	oldNearAddress, oldFarAddress := pd.lastHitNearAddress, pd.lastHitFarAddress
 
-	// Update the last hit addresses.
-	// This means the last hit addresses can be nil.
-	dEntry.lastHitNearAddress = fie.NearInfo.ReplyAddress
-	dEntry.lastHitFarAddress = fie.FarInfo.ReplyAddress
-
-	// Do the book-keeping.
-	if !oldNearAddress.Equal(dEntry.lastHitNearAddress) {
-		s.removeImpact(oldNearAddress, dEntry)
-		s.addImpact(dEntry.lastHitNearAddress, dEntry)
+	// Last hit addresses can be nil (e.g. on probe timeout).
+	if fie.NearInfo != nil {
+		pd.lastHitNearAddress = fie.NearInfo.ReplyAddress
 	}
-	if !oldFarAddress.Equal(dEntry.lastHitFarAddress) {
-		s.removeImpact(oldFarAddress, dEntry)
-		s.addImpact(dEntry.lastHitFarAddress, dEntry)
+	if fie.FarInfo != nil {
+		pd.lastHitFarAddress = fie.FarInfo.ReplyAddress
 	}
 
-	// Update the issuance probability.
+	if ipKey(oldNearAddress) != ipKey(pd.lastHitNearAddress) {
+		s.removeImpact(oldNearAddress, pd)
+		s.recordImpact(pd.lastHitNearAddress, pd)
+	}
+	if ipKey(oldFarAddress) != ipKey(pd.lastHitFarAddress) {
+		s.removeImpact(oldFarAddress, pd)
+		s.recordImpact(pd.lastHitFarAddress, pd)
+	}
+
 	numNearImpacts, numFarImpacts := 0, 0
-	if dEntry.lastHitNearAddress != nil {
-		numNearImpacts = len(s.addressImpactMap[dEntry.lastHitNearAddress.To16().String()].directives)
+	if rec, ok := s.impactRecords[ipKey(pd.lastHitNearAddress)]; ok {
+		numNearImpacts = len(rec.pds)
 	}
-	if dEntry.lastHitFarAddress != nil {
-		numFarImpacts = len(s.addressImpactMap[dEntry.lastHitFarAddress.To16().String()].directives)
+	if rec, ok := s.impactRecords[ipKey(pd.lastHitFarAddress)]; ok {
+		numFarImpacts = len(rec.pds)
 	}
 
-	denominator := max(numNearImpacts, numFarImpacts)
-
-	if denominator == 0 {
-		dEntry.issuanceProb = 1.0
+	maxImpacts := max(numNearImpacts, numFarImpacts)
+	if maxImpacts == 0 {
+		pd.issuanceProb = 1.0
 	} else {
-		dEntry.issuanceProb = 1.0 / float64(denominator)
+		pd.issuanceProb = 1.0 / float64(maxImpacts)
 	}
 
 	return nil
 }
 
-// addImpact adds the given directive entry to the impact map for the address.
-func (s *Scheduler) addImpact(address net.IP, dEntry *directiveEntry) {
+// recordImpact records that the given PD is impacting the specified address.
+// Creates a new impact record for the address if none exists yet.
+func (s *Scheduler) recordImpact(address net.IP, pd *pdState) {
 	if address == nil {
 		return
 	}
-	if _, ok := s.directiveMap[dEntry.directive.ProbingDirectiveID]; !ok {
-		return
-	}
-	iEntry, ok := s.addressImpactMap[address.To16().String()]
+	key := ipKey(address)
+	record, ok := s.impactRecords[key]
 	if !ok {
-		iEntry = &impactEntry{
-			directives: make(map[uint64]*directiveEntry),
+		record = &impactRecord{
+			pds: make(map[uint64]*pdState),
 		}
-		s.addressImpactMap[address.To16().String()] = iEntry
+		s.impactRecords[key] = record
 	}
-	iEntry.directives[dEntry.directive.ProbingDirectiveID] = dEntry
+	record.pds[pd.directive.ProbingDirectiveID] = pd
 }
 
-// removeImpact removes the given directive entry from the impact map for the
-// address.
-func (s *Scheduler) removeImpact(address net.IP, dEntry *directiveEntry) {
+// removeImpact removes the given PD from the impact record of the specified
+// address. Deletes the impact record entirely if no other PDs are impacting it.
+func (s *Scheduler) removeImpact(address net.IP, pd *pdState) {
 	if address == nil {
 		return
 	}
-	if _, ok := s.directiveMap[dEntry.directive.ProbingDirectiveID]; !ok {
-		return
-	}
-	iEntry, ok := s.addressImpactMap[address.To16().String()]
+	key := ipKey(address)
+	record, ok := s.impactRecords[key]
 	if ok {
-		delete(iEntry.directives, dEntry.directive.ProbingDirectiveID)
-		if len(iEntry.directives) == 0 {
-			delete(s.addressImpactMap, address.To16().String())
+		delete(record.pds, pd.directive.ProbingDirectiveID)
+		if len(record.pds) == 0 {
+			delete(s.impactRecords, key)
 		}
 	}
 }
 
-// readPDs is a utility function that reads the probing directives from the
-// given file.
+// ipKey returns a normalized string key for a net.IP address, suitable for
+// use as a map key. Returns an empty string for nil addresses.
+func ipKey(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	return ip.To16().String()
+}
+
 func readPDs(filepath string) ([]*api.ProbingDirective, error) {
 	f, err := os.Open(filepath) //nolint:gosec
 	if err != nil {

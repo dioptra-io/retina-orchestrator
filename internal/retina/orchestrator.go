@@ -139,7 +139,7 @@ func (o *orch) runScheduler(ctx context.Context) error {
 		default:
 		}
 
-		pd = o.scheduler.Issue()
+		pd = o.scheduler.NextPD()
 		if pd == nil {
 			log.Println("Bernoulli experiment failed, skipping PD.")
 			continue
