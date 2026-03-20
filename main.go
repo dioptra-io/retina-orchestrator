@@ -28,7 +28,7 @@ func main() {
 
 func run() error {
 	var (
-		streamAddr      = flag.String("stream-addr", "localhost:8080", "Listening address for FIE stream clients")
+		apiAddr         = flag.String("api-addr", "localhost:8080", "Listening address for the HTTP API server")
 		agentAddr       = flag.String("agent-addr", "localhost:50050", "Listening address for agent connections")
 		pdPath          = flag.String("pd-path", "", "Path to the probing directives file")
 		issuanceRate    = flag.Float64("issuance-rate", 1.0, "Target global issuance rate of probing directives (PDs per second, approximate)")
@@ -45,8 +45,8 @@ func run() error {
 		AgentAddress:      *agentAddr,
 		AgentBufferLength: defaultAgentBufferLength,
 		AgentTimeout:      time.Hour,
-		StreamAddress:     *streamAddr,
-		StreamTimeout:     time.Hour,
+		APIAddress:        *apiAddr,
+		APITimeout:        time.Hour,
 		PDPath:            *pdPath,
 		IssuanceRate:      *issuanceRate,
 		Seed:              *seed,

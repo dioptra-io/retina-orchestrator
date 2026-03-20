@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Dioptra
+// SPDX-License-Identifier: MIT
+
 package retina
 
 import (
@@ -26,11 +29,10 @@ type Config struct {
 	// AgentTimeout is the timeout value for the agent server.
 	AgentTimeout time.Duration
 
-	// StreamAddress is the listening address of the HTTP server used to
-	// stream ForwardingInfoElements to connected clients.
-	StreamAddress string
-	// StreamTimeout is the timeout value for the stream server.
-	StreamTimeout time.Duration
+	// APIAddress is the listening address of the HTTP API server.
+	APIAddress string
+	// APITimeout is the timeout value for the HTTP API server.
+	APITimeout time.Duration
 
 	// PDPath is the path to the file containing the probing directives.
 	PDPath string
@@ -42,7 +44,7 @@ type Config struct {
 	// ImpactThreshold is the maximum impact threshold per address for the
 	// responsible probing algorithm.
 	ImpactThreshold float64
-	// SecretString is the secret shared with the agents for authentication.
+	// Secret is the secret shared with the agents for authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
 }
@@ -52,8 +54,8 @@ type orch struct {
 	// scheduler schedules the ProbingDirectives and updates by the responses
 	// from ForwardingInfoElements and implements respoinsible probing.
 	scheduler *issuance.Scheduler
-	// streamServer serves the HTTP streaming endpoint for FIE consumers.
-	streamServer *servers.HTTPServer
+	// apiServer serves the HTTP API endpoint.
+	apiServer *servers.HTTPServer
 	// agentServer is the JSONL server used to communicate PDs and FIEs
 	// with connected agents.
 	agentServer *servers.JSONLServer
@@ -70,21 +72,20 @@ func NewOrch(config *Config) (*orch, error) {
 
 	// Create the Scheduler.
 	scheduler, err := issuance.NewScheduler(config.Seed, config.IssuanceRate, config.PDPath)
-
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
 	o.scheduler = scheduler
 
-	// Create the stream server.
-	streamServer, err := servers.NewHTTPServer(&servers.HTTPServerConfig{
-		Address:       config.StreamAddress,
+	// Create the API server.
+	apiServer, err := servers.NewHTTPServer(&servers.HTTPServerConfig{
+		Address:       config.APIAddress,
 		StreamHandler: o.httpStreamHandler,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error on creating stream server: %w", err)
+		return nil, fmt.Errorf("error on creating API server: %w", err)
 	}
-	o.streamServer = streamServer
+	o.apiServer = apiServer
 
 	// Create the agent server.
 	agentServer, err := servers.NewJSONLServer(&servers.JSONLServerConfig{
@@ -118,7 +119,7 @@ func (o *orch) Run(parentCtx context.Context) error {
 	// cancelled then the whole system is cancelled.
 	group, ctx := errgroup.WithContext(parentCtx)
 	group.Go(func() error {
-		return o.runStreamServer(ctx)
+		return o.runAPIServer(ctx)
 	})
 	group.Go(func() error {
 		return o.runAgentServer(ctx)
@@ -154,14 +155,14 @@ func (o *orch) runScheduler(ctx context.Context) error {
 	}
 }
 
-func (o *orch) runStreamServer(ctx context.Context) error {
+func (o *orch) runAPIServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return o.streamServer.ListenAndServe()
+		return o.apiServer.ListenAndServe()
 	})
 	group.Go(func() error {
 		<-ctx.Done()
-		return o.streamServer.Shutdown(3 * time.Second)
+		return o.apiServer.Shutdown(3 * time.Second)
 	})
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		return err
