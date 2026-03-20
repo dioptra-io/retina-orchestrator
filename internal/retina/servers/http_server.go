@@ -10,7 +10,7 @@ import (
 
 	httpSwagger "github.com/swaggo/http-swagger"
 
-	_ "github.com/dioptra-io/retina-orchestrator/docs"
+	// _ "github.com/dioptra-io/retina-orchestrator/docs"
 	apiOrch "github.com/dioptra-io/retina-orchestrator/internal/retina/api"
 )
 

@@ -1,3 +1,9 @@
+// Copyright (c) 2025 Dioptra
+// SPDX-License-Identifier: MIT
+//
+// Command retina-orchestrator runs the Retina orchestrator, which schedules
+// Probing Directives (PDs) to connected agents and streams the resulting
+// ForwardingInfoElements (FIEs) to clients.
 package main
 
 import (
@@ -12,44 +18,49 @@ import (
 	"github.com/dioptra-io/retina-orchestrator/internal/retina"
 )
 
+const defaultAgentBufferLength = 8192
+
 func main() {
+	if err := run(); err != nil {
+		log.Fatalf("%v", err)
+	}
+}
+
+func run() error {
 	var (
-		httpAddr  = flag.String("http-addr", "localhost:8080", "Listening address of HTTP server")
-		jsonlAddr = flag.String("jsonl-addr", "localhost:50050", "Listening address of JSONL server")
-		pdPath    = flag.String("pd-path", "", "PDFile name for reading the probing directives")
-		issueRate = flag.Float64("issue-rate", 1.0, "Issue rate of a single probing directive")
-		impactCap = flag.Float64("impact-cap", 1.0, "Impact capacity for a single address")
-		seed      = flag.Uint64("seed", 42, "Seed for the randomizer")
-		secret    = flag.String("secret", "", "Secret string to share with the agent")
+		apiAddr         = flag.String("api-addr", "localhost:8080", "Listening address for the HTTP API server")
+		agentAddr       = flag.String("agent-addr", "localhost:50050", "Listening address for agent connections")
+		pdPath          = flag.String("pd-path", "", "Path to the probing directives file")
+		issuanceRate    = flag.Float64("issuance-rate", 1.0, "Target global issuance rate of probing directives (PDs per second, approximate)")
+		impactThreshold = flag.Float64("impact-threshold", 1.0, "Maximum impact threshold per address for the responsible probing algorithm")
+		seed            = flag.Uint64("seed", 42, "Seed for the randomizer")
+		secret          = flag.String("secret", "", "Shared secret for agent authentication")
 	)
 	flag.Parse()
 
-	// Setup the context from the signal handlers.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	orch, err := retina.NewOrch(&retina.Config{
-		JSONLServerAddress: *jsonlAddr,
-		HTTPServerAddress:  *httpAddr,
-		PDPath:             *pdPath,
-		IssueRate:          *issueRate,
-		Seed:               *seed,
-		ImpactCap:          *impactCap,
-		SecretString:       *secret,
-		JSONLBufferLength:  8192, // hard-coded for now
-		JSONLTimeout:       time.Hour,
-		HTTPTimeout:        time.Hour,
+		AgentAddress:      *agentAddr,
+		AgentBufferLength: defaultAgentBufferLength,
+		AgentTimeout:      time.Hour,
+		APIAddress:        *apiAddr,
+		APITimeout:        time.Hour,
+		PDPath:            *pdPath,
+		IssuanceRate:      *issuanceRate,
+		Seed:              *seed,
+		ImpactThreshold:   *impactThreshold,
+		Secret:            *secret,
 	})
 	if err != nil {
-		log.Printf("cannot create orchestrator with the provided config: %v", err)
-		return
+		return err
 	}
 
-	// Run the orchestrator until context cancellation.
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {
-		log.Printf("orchestrator failed: %v", err)
-		return
+		return err
 	}
 
 	log.Println("Shutting down orchestrator.")
+	return nil
 }

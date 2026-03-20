@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Dioptra
+// SPDX-License-Identifier: MIT
+
 package retina
 
 import (
@@ -17,32 +20,33 @@ import (
 
 // Config is the main configuration struct used in the orchestrator.
 type Config struct {
-	// JSONLServerAddress is the listening address of the JSONL server between
+	// AgentAddress is the listening address of the JSONL server between
 	// retina-orchestrator and retina-agent.
-	JSONLServerAddress string
-	// JSONLBufferLength is the allocated send and receive buffer length for JSONL
-	// server.
-	JSONLBufferLength int
-	// JSONLTimeout is the timeout value for JSONL server.
-	JSONLTimeout time.Duration
+	AgentAddress string
+	// AgentBufferLength is the allocated send and receive buffer length for
+	// the agent server.
+	AgentBufferLength int
+	// AgentTimeout is the timeout value for the agent server.
+	AgentTimeout time.Duration
 
-	// HTTPServerAddress is the address of the HTTP server used to add
-	// directives and stream data.
-	HTTPServerAddress string
-	// HTTPTimeout is the timeout value for the http server.
-	HTTPTimeout time.Duration
+	// APIAddress is the listening address of the HTTP API server.
+	APIAddress string
+	// APITimeout is the timeout value for the HTTP API server.
+	APITimeout time.Duration
 
-	// PDPath is the filepath of the file that stores the ProbingDirectives.
+	// PDPath is the path to the file containing the probing directives.
 	PDPath string
 	// Seed is the seed used in the randomizer.
 	Seed uint64
-	// IssueRate denotes the number of PDs issued per second.
-	IssueRate float64
-	// ImpactCap is desired maximum impact capacity per address for the system.
-	ImpactCap float64
-	// SecretString is the provided secret via command lines. This is an MVS
-	// feature and will be removed soon.
-	SecretString string
+	// IssuanceRate is the target global issuance rate of probing directives
+	// (PDs per second, approximate).
+	IssuanceRate float64
+	// ImpactThreshold is the maximum impact threshold per address for the
+	// responsible probing algorithm.
+	ImpactThreshold float64
+	// Secret is the secret shared with the agents for authentication.
+	// This is an MVS feature and will be removed soon.
+	Secret string
 }
 
 type orch struct {
@@ -50,11 +54,11 @@ type orch struct {
 	// scheduler schedules the ProbingDirectives and updates by the responses
 	// from ForwardingInfoElements and implements respoinsible probing.
 	scheduler *issuance.Scheduler
-	// httpServer is used to provide an server to explore orchestrator.
-	httpServer *servers.HTTPServer
-	// jsonlServer is the jsonl server implementation used to communicate PDs
-	// and FIEs.
-	jsonlServer *servers.JSONLServer
+	// apiServer serves the HTTP API endpoint.
+	apiServer *servers.HTTPServer
+	// agentServer is the JSONL server used to communicate PDs and FIEs
+	// with connected agents.
+	agentServer *servers.JSONLServer
 	// pdQueue is the queue for generated probing directives.
 	pdQueue *structures.Queue[api.ProbingDirective]
 	// ringbuffer is used to stream FIEs to connected clients.
@@ -67,34 +71,34 @@ func NewOrch(config *Config) (*orch, error) {
 	o := &orch{config: config}
 
 	// Create the Scheduler.
-	scheduler, err := issuance.NewScheduler(config.Seed, config.IssueRate, config.PDPath)
+	scheduler, err := issuance.NewScheduler(config.Seed, config.IssuanceRate, config.PDPath)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
 	o.scheduler = scheduler
 
-	// Create the http server.
-	httpServer, err := servers.NewHTTPServer(&servers.HTTPServerConfig{
-		Address:       config.HTTPServerAddress,
+	// Create the API server.
+	apiServer, err := servers.NewHTTPServer(&servers.HTTPServerConfig{
+		Address:       config.APIAddress,
 		StreamHandler: o.httpStreamHandler,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error on creating http server: %w", err)
+		return nil, fmt.Errorf("error on creating API server: %w", err)
 	}
-	o.httpServer = httpServer
+	o.apiServer = apiServer
 
-	// Create the jsonl server.
-	jsonlServer, err := servers.NewJSONLServer(&servers.JSONLServerConfig{
-		TCPBufferLength: config.JSONLBufferLength,
-		TCPTimeout:      config.JSONLTimeout,
-		Address:         config.JSONLServerAddress,
+	// Create the agent server.
+	agentServer, err := servers.NewJSONLServer(&servers.JSONLServerConfig{
+		TCPBufferLength: config.AgentBufferLength,
+		TCPTimeout:      config.AgentTimeout,
+		Address:         config.AgentAddress,
 		StreamHandler:   o.jsonlStreamHandler,
 		AuthHandler:     o.jsonlAuthHandler,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error on creating jsonl server: %w", err)
+		return nil, fmt.Errorf("error on creating agent server: %w", err)
 	}
-	o.jsonlServer = jsonlServer
+	o.agentServer = agentServer
 
 	// Create pd queue
 	pdQueue, _ := structures.NewQueue[api.ProbingDirective](100)
@@ -115,10 +119,10 @@ func (o *orch) Run(parentCtx context.Context) error {
 	// cancelled then the whole system is cancelled.
 	group, ctx := errgroup.WithContext(parentCtx)
 	group.Go(func() error {
-		return o.runHTTPServer(ctx)
+		return o.runAPIServer(ctx)
 	})
 	group.Go(func() error {
-		return o.runJSONLServer(ctx)
+		return o.runAgentServer(ctx)
 	})
 	group.Go(func() error {
 		return o.runScheduler(ctx)
@@ -151,14 +155,14 @@ func (o *orch) runScheduler(ctx context.Context) error {
 	}
 }
 
-func (o *orch) runHTTPServer(ctx context.Context) error {
+func (o *orch) runAPIServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return o.httpServer.ListenAndServe()
+		return o.apiServer.ListenAndServe()
 	})
 	group.Go(func() error {
 		<-ctx.Done()
-		return o.httpServer.Shutdown(3 * time.Second)
+		return o.apiServer.Shutdown(3 * time.Second)
 	})
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		return err
@@ -166,14 +170,14 @@ func (o *orch) runHTTPServer(ctx context.Context) error {
 	return nil
 }
 
-func (o *orch) runJSONLServer(ctx context.Context) error {
+func (o *orch) runAgentServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return o.jsonlServer.ListenAndServe()
+		return o.agentServer.ListenAndServe()
 	})
 	group.Go(func() error {
 		<-ctx.Done()
-		return o.jsonlServer.Shutdown(3 * time.Second)
+		return o.agentServer.Shutdown(3 * time.Second)
 	})
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		return err
@@ -255,7 +259,7 @@ func (o *orch) jsonlStreamHandler(status *servers.JSONLAuthStatus, s *servers.JS
 
 // jsonlAuthHandler is the auth handler for the jsonl server.
 func (o *orch) jsonlAuthHandler(auth api.AuthRequest) api.AuthResponse {
-	if auth.Secret == o.config.SecretString {
+	if auth.Secret == o.config.Secret {
 		return api.AuthResponse{
 			Authenticated: true,
 			Message:       "authenticated",
