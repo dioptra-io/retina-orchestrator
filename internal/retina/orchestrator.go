@@ -1,3 +1,6 @@
+// Copyright (c) 2025 Dioptra
+// SPDX-License-Identifier: MIT
+
 package retina
 
 import (
@@ -29,6 +32,9 @@ type Config struct {
 	APIAddress string
 	// APITimeout is the timeout value for the HTTP API server.
 	APITimeout time.Duration
+	// APIReadHeaderTimeout is the timeout for reading HTTP request headers.
+	// Defaults to 5 seconds if zero.
+	APIReadHeaderTimeout time.Duration
 
 	// PDPath is the path to the file containing the probing directives.
 	PDPath string
@@ -47,44 +53,39 @@ type Config struct {
 
 type orch struct {
 	config *Config
-	// scheduler schedules the ProbingDirectives and updates by the responses
-	// from ForwardingInfoElements and implements respoinsible probing.
+	// scheduler schedules ProbingDirectives and implements responsible probing.
 	scheduler *issuance.Scheduler
-	// streamServer serves the HTTP streaming endpoint for FIE consumers.
-	streamServer *servers.HTTPServer
-	// agentServer is the agent server used to communicate PDs and FIEs
-	// with connected agents.
+	// apiServer serves the HTTP API endpoint.
+	apiServer *servers.APIServer
+	// agentServer handles bidirectional PD/FIE communication with agents.
 	agentServer *servers.AgentServer
 	// pdQueue is the queue for generated probing directives.
 	pdQueue *structures.Queue[api.ProbingDirective]
-	// ringbuffer is used to stream FIEs to connected clients.
+	// ringBuffer streams FIEs to connected HTTP clients.
 	ringBuffer *structures.RingBuffer[api.ForwardingInfoElement]
 }
 
-// NewOrch creates a new orchestrator from the given configuration. Returns the
-// error if any of the component creation fails.
+// NewOrch creates a new orchestrator from the given configuration. Returns an
+// error if any component creation fails.
 func NewOrch(config *Config) (*orch, error) {
 	o := &orch{config: config}
 
-	// Create the Scheduler.
 	scheduler, err := issuance.NewScheduler(config.Seed, config.IssuanceRate, config.PDPath)
-
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
 	o.scheduler = scheduler
 
-	// Create the stream server.
-	streamServer, err := servers.NewHTTPServer(&servers.HTTPServerConfig{
-		Address:       config.APIAddress,
-		StreamHandler: o.httpStreamHandler,
+	apiServer, err := servers.NewAPIServer(&servers.APIServerConfig{
+		Address:           config.APIAddress,
+		ReadHeaderTimeout: config.APIReadHeaderTimeout,
+		FIEHandler:        o.fieStreamHandler,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error on creating stream server: %w", err)
+		return nil, fmt.Errorf("error on creating API server: %w", err)
 	}
-	o.streamServer = streamServer
+	o.apiServer = apiServer
 
-	// Create the agent server.
 	agentServer, err := servers.NewAgentServer(&servers.AgentServerConfig{
 		BufferLength: config.AgentBufferLength,
 		Timeout:      config.AgentTimeout,
@@ -101,7 +102,6 @@ func NewOrch(config *Config) (*orch, error) {
 	pdQueue, _ := structures.NewQueue[api.ProbingDirective](100)
 	o.pdQueue = pdQueue
 
-	// Create ringBuffer
 	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](100)
 	if err != nil {
 		return nil, err
@@ -112,11 +112,9 @@ func NewOrch(config *Config) (*orch, error) {
 }
 
 func (o *orch) Run(parentCtx context.Context) error {
-	// Create a errgroup and run each components individually. If the context is
-	// cancelled then the whole system is cancelled.
 	group, ctx := errgroup.WithContext(parentCtx)
 	group.Go(func() error {
-		return o.runStreamServer(ctx)
+		return o.runAPIServer(ctx)
 	})
 	group.Go(func() error {
 		return o.runAgentServer(ctx)
@@ -152,14 +150,14 @@ func (o *orch) runScheduler(ctx context.Context) error {
 	}
 }
 
-func (o *orch) runStreamServer(ctx context.Context) error {
+func (o *orch) runAPIServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return o.streamServer.ListenAndServe()
+		return o.apiServer.ListenAndServe()
 	})
 	group.Go(func() error {
 		<-ctx.Done()
-		return o.streamServer.Shutdown(3 * time.Second)
+		return o.apiServer.Shutdown(3 * time.Second)
 	})
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		return err
@@ -182,25 +180,23 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 	return nil
 }
 
-// httpStreamHandler is the http handler for the http server.
-func (o *orch) httpStreamHandler(info *servers.FIEStreamerInfo, s *servers.FIEStreamer) {
-	ringBufferConsumer := o.ringBuffer.NewConsumer()
-	defer ringBufferConsumer.Close()
+// fieStreamHandler streams FIEs to connected HTTP clients.
+func (o *orch) fieStreamHandler(s *servers.FIEClient) {
+	consumer := o.ringBuffer.NewConsumer()
+	defer consumer.Close()
 
 	for {
-		fie, seq, err := ringBufferConsumer.Pop(s.Context())
+		fie, seq, err := consumer.Pop(s.Context())
 		if err != nil {
 			return
 		}
 
-		// Set the sequence number to the sequence number of the ring buffer.
-		seqFIE := &apiOrch.SequencedForwardingInfoElement{
+		seqFIE := &apiOrch.SequencedFIE{
 			ForwardingInfoElement: *fie,
 			SequenceNumber:        seq,
 		}
 
-		err = s.Send(seqFIE)
-		if err != nil {
+		if err = s.SendFIE(seqFIE); err != nil {
 			return
 		}
 	}
