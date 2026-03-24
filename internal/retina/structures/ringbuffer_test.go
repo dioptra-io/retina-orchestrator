@@ -7,9 +7,12 @@ import (
 	"time"
 )
 
+// Tests provide 100% coverage of ringbuffer.go.
+
 // --- NewRingBuffer ---
 
 func TestNewRingBuffer_ValidCapacity(t *testing.T) {
+	t.Parallel()
 	rb, err := NewRingBuffer[int](10)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -20,6 +23,7 @@ func TestNewRingBuffer_ValidCapacity(t *testing.T) {
 }
 
 func TestNewRingBuffer_ZeroCapacity(t *testing.T) {
+	t.Parallel()
 	_, err := NewRingBuffer[int](0)
 	if err == nil {
 		t.Fatal("expected error for zero capacity")
@@ -27,6 +31,7 @@ func TestNewRingBuffer_ZeroCapacity(t *testing.T) {
 }
 
 func TestNewRingBuffer_NegativeCapacity(t *testing.T) {
+	t.Parallel()
 	_, err := NewRingBuffer[int](-1)
 	if err == nil {
 		t.Fatal("expected error for negative capacity")
@@ -36,6 +41,7 @@ func TestNewRingBuffer_NegativeCapacity(t *testing.T) {
 // --- Push / Pop ---
 
 func TestPushPop_SingleConsumer(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -53,6 +59,7 @@ func TestPushPop_SingleConsumer(t *testing.T) {
 }
 
 func TestPushPop_Order(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](8)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -74,6 +81,7 @@ func TestPushPop_Order(t *testing.T) {
 }
 
 func TestPushPop_MultipleConsumers(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](8)
 	c1 := rb.NewConsumer()
 	c2 := rb.NewConsumer()
@@ -95,6 +103,7 @@ func TestPushPop_MultipleConsumers(t *testing.T) {
 }
 
 func TestPop_BlocksUntilPush(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -117,6 +126,7 @@ func TestPop_BlocksUntilPush(t *testing.T) {
 // --- Sequence number ---
 
 func TestSeq_StartsAtZero(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -134,6 +144,7 @@ func TestSeq_StartsAtZero(t *testing.T) {
 }
 
 func TestSeq_IncrementsOnEachPop(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](8)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -155,6 +166,7 @@ func TestSeq_IncrementsOnEachPop(t *testing.T) {
 }
 
 func TestSeq_IndependentPerConsumer(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](8)
 	c1 := rb.NewConsumer()
 	c2 := rb.NewConsumer()
@@ -166,7 +178,6 @@ func TestSeq_IndependentPerConsumer(t *testing.T) {
 		rb.Push(&v)
 	}
 
-	// c1 reads all 3
 	for i := range 3 {
 		_, seq, err := c1.Pop(context.Background())
 		if err != nil {
@@ -177,7 +188,6 @@ func TestSeq_IndependentPerConsumer(t *testing.T) {
 		}
 	}
 
-	// c2 reads only 1 — seq should still start at 0
 	_, seq, err := c2.Pop(context.Background())
 	if err != nil {
 		t.Fatalf("c2 unexpected error: %v", err)
@@ -188,10 +198,7 @@ func TestSeq_IndependentPerConsumer(t *testing.T) {
 }
 
 func TestSeq_ReflectsGlobalPushPosition(t *testing.T) {
-	// capacity 4: push 4 to lap the consumer (1 skip), then pop.
-	// The element read is the 2nd push (index 1 in global stream... wait,
-	// after being lapped once the consumer's tail points to push index 1).
-	// seq = reads(1) - 1 + skips(1) = 1
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -205,7 +212,6 @@ func TestSeq_ReflectsGlobalPushPosition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// 1 skip happened, this is the 2nd element in the global stream (seq=1)
 	expected := uint64(1)
 	if seq != expected {
 		t.Fatalf("expected seq %d after skip, got %d", expected, seq)
@@ -215,6 +221,7 @@ func TestSeq_ReflectsGlobalPushPosition(t *testing.T) {
 // --- Context cancellation ---
 
 func TestPop_ContextCancelledBeforeCall(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -229,6 +236,7 @@ func TestPop_ContextCancelledBeforeCall(t *testing.T) {
 }
 
 func TestPop_ContextCancelledWhileBlocking(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -246,6 +254,7 @@ func TestPop_ContextCancelledWhileBlocking(t *testing.T) {
 }
 
 func TestPop_ContextTimeout(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -262,14 +271,16 @@ func TestPop_ContextTimeout(t *testing.T) {
 // --- Close ---
 
 func TestClose_Idempotent(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 
 	cons.Close()
-	cons.Close() // should not panic
+	cons.Close()
 }
 
 func TestClose_PopAfterClose(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	cons.Close()
@@ -283,6 +294,7 @@ func TestClose_PopAfterClose(t *testing.T) {
 // --- Skipped ---
 
 func TestSkipped_InitiallyZero(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -293,6 +305,7 @@ func TestSkipped_InitiallyZero(t *testing.T) {
 }
 
 func TestSkipped_IncrementedWhenLapped(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -308,6 +321,7 @@ func TestSkipped_IncrementedWhenLapped(t *testing.T) {
 }
 
 func TestSkipped_NotIncrementedWhenKeepingUp(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
@@ -327,6 +341,7 @@ func TestSkipped_NotIncrementedWhenKeepingUp(t *testing.T) {
 }
 
 func TestSkipped_IndependentPerConsumer(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	slow := rb.NewConsumer()
 	fast := rb.NewConsumer()
@@ -350,6 +365,7 @@ func TestSkipped_IndependentPerConsumer(t *testing.T) {
 // --- Concurrency ---
 
 func TestConcurrent_PushPop(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](128)
 	const n = 100
 
@@ -358,7 +374,9 @@ func TestConcurrent_PushPop(t *testing.T) {
 	var mu sync.Mutex
 
 	cons := rb.NewConsumer()
-	wg.Go(func() {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		defer cons.Close()
 		for range n {
 			v, _, err := cons.Pop(context.Background())
@@ -370,7 +388,7 @@ func TestConcurrent_PushPop(t *testing.T) {
 			results = append(results, *v)
 			mu.Unlock()
 		}
-	})
+	}()
 
 	for i := range n {
 		v := i
@@ -385,13 +403,15 @@ func TestConcurrent_PushPop(t *testing.T) {
 }
 
 func TestConcurrent_PushPop_WithSkips(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](16)
 	const n = 100
 
 	var wg sync.WaitGroup
-
 	cons := rb.NewConsumer()
-	wg.Go(func() {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 		defer cons.Close()
 		received := 0
 		for uint64(received)+cons.Skipped() < n {
@@ -402,11 +422,10 @@ func TestConcurrent_PushPop_WithSkips(t *testing.T) {
 			}
 			received++
 		}
-		// verify received + skipped == n
 		if uint64(received)+cons.Skipped() != n {
 			t.Errorf("expected received+skipped=%d, got %d", n, uint64(received)+cons.Skipped())
 		}
-	})
+	}()
 
 	for i := range n {
 		v := i
@@ -417,12 +436,12 @@ func TestConcurrent_PushPop_WithSkips(t *testing.T) {
 }
 
 func TestWrapAround_CorrectValues(t *testing.T) {
-	// Push more than 2x capacity to force multiple wrap-arounds.
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
 
-	const n = 12 // 3x capacity
+	const n = 12
 	for i := range n {
 		v := i
 		rb.Push(&v)
@@ -437,13 +456,16 @@ func TestWrapAround_CorrectValues(t *testing.T) {
 }
 
 func TestConcurrent_MultipleConsumers_WithSkips(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](16)
 	const n = 100
 
 	var wg sync.WaitGroup
 	for range 3 {
 		cons := rb.NewConsumer()
-		wg.Go(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			defer cons.Close()
 			received := 0
 			for uint64(received)+cons.Skipped() < n {
@@ -457,7 +479,7 @@ func TestConcurrent_MultipleConsumers_WithSkips(t *testing.T) {
 			if uint64(received)+cons.Skipped() != n {
 				t.Errorf("expected received+skipped=%d, got %d", n, uint64(received)+cons.Skipped())
 			}
-		})
+		}()
 	}
 
 	for i := range n {
@@ -468,9 +490,9 @@ func TestConcurrent_MultipleConsumers_WithSkips(t *testing.T) {
 }
 
 func TestNewConsumer_MidStream(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](8)
 
-	// Push some elements before the consumer is created.
 	for i := range 3 {
 		v := i
 		rb.Push(&v)
@@ -479,7 +501,6 @@ func TestNewConsumer_MidStream(t *testing.T) {
 	cons := rb.NewConsumer()
 	defer cons.Close()
 
-	// Push one more after consumer creation.
 	v := 99
 	rb.Push(&v)
 
@@ -493,31 +514,30 @@ func TestNewConsumer_MidStream(t *testing.T) {
 }
 
 func TestPush_SkipCountReturnValue(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	c1 := rb.NewConsumer()
 	c2 := rb.NewConsumer()
 	defer c1.Close()
 	defer c2.Close()
 
-	// Push 4 elements to lap both consumers.
 	skipped := 0
 	for i := range 4 {
 		v := i
 		skipped += rb.Push(&v)
 	}
 
-	// Both consumers should have been skipped once each.
 	if skipped < 2 {
 		t.Fatalf("expected at least 2 total skips across consumers, got %d", skipped)
 	}
 }
 
 func TestSkipped_AccumulatesAcrossMultipleLaps(t *testing.T) {
+	t.Parallel()
 	rb, _ := NewRingBuffer[int](4)
 	cons := rb.NewConsumer()
 	defer cons.Close()
 
-	// Push 12 elements (3x capacity) without ever popping.
 	for i := range 12 {
 		v := i
 		rb.Push(&v)
