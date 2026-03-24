@@ -1,6 +1,9 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
+// Package retina implements the Retina orchestrator, which schedules
+// ProbingDirectives to connected agents and streams the resulting
+// ForwardingInfoElements to HTTP clients.
 package retina
 
 import (
@@ -20,53 +23,43 @@ import (
 
 // Config is the main configuration struct used in the orchestrator.
 type Config struct {
-	// AgentAddress is the listening address of the agent server.
-	AgentAddress string
-	// AgentBufferLength is the allocated send and receive buffer length for
-	// the agent server.
+	// AgentAddress is the TCP listening address for agent connections, in the form "host:port".
+	AgentAddress      string
 	AgentBufferLength int
-	// AgentTimeout is the timeout value for the agent server.
+	// TODO: replace with TCP keepalive once implemented in agent_server.go.
 	AgentTimeout time.Duration
 
-	// APIAddress is the listening address of the HTTP API server.
+	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
 	APIAddress string
-	// APITimeout is the timeout value for the HTTP API server.
 	APITimeout time.Duration
-	// APIReadHeaderTimeout is the timeout for reading HTTP request headers.
-	// Defaults to 5 seconds if zero.
+	// APIReadHeaderTimeout defaults to 5 seconds if zero.
 	APIReadHeaderTimeout time.Duration
 
-	// PDPath is the path to the file containing the probing directives.
 	PDPath string
-	// Seed is the seed used in the randomizer.
-	Seed uint64
+	Seed   uint64
 	// IssuanceRate is the target global issuance rate of probing directives
 	// (PDs per second, approximate).
 	IssuanceRate float64
-	// ImpactThreshold is the maximum impact threshold per address for the
-	// responsible probing algorithm.
+	// ImpactThreshold is the maximum number of concurrent directives allowed
+	// to impact a single address in the responsible probing algorithm.
 	ImpactThreshold float64
-	// Secret is the secret shared with the agents for authentication.
+	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
 }
 
 type orch struct {
-	config *Config
-	// scheduler schedules ProbingDirectives and implements responsible probing.
-	scheduler *issuance.Scheduler
-	// apiServer serves the HTTP API endpoint.
-	apiServer *servers.APIServer
-	// agentServer handles bidirectional PD/FIE communication with agents.
+	config      *Config
+	scheduler   *issuance.Scheduler
+	apiServer   *servers.APIServer
 	agentServer *servers.AgentServer
-	// pdQueue is the queue for generated probing directives.
-	pdQueue *structures.Queue[api.ProbingDirective]
-	// ringBuffer streams FIEs to connected HTTP clients.
-	ringBuffer *structures.RingBuffer[api.ForwardingInfoElement]
+	pdQueue     *structures.Queue[api.ProbingDirective]
+	ringBuffer  *structures.RingBuffer[api.ForwardingInfoElement]
 }
 
 // NewOrch creates a new orchestrator from the given configuration. Returns an
 // error if any component creation fails.
+// TODO: add Config.Validate() call before constructing components.
 func NewOrch(config *Config) (*orch, error) {
 	o := &orch{config: config}
 
@@ -90,21 +83,23 @@ func NewOrch(config *Config) (*orch, error) {
 		BufferLength: config.AgentBufferLength,
 		Timeout:      config.AgentTimeout,
 		Address:      config.AgentAddress,
-		AgentHandler: o.jsonlStreamHandler,
-		AuthHandler:  o.jsonlAuthHandler,
+		AgentHandler: o.agentHandler,
+		AuthHandler:  o.agentAuthHandler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error on creating agent server: %w", err)
 	}
 	o.agentServer = agentServer
 
-	// Create pd queue
-	pdQueue, _ := structures.NewQueue[api.ProbingDirective](100)
+	pdQueue, err := structures.NewQueue[api.ProbingDirective](100)
+	if err != nil {
+		return nil, fmt.Errorf("error on creating pd queue: %w", err)
+	}
 	o.pdQueue = pdQueue
 
 	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](100)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error on creating ring buffer: %w", err)
 	}
 	o.ringBuffer = ringBuffer
 
@@ -126,11 +121,7 @@ func (o *orch) Run(parentCtx context.Context) error {
 	return group.Wait()
 }
 
-// runScheduler starts the scheduler loop for issuing new ProbingDirectives
-// using the respoinsible probing algorithm.
 func (o *orch) runScheduler(ctx context.Context) error {
-	var pd *api.ProbingDirective
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -138,14 +129,15 @@ func (o *orch) runScheduler(ctx context.Context) error {
 		default:
 		}
 
-		pd = o.scheduler.NextPD()
+		pd := o.scheduler.NextPD()
 		if pd == nil {
-			log.Println("Bernoulli experiment failed, skipping PD.")
 			continue
 		}
 
 		if err := o.pdQueue.Push(ctx, pd.AgentID, pd); err != nil {
-			log.Printf("Cannot find the queue for agent id %v", pd.AgentID)
+			// TODO: downgrade to DEBUG once slog is added.
+			// PD drops before agent connection is expected.
+			log.Printf("Scheduler: no queue for agent %q, directive dropped", pd.AgentID)
 		}
 	}
 }
@@ -180,7 +172,6 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 	return nil
 }
 
-// fieStreamHandler streams FIEs to connected HTTP clients.
 func (o *orch) fieStreamHandler(s *servers.FIEClient) {
 	consumer := o.ringBuffer.NewConsumer()
 	defer consumer.Close()
@@ -196,19 +187,22 @@ func (o *orch) fieStreamHandler(s *servers.FIEClient) {
 			SequenceNumber:        seq,
 		}
 
+		// TODO: log sent FIE at DEBUG level once slog is added.
 		if err = s.SendFIE(seqFIE); err != nil {
 			return
 		}
 	}
 }
 
-// jsonlStreamHandler is the handler for streaming.
-func (o *orch) jsonlStreamHandler(status *servers.AgentAuthStatus, s *servers.AgentStream) {
-	pdQueueConsumer, err := o.pdQueue.NewConsumer(status.AgentID)
+func (o *orch) agentHandler(status *servers.AgentAuthStatus, s *servers.AgentStream) {
+	consumer, err := o.pdQueue.NewConsumer(status.AgentID)
 	if err != nil {
-		log.Printf("Agent with agent id %q is already connected.", status.AgentID)
+		log.Printf("Agent %q is already connected, rejecting", status.AgentID)
+		return
 	}
-	defer pdQueueConsumer.Close()
+	defer consumer.Close()
+
+	log.Printf("Agent %q connected", status.AgentID)
 
 	group, ctx := errgroup.WithContext(s.Context())
 
@@ -219,39 +213,41 @@ func (o *orch) jsonlStreamHandler(status *servers.AgentAuthStatus, s *servers.Ag
 				return err
 			}
 
-			// Make a completeness check.
-			if fie.FarInfo.ReplyAddress == nil || fie.NearInfo.ReplyAddress == nil {
+			// TODO: log received FIE at DEBUG level once slog is added.
+			if err := o.scheduler.UpdateFromFIE(fie); err != nil {
+				log.Printf("Scheduler: failed to update from FIE: %v", err)
+			}
+
+			// Only push complete FIEs to the ring buffer for streaming.
+			if fie.NearInfo == nil || fie.FarInfo == nil {
 				continue
 			}
 
-			// don't care about the slow consumers
 			_ = o.ringBuffer.Push(fie)
 		}
 	})
+
 	group.Go(func() error {
 		for {
-			pd, err := pdQueueConsumer.Pop(ctx)
+			pd, err := consumer.Pop(ctx)
 			if err != nil {
 				return err
 			}
 
-			log.Printf("Sent PD: %v", pd)
-
-			err = s.SendPD(pd)
-			if err != nil {
+			// TODO: log sent PD at DEBUG level once slog is added.
+			if err = s.SendPD(pd); err != nil {
 				return err
 			}
 		}
 	})
 
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
-		log.Printf("jsonl stream handler failed: %v\n", err)
+		log.Printf("Agent %q stream failed: %v", status.AgentID, err)
 	}
-	log.Println("jsonl stream handler exited")
+	log.Printf("Agent %q disconnected", status.AgentID)
 }
 
-// jsonlAuthHandler is the auth handler for the jsonl server.
-func (o *orch) jsonlAuthHandler(auth api.AuthRequest) api.AuthResponse {
+func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
 	if auth.Secret == o.config.Secret {
 		return api.AuthResponse{
 			Authenticated: true,
