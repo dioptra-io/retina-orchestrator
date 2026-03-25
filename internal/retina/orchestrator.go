@@ -4,6 +4,8 @@
 // Package retina implements the Retina orchestrator, which schedules
 // ProbingDirectives to connected agents and streams the resulting
 // ForwardingInfoElements to HTTP clients.
+// TODO: rename package retina → orchestrator when internal/retina/ is
+// restructured to internal/orchestrator/.
 package retina
 
 import (
@@ -14,7 +16,6 @@ import (
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
-	apiOrch "github.com/dioptra-io/retina-orchestrator/internal/retina/api"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/issuance"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/servers"
 	"github.com/dioptra-io/retina-orchestrator/internal/retina/structures"
@@ -26,12 +27,9 @@ type Config struct {
 	// AgentAddress is the TCP listening address for agent connections, in the form "host:port".
 	AgentAddress      string
 	AgentBufferLength int
-	// TODO: replace with TCP keepalive once implemented in agent_server.go.
-	AgentTimeout time.Duration
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
 	APIAddress string
-	APITimeout time.Duration
 	// APIReadHeaderTimeout defaults to 5 seconds if zero.
 	APIReadHeaderTimeout time.Duration
 
@@ -48,6 +46,33 @@ type Config struct {
 	Secret string
 }
 
+// Validate checks all configuration fields and applies defaults where appropriate.
+// Returns an error if any required field is missing or invalid.
+func (c *Config) Validate() error {
+	if c.AgentAddress == "" {
+		return fmt.Errorf("AgentAddress cannot be empty")
+	}
+	if c.AgentBufferLength < 8192 {
+		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
+	}
+	if c.APIAddress == "" {
+		return fmt.Errorf("APIAddress cannot be empty")
+	}
+	if c.PDPath == "" {
+		return fmt.Errorf("PDPath cannot be empty")
+	}
+	if c.IssuanceRate <= 0 {
+		return fmt.Errorf("IssuanceRate must be greater than zero: got %f", c.IssuanceRate)
+	}
+	if c.ImpactThreshold <= 0 {
+		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
+	}
+	if c.APIReadHeaderTimeout == 0 {
+		c.APIReadHeaderTimeout = 5 * time.Second
+	}
+	return nil
+}
+
 type orch struct {
 	config      *Config
 	scheduler   *issuance.Scheduler
@@ -58,9 +83,12 @@ type orch struct {
 }
 
 // NewOrch creates a new orchestrator from the given configuration. Returns an
-// error if any component creation fails.
-// TODO: add Config.Validate() call before constructing components.
+// error if the configuration is invalid or any component creation fails.
 func NewOrch(config *Config) (*orch, error) {
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
 	o := &orch{config: config}
 
 	scheduler, err := issuance.NewScheduler(config.Seed, config.IssuanceRate, config.PDPath)
@@ -80,11 +108,11 @@ func NewOrch(config *Config) (*orch, error) {
 	o.apiServer = apiServer
 
 	agentServer, err := servers.NewAgentServer(&servers.AgentServerConfig{
-		BufferLength: config.AgentBufferLength,
-		Timeout:      config.AgentTimeout,
-		Address:      config.AgentAddress,
-		AgentHandler: o.agentHandler,
-		AuthHandler:  o.agentAuthHandler,
+		BufferLength:     config.AgentBufferLength,
+		HandshakeTimeout: 5 * time.Second,
+		Address:          config.AgentAddress,
+		AgentHandler:     o.agentHandler,
+		AuthHandler:      o.agentAuthHandler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error on creating agent server: %w", err)
@@ -181,8 +209,7 @@ func (o *orch) fieStreamHandler(s *servers.FIEClient) {
 		if err != nil {
 			return
 		}
-
-		seqFIE := &apiOrch.SequencedFIE{
+		seqFIE := &servers.SequencedFIE{
 			ForwardingInfoElement: *fie,
 			SequenceNumber:        seq,
 		}

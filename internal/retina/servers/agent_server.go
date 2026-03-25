@@ -19,6 +19,10 @@ import (
 	"github.com/dioptra-io/retina-commons/api/v1"
 )
 
+// agentKeepalivePeriod is the interval between TCP keepalive probes
+// for agent connections.
+const agentKeepalivePeriod = 30 * time.Second
+
 // AgentAuthStatus contains the agent's identity and connection info after
 // a successful authentication handshake.
 type AgentAuthStatus struct {
@@ -38,11 +42,12 @@ type AuthHandleFunc func(req api.AuthRequest) api.AuthResponse
 // AgentServerConfig configures the TCP listener and handlers for the AgentServer.
 type AgentServerConfig struct {
 	// Address is the TCP listening address in the form "host:port".
-	Address      string
-	BufferLength int
-	Timeout      time.Duration
-	AgentHandler AgentHandleFunc
-	AuthHandler  AuthHandleFunc
+	Address string
+	// HandshakeTimeout is the deadline for the initial authentication exchange.
+	HandshakeTimeout time.Duration
+	BufferLength     int
+	AgentHandler     AgentHandleFunc
+	AuthHandler      AuthHandleFunc
 }
 
 // AgentServer is the TCP server that handles bidirectional PD/FIE communication
@@ -59,20 +64,9 @@ type AgentServer struct {
 }
 
 // NewAgentServer creates a new AgentServer from the provided config.
-// TODO: move validation to Config.Validate() in orchestrator.go.
+// Address and BufferLength are validated by Config.Validate() in orchestrator.go.
+// Handler validation remains here as handlers are not part of Config.
 func NewAgentServer(config *AgentServerConfig) (*AgentServer, error) {
-	if config == nil {
-		return nil, fmt.Errorf("config cannot be nil")
-	}
-	if config.BufferLength < 8192 {
-		return nil, fmt.Errorf("buffer length is too small: got %d, minimum 8192", config.BufferLength)
-	}
-	if config.Timeout <= 0 {
-		return nil, fmt.Errorf("timeout must be positive: got %s", config.Timeout)
-	}
-	if config.Address == "" {
-		return nil, fmt.Errorf("agent server address cannot be empty")
-	}
 	if config.AuthHandler == nil || config.AgentHandler == nil {
 		return nil, fmt.Errorf("handlers cannot be nil")
 	}
@@ -117,7 +111,13 @@ func (s *AgentServer) ListenAndServe() error {
 			s.mutex.Unlock()
 			return fmt.Errorf("expected TCP connection, got %T", conn)
 		}
-		stream := newAgentStream(s.nextStreamID, tcpConn, s)
+		stream, err := newAgentStream(s.nextStreamID, tcpConn, s)
+		if err != nil {
+			s.mutex.Unlock()
+			log.Printf("Failed to configure agent connection: %v", err)
+			_ = tcpConn.Close()
+			continue
+		}
 		s.connections[s.nextStreamID] = stream
 		s.nextStreamID++
 		s.wg.Add(1)
@@ -182,13 +182,13 @@ func (s *AgentServer) handleAgent(stream *AgentStream) {
 }
 
 func (s *AgentServer) handshake(stream *AgentStream) (*AgentAuthStatus, error) {
-	authReq, err := receive[api.AuthRequest](stream.conn, stream.decoder, s.config.Timeout, s.config.BufferLength)
+	authReq, err := receive[api.AuthRequest](stream.conn, stream.decoder, s.config.HandshakeTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("could not receive auth request: %w", err)
 	}
 
 	authResp := s.config.AuthHandler(*authReq)
-	if err := send(stream.conn, stream.encoder, s.config.Timeout, s.config.BufferLength, &authResp); err != nil {
+	if err := send(stream.conn, stream.encoder, s.config.HandshakeTimeout, &authResp); err != nil {
 		return nil, fmt.Errorf("could not send auth response: %w", err)
 	}
 
@@ -229,7 +229,20 @@ type AgentStream struct {
 	server  *AgentServer
 }
 
-func newAgentStream(id int, conn *net.TCPConn, server *AgentServer) *AgentStream {
+func newAgentStream(id int, conn *net.TCPConn, server *AgentServer) (*AgentStream, error) {
+	if err := conn.SetKeepAlive(true); err != nil {
+		return nil, fmt.Errorf("failed to enable keepalive: %w", err)
+	}
+	if err := conn.SetKeepAlivePeriod(agentKeepalivePeriod); err != nil {
+		return nil, fmt.Errorf("failed to set keepalive period: %w", err)
+	}
+	if err := conn.SetReadBuffer(server.config.BufferLength); err != nil {
+		return nil, fmt.Errorf("failed to set read buffer: %w", err)
+	}
+	if err := conn.SetWriteBuffer(server.config.BufferLength); err != nil {
+		return nil, fmt.Errorf("failed to set write buffer: %w", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	return &AgentStream{
 		id:      id,
@@ -239,7 +252,7 @@ func newAgentStream(id int, conn *net.TCPConn, server *AgentServer) *AgentStream
 		encoder: json.NewEncoder(conn),
 		decoder: json.NewDecoder(conn),
 		server:  server,
-	}
+	}, nil
 }
 
 func (s *AgentStream) Context() context.Context {
@@ -247,19 +260,18 @@ func (s *AgentStream) Context() context.Context {
 }
 
 func (s *AgentStream) SendPD(e *api.ProbingDirective) error {
-	return send(s.conn, s.encoder, s.server.config.Timeout, s.server.config.BufferLength, e)
+	return send(s.conn, s.encoder, 0, e)
 }
 
 func (s *AgentStream) ReceiveFIE() (*api.ForwardingInfoElement, error) {
-	return receive[api.ForwardingInfoElement](s.conn, s.decoder, s.server.config.Timeout, s.server.config.BufferLength)
+	return receive[api.ForwardingInfoElement](s.conn, s.decoder, 0)
 }
 
-func send[E any](conn *net.TCPConn, encoder *json.Encoder, timeout time.Duration, buffer int, e *E) error {
-	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-		return fmt.Errorf("send failed: cannot set write deadline: %w", err)
-	}
-	if err := conn.SetWriteBuffer(buffer); err != nil {
-		return fmt.Errorf("send failed: cannot set write buffer: %w", err)
+func send[E any](conn *net.TCPConn, encoder *json.Encoder, timeout time.Duration, e *E) error {
+	if timeout > 0 {
+		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			return fmt.Errorf("send failed: cannot set write deadline: %w", err)
+		}
 	}
 	if err := encoder.Encode(e); err != nil {
 		return fmt.Errorf("send failed: cannot encode: %w", err)
@@ -267,13 +279,12 @@ func send[E any](conn *net.TCPConn, encoder *json.Encoder, timeout time.Duration
 	return nil
 }
 
-func receive[E any](conn *net.TCPConn, decoder *json.Decoder, timeout time.Duration, buffer int) (*E, error) {
+func receive[E any](conn *net.TCPConn, decoder *json.Decoder, timeout time.Duration) (*E, error) {
 	var e E
-	if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return nil, fmt.Errorf("receive failed: cannot set read deadline: %w", err)
-	}
-	if err := conn.SetReadBuffer(buffer); err != nil {
-		return nil, fmt.Errorf("receive failed: cannot set read buffer: %w", err)
+	if timeout > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return nil, fmt.Errorf("receive failed: cannot set read deadline: %w", err)
+		}
 	}
 	if err := decoder.Decode(&e); err != nil {
 		return nil, fmt.Errorf("receive failed: cannot decode: %w", err)

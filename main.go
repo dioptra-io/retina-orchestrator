@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"log"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -34,10 +35,11 @@ func run() error {
 		issuanceRate         = flag.Float64("issuance-rate", 1.0, "Target global issuance rate of probing directives (PDs per second, approximate)")
 		impactThreshold      = flag.Float64("impact-threshold", 1.0, "Maximum impact threshold per address for the responsible probing algorithm")
 		seed                 = flag.Uint64("seed", 42, "Seed for the randomizer")
-		secret               = flag.String("secret", "", "Shared secret for agent authentication")
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", 5*time.Second, "Timeout for reading HTTP request headers")
 	)
 	flag.Parse()
+
+	secret := os.Getenv("RETINA_SECRET")
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -45,15 +47,13 @@ func run() error {
 	orch, err := retina.NewOrch(&retina.Config{
 		AgentAddress:         *agentAddr,
 		AgentBufferLength:    defaultAgentBufferLength,
-		AgentTimeout:         time.Hour,
 		APIAddress:           *apiAddr,
-		APITimeout:           time.Hour,
 		APIReadHeaderTimeout: *apiReadHeaderTimeout,
 		PDPath:               *pdPath,
 		IssuanceRate:         *issuanceRate,
 		Seed:                 *seed,
 		ImpactThreshold:      *impactThreshold,
-		Secret:               *secret,
+		Secret:               secret,
 	})
 	if err != nil {
 		return err
