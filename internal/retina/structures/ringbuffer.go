@@ -49,6 +49,7 @@ func (rbc *ringConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
 		rbc.rb.cond.Wait()
 	}
 	e := rbc.rb.buffer[rbc.tail]
+	rbc.rb.buffer[rbc.tail] = nil // allow GC of processed elements
 	rbc.tail = (rbc.tail + 1) % rbc.rb.capacity
 	rbc.seq++
 
