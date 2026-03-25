@@ -1,3 +1,8 @@
+// Copyright (c) 2025 Dioptra
+// SPDX-License-Identifier: MIT
+
+// Package structures provides generic data structures for the orchestrator,
+// including a per-consumer queue and a ring buffer for FIE streaming.
 package structures
 
 import (
@@ -6,41 +11,36 @@ import (
 	"sync"
 )
 
-// queueConsumer is a consumer of a Queue. It holds a dedicated channel for
-// receiving elements pushed to it.
-//
-// All methods on queueConsumer must be called from the same goroutine.
-type queueConsumer[T any] struct {
+// All methods on consumer must be called from the same goroutine.
+type consumer[T any] struct {
 	id    string
 	ch    chan *T
+	done  chan struct{}
 	queue *Queue[T]
 }
 
-// Pop returns the next element from the consumer's queue. If no element is
-// available, Pop blocks until one is pushed or the context is cancelled.
-//
-// Returns an error if the context is cancelled or if the consumer is already
-// closed.
-func (qc *queueConsumer[T]) Pop(ctx context.Context) (*T, error) {
-	if qc.queue == nil {
-		return nil, fmt.Errorf("consumer already closed")
+// Pop returns the next element, blocking until one is available, the context
+// is cancelled, or the consumer is closed.
+func (qc *consumer[T]) Pop(ctx context.Context) (*T, error) {
+	// Drain any buffered item first before blocking.
+	select {
+	case item := <-qc.ch:
+		return item, nil
+	default:
 	}
 
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-
-	case item, open := <-qc.ch:
-		if !open {
-			return nil, fmt.Errorf("consumer already closed")
-		}
+	case <-qc.done:
+		return nil, fmt.Errorf("consumer closed")
+	case item := <-qc.ch:
 		return item, nil
 	}
 }
 
-// Close removes the consumer from the queue. Calling Close multiple times is a
-// no-op.
-func (qc *queueConsumer[T]) Close() {
+// Calling Close multiple times is a no-op.
+func (qc *consumer[T]) Close() {
 	if qc.queue == nil {
 		return
 	}
@@ -50,76 +50,73 @@ func (qc *queueConsumer[T]) Close() {
 
 	if _, ok := qc.queue.consumers[qc.id]; ok {
 		delete(qc.queue.consumers, qc.id)
-		close(qc.ch)
+		close(qc.done)
 		qc.queue = nil
 	}
 }
 
-// Queue is a pub/sub queue that delivers elements to individual consumers.
-// Each consumer has its own buffered channel and receives only elements pushed
-// directly to it.
-//
-// Push is safe to call concurrently with Pop and Close.
+// Queue delivers elements to individual named consumers.
+// Each consumer has its own buffered channel and receives only elements
+// pushed directly to it by ID.
 type Queue[T any] struct {
 	mu         sync.Mutex
-	consumers  map[string]*queueConsumer[T]
+	consumers  map[string]*consumer[T]
 	bufferSize int
 }
 
 // NewQueue creates a new Queue with the given per-consumer buffer size.
 func NewQueue[T any](bufferSize int) (*Queue[T], error) {
 	if bufferSize < 0 {
-		return nil, fmt.Errorf("buffer size cannot be negative")
+		return nil, fmt.Errorf("buffer size cannot be negative: got %d", bufferSize)
 	}
 
 	return &Queue[T]{
-		consumers:  make(map[string]*queueConsumer[T]),
+		consumers:  make(map[string]*consumer[T]),
 		bufferSize: bufferSize,
 	}, nil
 }
 
-// NewConsumer creates a new QueueConsumer with a dedicated buffered channel.
-// If the given id already exists it returns an error.
-func (q *Queue[T]) NewConsumer(id string) (*queueConsumer[T], error) {
+// Returns an error if a consumer with the given id already exists.
+func (q *Queue[T]) NewConsumer(id string) (*consumer[T], error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if _, ok := q.consumers[id]; ok {
-		return nil, fmt.Errorf("consumer with id already exists")
+		return nil, fmt.Errorf("consumer %q already exists", id)
 	}
 
-	consumer := &queueConsumer[T]{
+	c := &consumer[T]{
 		id:    id,
 		ch:    make(chan *T, q.bufferSize),
+		done:  make(chan struct{}),
 		queue: q,
 	}
-	q.consumers[id] = consumer
-	return consumer, nil
+	q.consumers[id] = c
+	return c, nil
 }
 
-// Push sends an element to a specific consumer. Blocks if the consumer's buffer
-// is full until space is available or the context is cancelled.
+// Push sends an element to a specific consumer. Blocks if the consumer's
+// buffer is full until space is available or the context is cancelled.
+// Push is safe to call concurrently with Pop and Close.
 //
-// Returns an error if the context is cancelled or if the consumer is closed.
-func (q *Queue[T]) Push(ctx context.Context, id string, item *T) (err error) {
+// Returns an error if the context is cancelled, if the consumer is not found,
+// or if the consumer is closed.
+func (q *Queue[T]) Push(ctx context.Context, id string, item *T) error {
 	q.mu.Lock()
 	if _, ok := q.consumers[id]; !ok {
 		q.mu.Unlock()
-		return fmt.Errorf("consumer is not registered or already closed")
+		return fmt.Errorf("consumer %q not found", id)
 	}
-	ch := q.consumers[id].ch
+	// Capture both ch and done under the lock so Close() cannot race between
+	// the two reads.
+	ch, done := q.consumers[id].ch, q.consumers[id].done
 	q.mu.Unlock()
-
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("consumer already closed")
-		}
-	}()
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-
+	case <-done:
+		return fmt.Errorf("consumer %q closed", id)
 	case ch <- item:
 		return nil
 	}
