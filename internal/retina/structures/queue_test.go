@@ -348,6 +348,28 @@ func TestPush_ContextCancelledWhileBlocking(t *testing.T) {
 	}
 }
 
+func TestPush_BlocksUntilConsumerClosed(t *testing.T) {
+	t.Parallel()
+	// Unbuffered so Push blocks immediately in the select,
+	// exercising the <-done arm when Close fires concurrently.
+	q, _ := NewQueue[int](0)
+	cons, _ := q.NewConsumer("a")
+
+	v := 1
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- q.Push(context.Background(), "a", &v)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	cons.Close()
+
+	err := <-errCh
+	if err == nil {
+		t.Fatal("expected error when consumer closed while Push blocking")
+	}
+}
+
 // --- Close ---
 
 func TestQueueClose_Idempotent(t *testing.T) {

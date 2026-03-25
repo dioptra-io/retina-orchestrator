@@ -28,6 +28,7 @@ func (qc *consumer[T]) Pop(ctx context.Context) (*T, error) {
 		return item, nil
 	default:
 	}
+
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -43,8 +44,10 @@ func (qc *consumer[T]) Close() {
 	if qc.queue == nil {
 		return
 	}
+
 	qc.queue.mu.Lock()
 	defer qc.queue.mu.Unlock()
+
 	if _, ok := qc.queue.consumers[qc.id]; ok {
 		delete(qc.queue.consumers, qc.id)
 		close(qc.done)
@@ -66,6 +69,7 @@ func NewQueue[T any](bufferSize int) (*Queue[T], error) {
 	if bufferSize < 0 {
 		return nil, fmt.Errorf("buffer size cannot be negative: got %d", bufferSize)
 	}
+
 	return &Queue[T]{
 		consumers:  make(map[string]*consumer[T]),
 		bufferSize: bufferSize,
@@ -76,9 +80,11 @@ func NewQueue[T any](bufferSize int) (*Queue[T], error) {
 func (q *Queue[T]) NewConsumer(id string) (*consumer[T], error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+
 	if _, ok := q.consumers[id]; ok {
 		return nil, fmt.Errorf("consumer %q already exists", id)
 	}
+
 	c := &consumer[T]{
 		id:    id,
 		ch:    make(chan *T, q.bufferSize),
@@ -93,19 +99,24 @@ func (q *Queue[T]) NewConsumer(id string) (*consumer[T], error) {
 // buffer is full until space is available or the context is cancelled.
 // Push is safe to call concurrently with Pop and Close.
 //
-// Returns an error if the context is cancelled or if the consumer is not found.
+// Returns an error if the context is cancelled, if the consumer is not found,
+// or if the consumer is closed.
 func (q *Queue[T]) Push(ctx context.Context, id string, item *T) error {
 	q.mu.Lock()
 	if _, ok := q.consumers[id]; !ok {
 		q.mu.Unlock()
 		return fmt.Errorf("consumer %q not found", id)
 	}
-	ch := q.consumers[id].ch
+	// Capture both ch and done under the lock so Close() cannot race between
+	// the two reads.
+	ch, done := q.consumers[id].ch, q.consumers[id].done
 	q.mu.Unlock()
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-done:
+		return fmt.Errorf("consumer %q closed", id)
 	case ch <- item:
 		return nil
 	}
