@@ -16,8 +16,15 @@ import (
 	httpSwagger "github.com/swaggo/http-swagger"
 
 	// _ "github.com/dioptra-io/retina-orchestrator/docs"
-	apiOrch "github.com/dioptra-io/retina-orchestrator/internal/retina/api"
+	"github.com/dioptra-io/retina-commons/api/v1"
 )
+
+// SequencedFIE wraps a ForwardingInfoElement with a sequence number
+// for ordered delivery to HTTP clients.
+type SequencedFIE struct {
+	api.ForwardingInfoElement
+	SequenceNumber uint64 `json:"sequence_number"`
+}
 
 // FIEHandleFunc is called for each incoming request to the /stream endpoint.
 type FIEHandleFunc func(s *FIEClient)
@@ -40,11 +47,13 @@ type APIServer struct {
 }
 
 // NewAPIServer creates a new APIServer from the provided config.
-// TODO: Config.Validate() in orchestrator.go should validate all fields
-// including Address and FIEHandler before constructing the server.
 // FIEHandler is passed via config rather than as a direct parameter to
 // keep the constructor signature stable as new handlers are added.
 func NewAPIServer(config *APIServerConfig) (*APIServer, error) {
+	if config.FIEHandler == nil {
+		return nil, fmt.Errorf("FIEHandler cannot be nil")
+	}
+
 	s := &APIServer{
 		config:  config,
 		clients: make(map[*FIEClient]struct{}),
@@ -136,7 +145,7 @@ type FIEClient struct {
 }
 
 // SendFIE encodes and sends a SequencedFIE to the client.
-func (s *FIEClient) SendFIE(fie *apiOrch.SequencedFIE) error {
+func (s *FIEClient) SendFIE(fie *SequencedFIE) error {
 	if err := s.encoder.Encode(fie); err != nil {
 		return fmt.Errorf("failed to send FIE: %w", err)
 	}
