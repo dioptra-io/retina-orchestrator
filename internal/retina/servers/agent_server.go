@@ -165,6 +165,7 @@ func (s *AgentServer) Shutdown(timeout time.Duration) error {
 // handleAgent performs the authentication handshake and invokes the
 // AgentHandler for authenticated agents.
 func (s *AgentServer) handleAgent(stream *AgentStream) {
+	defer s.wg.Done()
 	defer func() {
 		s.mutex.Lock()
 		defer s.mutex.Unlock()
@@ -205,7 +206,6 @@ func (s *AgentServer) handshake(stream *AgentStream) (*AgentAuthStatus, error) {
 // removeConnection cleans up a connection when the agent disconnects or the
 // server shuts down.
 // Must be called with s.mutex held to avoid races with concurrent connections.
-// Must only be called once per connection to avoid double-counting the WaitGroup.
 func (s *AgentServer) removeConnection(stream *AgentStream) {
 	if _, ok := s.connections[stream.id]; !ok {
 		return
@@ -213,7 +213,6 @@ func (s *AgentServer) removeConnection(stream *AgentStream) {
 	stream.cancel()
 	_ = stream.conn.Close()
 	delete(s.connections, stream.id)
-	s.wg.Done()
 }
 
 // AgentStream is the bidirectional JSON communication channel with a single
