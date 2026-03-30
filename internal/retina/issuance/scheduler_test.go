@@ -55,7 +55,7 @@ func makeFIE(id uint64, near, far net.IP) *api.ForwardingInfoElement {
 
 func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
 	t.Helper()
-	s, err := NewScheduler(42, 1000.0, writePDFile(t, pds))
+	s, err := NewScheduler(42, 1000.0, writePDFile(t, pds), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,7 +67,7 @@ func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
 func TestNewScheduler_InvalidRate(t *testing.T) {
 	t.Parallel()
 	for _, rate := range []float64{0, -1} {
-		_, err := NewScheduler(0, rate, "irrelevant")
+		_, err := NewScheduler(0, rate, "irrelevant", nil)
 		if err == nil {
 			t.Errorf("rate %v: expected error, got nil", rate)
 		}
@@ -76,7 +76,7 @@ func TestNewScheduler_InvalidRate(t *testing.T) {
 
 func TestNewScheduler_MissingFile(t *testing.T) {
 	t.Parallel()
-	_, err := NewScheduler(0, 1.0, "/nonexistent/path.jsonl")
+	_, err := NewScheduler(0, 1.0, "/nonexistent/path.jsonl", nil)
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -84,7 +84,7 @@ func TestNewScheduler_MissingFile(t *testing.T) {
 
 func TestNewScheduler_EmptyFile(t *testing.T) {
 	t.Parallel()
-	_, err := NewScheduler(0, 1.0, writePDFile(t, nil))
+	_, err := NewScheduler(0, 1.0, writePDFile(t, nil), nil)
 	if err == nil {
 		t.Fatal("expected error for empty directive file, got nil")
 	}
@@ -112,7 +112,7 @@ func TestReadPDs_InvalidJSON(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("cannot close temp file: %v", err)
 	}
-	_, err = NewScheduler(0, 1.0, f.Name())
+	_, err = NewScheduler(0, 1.0, f.Name(), nil)
 	if err == nil {
 		t.Fatal("expected unmarshal error for invalid JSON, got nil")
 	}
@@ -132,7 +132,7 @@ func TestReadPDs_ScannerError(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("cannot close temp file: %v", err)
 	}
-	_, err = NewScheduler(0, 1.0, f.Name())
+	_, err = NewScheduler(0, 1.0, f.Name(), nil)
 	if err == nil {
 		t.Fatal("expected scanner error for oversized line, got nil")
 	}

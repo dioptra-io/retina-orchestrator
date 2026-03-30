@@ -9,7 +9,8 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -38,7 +39,8 @@ type impactRecord struct {
 // ProbingDirectives for issuance and updates their issuance probabilities
 // based on incoming ForwardingInfoElements.
 type Scheduler struct {
-	mutex sync.Mutex
+	logger *slog.Logger
+	mutex  sync.Mutex
 	// pdMap maps each ProbingDirective ID to its scheduling state, which holds
 	// the directive itself, its issuance probability, and last hit addresses.
 	pdMap map[uint64]*pdState
@@ -60,9 +62,12 @@ type Scheduler struct {
 // file contains no directives.
 //
 // TODO: validate issuanceRate > 0 at the Config level instead of here.
-func NewScheduler(seed uint64, issuanceRate float64, pdFile string) (*Scheduler, error) {
+func NewScheduler(seed uint64, issuanceRate float64, pdFile string, logger *slog.Logger) (*Scheduler, error) {
 	if issuanceRate <= 0.0 {
 		return nil, fmt.Errorf("invalid arguments: issuance rate cannot be zero or negative")
+	}
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
 	pds, err := readPDs(pdFile)
@@ -73,8 +78,9 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string) (*Scheduler,
 		return nil, fmt.Errorf("invalid arguments: pds length cannot be zero")
 	}
 
-	// TODO: downgrade to INFO level once slog is added.
-	log.Printf("Scheduler: loaded %d directives from %s", len(pds), pdFile)
+	logger.Info("Scheduler loaded directives",
+		slog.Int("count", len(pds)),
+		slog.String("file", pdFile))
 
 	pdMap := make(map[uint64]*pdState, len(pds))
 	indices := make([]uint64, 0, len(pds))
@@ -92,6 +98,7 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string) (*Scheduler,
 	}
 
 	return &Scheduler{
+		logger:         logger,
 		pdMap:          pdMap,
 		impactRecords:  make(map[string]*impactRecord),
 		issuancePeriod: time.Duration(float64(time.Second) / issuanceRate),
@@ -119,8 +126,9 @@ func (s *Scheduler) NextPD() *api.ProbingDirective {
 	if s.random.Float64() < issuanceProb {
 		return pd.directive
 	}
-	// TODO: downgrade to DEBUG level once slog is added.
-	log.Printf("Scheduler: directive %d skipped (issuance probability: %.2f)", pd.directive.ProbingDirectiveID, issuanceProb)
+	s.logger.Debug("PD skipped",
+		slog.Uint64("pd_id", pd.directive.ProbingDirectiveID),
+		slog.Float64("issuance_prob", issuanceProb))
 	return nil
 }
 

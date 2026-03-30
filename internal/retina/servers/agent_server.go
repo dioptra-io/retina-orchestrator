@@ -10,7 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -48,12 +48,14 @@ type AgentServerConfig struct {
 	BufferLength     int
 	AgentHandler     AgentHandleFunc
 	AuthHandler      AuthHandleFunc
+	Logger           *slog.Logger
 }
 
 // AgentServer is the TCP server that handles bidirectional PD/FIE communication
 // with connected agents using newline-delimited JSON.
 type AgentServer struct {
 	config   *AgentServerConfig
+	logger   *slog.Logger
 	shutdown atomic.Bool
 	mutex    sync.Mutex
 	// connections tracks all active agent connections for shutdown.
@@ -70,9 +72,13 @@ func NewAgentServer(config *AgentServerConfig) (*AgentServer, error) {
 	if config.AuthHandler == nil || config.AgentHandler == nil {
 		return nil, fmt.Errorf("handlers cannot be nil")
 	}
+	if config.Logger == nil {
+		config.Logger = slog.Default()
+	}
 
 	return &AgentServer{
 		config:      config,
+		logger:      config.Logger,
 		connections: make(map[int]*AgentStream),
 	}, nil
 }
@@ -91,6 +97,8 @@ func (s *AgentServer) ListenAndServe() error {
 	s.mutex.Lock()
 	s.listener = listener
 	s.mutex.Unlock()
+
+	s.logger.Info("Agent server listening", slog.String("addr", s.config.Address))
 
 	if s.shutdown.Load() {
 		return ErrServerShutdown
@@ -114,7 +122,9 @@ func (s *AgentServer) ListenAndServe() error {
 		stream, err := newAgentStream(s.nextStreamID, tcpConn, s)
 		if err != nil {
 			s.mutex.Unlock()
-			log.Printf("Failed to configure agent connection: %v", err)
+			s.logger.Error("failed to configure agent connection",
+				slog.String("remote_addr", conn.RemoteAddr().String()),
+				slog.Any("err", err))
 			_ = tcpConn.Close()
 			continue
 		}
@@ -133,6 +143,8 @@ func (s *AgentServer) Shutdown(timeout time.Duration) error {
 	if s.shutdown.Swap(true) {
 		return nil
 	}
+
+	s.logger.Info("Shutting down agent server")
 
 	exitCtx, exitCancel := context.WithTimeout(context.Background(), timeout)
 	defer exitCancel()
@@ -158,6 +170,7 @@ func (s *AgentServer) Shutdown(timeout time.Duration) error {
 	case <-done:
 		return nil
 	case <-exitCtx.Done():
+		s.logger.Warn("Agent server shutdown timed out", slog.Duration("timeout", timeout))
 		return exitCtx.Err()
 	}
 }
@@ -174,11 +187,15 @@ func (s *AgentServer) handleAgent(stream *AgentStream) {
 
 	status, err := s.handshake(stream)
 	if err != nil {
-		log.Printf("Handshake failed: %v", err)
+		s.logger.Warn("Handshake failed",
+			slog.String("remote_addr", stream.conn.RemoteAddr().String()),
+			slog.Any("err", err))
 		return
 	}
 
-	log.Printf("Agent authenticated from %v", status.RemoteAddress)
+	s.logger.Info("Agent authenticated",
+		slog.String("agent_id", status.AgentID),
+		slog.String("remote_addr", status.RemoteAddress.String()))
 	s.config.AgentHandler(status, stream)
 }
 

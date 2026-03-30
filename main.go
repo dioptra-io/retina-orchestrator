@@ -10,7 +10,7 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -23,7 +23,8 @@ const defaultAgentBufferLength = 8192
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatalf("%v", err)
+		slog.Error("orchestrator error", "err", err)
+		os.Exit(1)
 	}
 }
 
@@ -36,8 +37,19 @@ func run() error {
 		impactThreshold      = flag.Float64("impact-threshold", 1.0, "Maximum impact threshold per address for the responsible probing algorithm")
 		seed                 = flag.Uint64("seed", 42, "Seed for the randomizer")
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", 5*time.Second, "Timeout for reading HTTP request headers")
+		logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 	)
 	flag.Parse()
+
+	var level slog.Level
+	invalidLevel := level.UnmarshalText([]byte(*logLevel)) != nil
+	if invalidLevel {
+		level = slog.LevelInfo
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	if invalidLevel {
+		logger.Warn("Unknown log level, defaulting to info", slog.String("log_level", *logLevel))
+	}
 
 	secret := os.Getenv("RETINA_SECRET")
 
@@ -54,15 +66,25 @@ func run() error {
 		Seed:                 *seed,
 		ImpactThreshold:      *impactThreshold,
 		Secret:               secret,
+		Logger:               logger,
 	})
+
 	if err != nil {
 		return err
 	}
+	logger.Info("Starting orchestrator",
+		"api_addr", *apiAddr,
+		"agent_addr", *agentAddr,
+		"pd_path", *pdPath,
+		"issuance_rate", *issuanceRate,
+		"impact_threshold", *impactThreshold,
+		"log_level", level,
+	)
 
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {
 		return err
 	}
 
-	log.Println("Shutting down orchestrator.")
+	logger.Info("Shutting down orchestrator")
 	return nil
 }
