@@ -6,27 +6,21 @@ import (
 )
 
 func TestAgentServer_ErrServerShutdown_ListenBeforeShutdown(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, allowAll, nopAgent)
-
-	// Shutdown before calling ListenAndServe
 	_ = s.Shutdown(time.Second)
-
-	err := s.ListenAndServe()
-	if err != ErrServerShutdown {
+	if err := s.ListenAndServe(); err != ErrServerShutdown {
 		t.Fatalf("expected ErrServerShutdown, got %v", err)
 	}
 }
 
 func TestAgentServer_ErrServerShutdown_AfterShutdown(t *testing.T) {
+	t.Parallel()
 	s, _ := newTestServer(t, allowAll, nopAgent)
 
 	done := make(chan error, 1)
-	go func() {
-		done <- s.ListenAndServe()
-	}()
+	go func() { done <- s.ListenAndServe() }()
 	time.Sleep(20 * time.Millisecond)
-
-	// Trigger shutdown
 	_ = s.Shutdown(time.Second)
 
 	select {

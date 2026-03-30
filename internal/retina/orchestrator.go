@@ -6,6 +6,9 @@
 // ForwardingInfoElements to HTTP clients.
 // TODO: rename package retina → orchestrator when internal/retina/ is
 // restructured to internal/orchestrator/.
+// TODO: flatten internal/retina/issuance, internal/retina/servers, and
+// internal/retina/structures into this package to improve testability and
+// remove unnecessary package boundaries. Defer until after first release.
 package retina
 
 import (
