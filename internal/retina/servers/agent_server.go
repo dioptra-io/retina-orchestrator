@@ -122,7 +122,7 @@ func (s *AgentServer) ListenAndServe() error {
 		stream, err := newAgentStream(s.nextStreamID, tcpConn, s)
 		if err != nil {
 			s.mutex.Unlock()
-			s.logger.Error("failed to configure agent connection",
+			s.logger.Error("Failed to configure agent connection",
 				slog.String("remote_addr", conn.RemoteAddr().String()),
 				slog.Any("err", err))
 			_ = tcpConn.Close()

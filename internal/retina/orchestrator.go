@@ -260,7 +260,7 @@ func (o *orch) agentHandler(status *servers.AgentAuthStatus, s *servers.AgentStr
 				slog.Uint64("pd_id", fie.ProbingDirectiveID),
 				slog.Bool("complete", fie.NearInfo != nil && fie.FarInfo != nil))
 			if err := o.scheduler.UpdateFromFIE(fie); err != nil {
-				o.logger.Error("failed to update scheduler from FIE", "agent_id", status.AgentID, "err", err)
+				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.AgentID, "err", err)
 			}
 
 			// Only push complete FIEs to the ring buffer for streaming.
@@ -290,7 +290,7 @@ func (o *orch) agentHandler(status *servers.AgentAuthStatus, s *servers.AgentStr
 	})
 
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
-		o.logger.Error("agent stream failed", "agent_id", status.AgentID, "err", err)
+		o.logger.Error("Agent stream failed", "agent_id", status.AgentID, "err", err)
 	}
 	o.logger.Info("Agent disconnected", "agent_id", status.AgentID)
 }

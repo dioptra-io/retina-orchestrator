@@ -23,7 +23,7 @@ const defaultAgentBufferLength = 8192
 
 func main() {
 	if err := run(); err != nil {
-		slog.Error("orchestrator error", "err", err)
+		slog.Error("Orchestrator error", "err", err)
 		os.Exit(1)
 	}
 }

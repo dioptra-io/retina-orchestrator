@@ -114,7 +114,7 @@ func (s *APIServer) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		s.logger.Error("streaming unsupported: ResponseWriter does not implement http.Flusher")
+		s.logger.Error("Streaming unsupported: ResponseWriter does not implement http.Flusher")
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
