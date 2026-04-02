@@ -263,7 +263,7 @@ func newAgentStream(id int, conn *net.TCPConn, server *AgentServer) (*AgentStrea
 		return nil, fmt.Errorf("failed to set write buffer: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118
 	return &AgentStream{
 		id:      id,
 		conn:    conn,
