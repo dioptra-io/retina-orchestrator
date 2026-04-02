@@ -89,15 +89,17 @@ func startServer(t *testing.T, s *AgentServer) {
 	time.Sleep(20 * time.Millisecond)
 }
 
-// doHandshake performs the auth exchange and returns the response and the
-// decoder used. The decoder must be reused for any subsequent reads on conn
-// to avoid losing bytes buffered inside it.
+// doHandshake sends an AuthRequest and returns the AuthResponse along with the
+// persistent decoder. Callers that read further messages from conn must reuse
+// the returned decoder — creating a new one would re-buffer bytes already
+// consumed, silently discarding them.
 func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) (api.AuthResponse, *json.Decoder) {
 	t.Helper()
 	dec := json.NewDecoder(conn)
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		t.Fatalf("cannot send auth request: %v", err)
 	}
+	dec := json.NewDecoder(conn)
 	var resp api.AuthResponse
 	if err := dec.Decode(&resp); err != nil {
 		t.Fatalf("cannot decode auth response: %v", err)
@@ -521,7 +523,8 @@ func TestAgentStream_SendPDReceiveFIE(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Reuse the decoder from doHandshake to avoid losing buffered bytes.
+	// Reuse the decoder from doHandshake to avoid re-buffering bytes that were
+	// already consumed during the auth response read.
 	_, dec := doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
 
 	var pd api.ProbingDirective

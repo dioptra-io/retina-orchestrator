@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -36,11 +36,13 @@ type APIServerConfig struct {
 	// ReadHeaderTimeout is the timeout for reading HTTP request headers.
 	ReadHeaderTimeout time.Duration
 	FIEHandler        FIEHandleFunc
+	Logger            *slog.Logger
 }
 
 // APIServer exposes the FIE streaming endpoint and Swagger UI over HTTP.
 type APIServer struct {
 	config  *APIServerConfig
+	logger  *slog.Logger
 	server  *http.Server
 	mutex   sync.Mutex
 	clients map[*FIEClient]struct{}
@@ -53,9 +55,13 @@ func NewAPIServer(config *APIServerConfig) (*APIServer, error) {
 	if config.FIEHandler == nil {
 		return nil, fmt.Errorf("FIEHandler cannot be nil")
 	}
+	if config.Logger == nil {
+		config.Logger = slog.Default()
+	}
 
 	s := &APIServer{
 		config:  config,
+		logger:  config.Logger,
 		clients: make(map[*FIEClient]struct{}),
 	}
 
@@ -82,10 +88,13 @@ func (s *APIServer) ListenAndServe() error {
 
 // Shutdown gracefully stops the HTTP server, respecting the provided timeout.
 func (s *APIServer) Shutdown(timeout time.Duration) error {
+	s.logger.Info("Shutting down API server")
+
 	exitCtx, exitCancel := context.WithTimeout(context.Background(), timeout)
 	defer exitCancel()
 
 	if err := s.server.Shutdown(exitCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		s.logger.Warn("API server shutdown timed out", slog.Duration("timeout", timeout))
 		return err
 	}
 	return nil
@@ -105,6 +114,7 @@ func (s *APIServer) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
+		s.logger.Error("Streaming unsupported: ResponseWriter does not implement http.Flusher")
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
@@ -115,11 +125,10 @@ func (s *APIServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		encoder: json.NewEncoder(w),
 	}
 	s.addClient(client)
-	// TODO: downgrade to DEBUG level once slog is added.
-	log.Printf("API: client connected from %v", r.RemoteAddr)
+	s.logger.Debug("Client connected", slog.String("remote_addr", r.RemoteAddr))
 	defer func() {
 		s.removeClient(client)
-		log.Printf("API: client disconnected from %v", r.RemoteAddr)
+		s.logger.Debug("Client disconnected", slog.String("remote_addr", r.RemoteAddr))
 	}()
 
 	s.config.FIEHandler(client)
