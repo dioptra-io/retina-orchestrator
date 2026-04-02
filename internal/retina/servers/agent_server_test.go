@@ -95,6 +95,7 @@ func startServer(t *testing.T, s *AgentServer) {
 // consumed, silently discarding them.
 func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) (api.AuthResponse, *json.Decoder) {
 	t.Helper()
+	dec := json.NewDecoder(conn)
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		t.Fatalf("cannot send auth request: %v", err)
 	}
@@ -310,6 +311,69 @@ func TestHandshake_ConnectionClosedBeforeAuth(t *testing.T) {
 	}
 	conn.Close()
 	time.Sleep(50 * time.Millisecond)
+}
+
+func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
+	t.Parallel()
+
+	handshakeTimeout := 100 * time.Millisecond
+	addr := freeAddr(t)
+	fieCh := make(chan *api.ForwardingInfoElement, 1)
+
+	s, err := NewAgentServer(&AgentServerConfig{
+		Address:          addr,
+		HandshakeTimeout: handshakeTimeout,
+		BufferLength:     4096,
+		AuthHandler:      allowAll,
+		AgentHandler: func(_ *AgentAuthStatus, stream *AgentStream) {
+			if err := stream.SendPD(&api.ProbingDirective{ProbingDirectiveID: 1}); err != nil {
+				return
+			}
+			fie, err := stream.ReceiveFIE()
+			if err != nil {
+				return
+			}
+			fieCh <- fie
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	startServer(t, s)
+	defer s.Shutdown(time.Second)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("cannot dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Reuse the decoder from doHandshake to avoid losing buffered bytes.
+	_, dec := doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
+
+	// Read the PD immediately — the server sends it right after auth.
+	var pd api.ProbingDirective
+	if err := dec.Decode(&pd); err != nil {
+		t.Fatalf("cannot decode PD: %v", err)
+	}
+
+	// Wait longer than HandshakeTimeout before sending the FIE — if the
+	// deadline is not cleared, the server-side connection will have timed
+	// out by now and the encode below will fail.
+	time.Sleep(handshakeTimeout * 3)
+
+	if err := json.NewEncoder(conn).Encode(&api.ForwardingInfoElement{ProbingDirectiveID: 1}); err != nil {
+		t.Fatalf("connection timed out after handshake — deadline not cleared: %v", err)
+	}
+
+	select {
+	case got := <-fieCh:
+		if got.ProbingDirectiveID != 1 {
+			t.Errorf("expected FIE ID 1, got %d", got.ProbingDirectiveID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("did not receive FIE — connection may have timed out")
+	}
 }
 
 // -- send / receive -----------------------------------------------------------

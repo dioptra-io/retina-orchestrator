@@ -214,6 +214,10 @@ func (s *AgentServer) handshake(stream *AgentStream) (*AgentAuthStatus, error) {
 		return nil, fmt.Errorf("agent not authenticated: %s", authResp.Message)
 	}
 
+	if err := stream.conn.SetDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("could not clear deadline: %w", err)
+	}
+
 	return &AgentAuthStatus{
 		AgentID:       authReq.AgentID,
 		RemoteAddress: stream.conn.RemoteAddr(),
