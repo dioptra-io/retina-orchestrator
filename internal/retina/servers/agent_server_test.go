@@ -89,16 +89,21 @@ func startServer(t *testing.T, s *AgentServer) {
 	time.Sleep(20 * time.Millisecond)
 }
 
-func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) api.AuthResponse {
+// doHandshake sends an AuthRequest and returns the AuthResponse along with the
+// persistent decoder. Callers that read further messages from conn must reuse
+// the returned decoder — creating a new one would re-buffer bytes already
+// consumed, silently discarding them.
+func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) (api.AuthResponse, *json.Decoder) {
 	t.Helper()
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		t.Fatalf("cannot send auth request: %v", err)
 	}
+	dec := json.NewDecoder(conn)
 	var resp api.AuthResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+	if err := dec.Decode(&resp); err != nil {
 		t.Fatalf("cannot decode auth response: %v", err)
 	}
-	return resp
+	return resp, dec
 }
 
 // -- NewAgentServer -----------------------------------------------------------
@@ -258,7 +263,7 @@ func TestHandshake_Success(t *testing.T) {
 	}
 	defer conn.Close()
 
-	resp := doHandshake(t, conn, api.AuthRequest{AgentID: "agent-1", Secret: "s"})
+	resp, _ := doHandshake(t, conn, api.AuthRequest{AgentID: "agent-1", Secret: "s"})
 	if !resp.Authenticated {
 		t.Fatalf("expected authenticated, got: %s", resp.Message)
 	}
@@ -284,7 +289,7 @@ func TestHandshake_Failure(t *testing.T) {
 	}
 	defer conn.Close()
 
-	resp := doHandshake(t, conn, api.AuthRequest{AgentID: "bad", Secret: "wrong"})
+	resp, _ := doHandshake(t, conn, api.AuthRequest{AgentID: "bad", Secret: "wrong"})
 	if resp.Authenticated {
 		t.Fatal("expected not authenticated")
 	}
@@ -453,10 +458,13 @@ func TestAgentStream_SendPDReceiveFIE(t *testing.T) {
 		t.Fatalf("cannot dial: %v", err)
 	}
 	defer conn.Close()
-	doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
+
+	// Reuse the decoder from doHandshake to avoid re-buffering bytes that were
+	// already consumed during the auth response read.
+	_, dec := doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
 
 	var pd api.ProbingDirective
-	if err := json.NewDecoder(conn).Decode(&pd); err != nil {
+	if err := dec.Decode(&pd); err != nil {
 		t.Fatalf("cannot decode PD: %v", err)
 	}
 	if pd.ProbingDirectiveID != 42 {

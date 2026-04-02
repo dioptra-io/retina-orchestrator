@@ -15,7 +15,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
@@ -47,6 +48,9 @@ type Config struct {
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
+	// Logger is the structured logger for the orchestrator.
+	// Defaults to discarding all output if nil.
+	Logger *slog.Logger
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -73,11 +77,15 @@ func (c *Config) Validate() error {
 	if c.APIReadHeaderTimeout == 0 {
 		c.APIReadHeaderTimeout = 5 * time.Second
 	}
+	if c.Logger == nil {
+		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	return nil
 }
 
 type orch struct {
 	config      *Config
+	logger      *slog.Logger
 	scheduler   *issuance.Scheduler
 	apiServer   *servers.APIServer
 	agentServer *servers.AgentServer
@@ -92,9 +100,13 @@ func NewOrch(config *Config) (*orch, error) {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	o := &orch{config: config}
+	o := &orch{
+		config: config,
+		logger: config.Logger,
+	}
 
-	scheduler, err := issuance.NewScheduler(config.Seed, config.IssuanceRate, config.PDPath)
+	scheduler, err := issuance.NewScheduler(config.Seed, config.IssuanceRate, config.PDPath,
+		config.Logger.With("component", "scheduler"))
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
@@ -166,9 +178,10 @@ func (o *orch) runScheduler(ctx context.Context) error {
 		}
 
 		if err := o.pdQueue.Push(ctx, pd.AgentID, pd); err != nil {
-			// TODO: downgrade to DEBUG once slog is added.
-			// PD drops before agent connection is expected.
-			log.Printf("Scheduler: no queue for agent %q, directive dropped", pd.AgentID)
+			// PD drops before agent connection are expected during startup.
+			o.logger.Debug("PD dropped: no queue for agent",
+				slog.String("agent_id", pd.AgentID),
+				slog.Uint64("pd_id", pd.ProbingDirectiveID))
 		}
 	}
 }
@@ -217,7 +230,9 @@ func (o *orch) fieStreamHandler(s *servers.FIEClient) {
 			SequenceNumber:        seq,
 		}
 
-		// TODO: log sent FIE at DEBUG level once slog is added.
+		o.logger.Debug("Sending FIE to client",
+			slog.Uint64("seq", seq),
+			slog.Uint64("pd_id", fie.ProbingDirectiveID))
 		if err = s.SendFIE(seqFIE); err != nil {
 			return
 		}
@@ -227,12 +242,12 @@ func (o *orch) fieStreamHandler(s *servers.FIEClient) {
 func (o *orch) agentHandler(status *servers.AgentAuthStatus, s *servers.AgentStream) {
 	consumer, err := o.pdQueue.NewConsumer(status.AgentID)
 	if err != nil {
-		log.Printf("Agent %q is already connected, rejecting", status.AgentID)
+		o.logger.Warn("Agent already connected, rejecting", "agent_id", status.AgentID)
 		return
 	}
 	defer consumer.Close()
 
-	log.Printf("Agent %q connected", status.AgentID)
+	o.logger.Info("Agent connected", "agent_id", status.AgentID)
 
 	group, ctx := errgroup.WithContext(s.Context())
 
@@ -243,9 +258,12 @@ func (o *orch) agentHandler(status *servers.AgentAuthStatus, s *servers.AgentStr
 				return err
 			}
 
-			// TODO: log received FIE at DEBUG level once slog is added.
+			o.logger.Debug("FIE received",
+				slog.String("agent_id", status.AgentID),
+				slog.Uint64("pd_id", fie.ProbingDirectiveID),
+				slog.Bool("complete", fie.NearInfo != nil && fie.FarInfo != nil))
 			if err := o.scheduler.UpdateFromFIE(fie); err != nil {
-				log.Printf("Scheduler: failed to update from FIE: %v", err)
+				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.AgentID, "err", err)
 			}
 
 			// Only push complete FIEs to the ring buffer for streaming.
@@ -264,7 +282,10 @@ func (o *orch) agentHandler(status *servers.AgentAuthStatus, s *servers.AgentStr
 				return err
 			}
 
-			// TODO: log sent PD at DEBUG level once slog is added.
+			o.logger.Debug("Sending PD to agent",
+				slog.String("agent_id", status.AgentID),
+				slog.Uint64("pd_id", pd.ProbingDirectiveID),
+				slog.String("dest", pd.DestinationAddress.String()))
 			if err = s.SendPD(pd); err != nil {
 				return err
 			}
@@ -272,9 +293,9 @@ func (o *orch) agentHandler(status *servers.AgentAuthStatus, s *servers.AgentStr
 	})
 
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
-		log.Printf("Agent %q stream failed: %v", status.AgentID, err)
+		o.logger.Error("Agent stream failed", "agent_id", status.AgentID, "err", err)
 	}
-	log.Printf("Agent %q disconnected", status.AgentID)
+	o.logger.Info("Agent disconnected", "agent_id", status.AgentID)
 }
 
 func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
@@ -284,6 +305,7 @@ func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
 			Message:       "authenticated",
 		}
 	}
+	o.logger.Warn("Agent authentication failed")
 	return api.AuthResponse{
 		Authenticated: false,
 		Message:       "secret is not correct",
