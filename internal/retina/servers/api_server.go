@@ -104,7 +104,7 @@ func (s *APIServer) Shutdown(timeout time.Duration) error {
 // @Description	Opens a long-lived NDJSON stream of FIEs from connected agents.
 // @Tags			stream
 // @Produce		application/x-ndjson
-// @Success		200	{object}	apiOrch.SequencedFIE
+// @Success		200	{object}	SequencedFIE
 // @Failure		500	{string}	string	"internal server error"
 // @Router			/stream [get]
 func (s *APIServer) handleStream(w http.ResponseWriter, r *http.Request) {
