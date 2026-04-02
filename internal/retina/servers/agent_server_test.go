@@ -99,7 +99,7 @@ func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) (api.AuthResp
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		t.Fatalf("cannot send auth request: %v", err)
 	}
-	dec := json.NewDecoder(conn)
+	dec = json.NewDecoder(conn)
 	var resp api.AuthResponse
 	if err := dec.Decode(&resp); err != nil {
 		t.Fatalf("cannot decode auth response: %v", err)
