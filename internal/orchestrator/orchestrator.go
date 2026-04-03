@@ -81,7 +81,7 @@ type orch struct {
 	logger      *slog.Logger
 	scheduler   *Scheduler
 	apiServer   *APIServer
-	agentServer *AgentServer
+	agentServer *agentServer
 	pdQueue     *structures.Queue[api.ProbingDirective]
 	ringBuffer  *structures.RingBuffer[api.ForwardingInfoElement]
 }
@@ -115,12 +115,12 @@ func NewOrch(config *Config) (*orch, error) {
 	}
 	o.apiServer = apiServer
 
-	agentServer, err := NewAgentServer(&AgentServerConfig{
-		BufferLength:     config.AgentBufferLength,
-		HandshakeTimeout: 5 * time.Second,
-		Address:          config.AgentAddress,
-		AgentHandler:     o.agentHandler,
-		AuthHandler:      o.agentAuthHandler,
+	agentServer, err := newAgentServer(&agentServerConfig{
+		bufferLength:     config.AgentBufferLength,
+		handshakeTimeout: 5 * time.Second,
+		address:          config.AgentAddress,
+		agentHandler:     o.agentHandler,
+		authHandler:      o.agentAuthHandler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error on creating agent server: %w", err)
@@ -197,11 +197,11 @@ func (o *orch) runAPIServer(ctx context.Context) error {
 func (o *orch) runAgentServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return o.agentServer.ListenAndServe()
+		return o.agentServer.listenAndServe()
 	})
 	group.Go(func() error {
 		<-ctx.Done()
-		return o.agentServer.Shutdown(3 * time.Second)
+		return o.agentServer.close(3 * time.Second)
 	})
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		return err
@@ -232,31 +232,31 @@ func (o *orch) fieStreamHandler(s *FIEClient) {
 	}
 }
 
-func (o *orch) agentHandler(status *AgentAuthStatus, s *AgentStream) {
-	consumer, err := o.pdQueue.NewConsumer(status.AgentID)
+func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
+	consumer, err := o.pdQueue.NewConsumer(status.agentID)
 	if err != nil {
-		o.logger.Warn("Agent already connected, rejecting", "agent_id", status.AgentID)
+		o.logger.Warn("Agent already connected, rejecting", "agent_id", status.agentID)
 		return
 	}
 	defer consumer.Close()
 
-	o.logger.Info("Agent connected", "agent_id", status.AgentID)
+	o.logger.Info("Agent connected", "agent_id", status.agentID)
 
-	group, ctx := errgroup.WithContext(s.Context())
+	group, ctx := errgroup.WithContext(s.context())
 
 	group.Go(func() error {
 		for {
-			fie, err := s.ReceiveFIE()
+			fie, err := s.receiveFIE()
 			if err != nil {
 				return err
 			}
 
 			o.logger.Debug("FIE received",
-				slog.String("agent_id", status.AgentID),
+				slog.String("agent_id", status.agentID),
 				slog.Uint64("pd_id", fie.ProbingDirectiveID),
 				slog.Bool("complete", fie.NearInfo != nil && fie.FarInfo != nil))
 			if err := o.scheduler.UpdateFromFIE(fie); err != nil {
-				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.AgentID, "err", err)
+				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.agentID, "err", err)
 			}
 
 			// Only push complete FIEs to the ring buffer for streaming.
@@ -276,19 +276,19 @@ func (o *orch) agentHandler(status *AgentAuthStatus, s *AgentStream) {
 			}
 
 			o.logger.Debug("Sending PD to agent",
-				slog.String("agent_id", status.AgentID),
+				slog.String("agent_id", status.agentID),
 				slog.Uint64("pd_id", pd.ProbingDirectiveID),
 				slog.String("dest", pd.DestinationAddress.String()))
-			if err = s.SendPD(pd); err != nil {
+			if err = s.sendPD(pd); err != nil {
 				return err
 			}
 		}
 	})
 
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
-		o.logger.Error("Agent stream failed", "agent_id", status.AgentID, "err", err)
+		o.logger.Error("Agent stream failed", "agent_id", status.agentID, "err", err)
 	}
-	o.logger.Info("Agent disconnected", "agent_id", status.AgentID)
+	o.logger.Info("Agent disconnected", "agent_id", status.agentID)
 }
 
 func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {

@@ -20,74 +20,64 @@ import (
 // for agent connections.
 const agentKeepalivePeriod = 30 * time.Second
 
-// AgentAuthStatus contains the agent's identity and connection info after
-// a successful authentication handshake.
-type AgentAuthStatus struct {
-	AgentID       string
-	RemoteAddress net.Addr
+type agentAuthStatus struct {
+	agentID       string
+	remoteAddress net.Addr
 }
 
-// AgentHandleFunc is called in a separate goroutine for each authenticated
+// agentHandleFunc is called in a separate goroutine for each authenticated
 // agent connection.
-type AgentHandleFunc func(status *AgentAuthStatus, s *AgentStream)
+type agentHandleFunc func(status *agentAuthStatus, s *agentStream)
 
-// AuthHandleFunc handles authentication for incoming agent connections.
-// It receives the agent's AuthRequest and returns an AuthResponse.
-// If Authenticated is false, the connection is closed.
-type AuthHandleFunc func(req api.AuthRequest) api.AuthResponse
+// authHandleFunc handles agent authentication. If Authenticated is false, the connection is closed.
+type authHandleFunc func(req api.AuthRequest) api.AuthResponse
 
-// AgentServerConfig configures the TCP listener and handlers for the AgentServer.
-type AgentServerConfig struct {
-	// Address is the TCP listening address in the form "host:port".
-	Address string
-	// HandshakeTimeout is the deadline for the initial authentication exchange.
-	HandshakeTimeout time.Duration
-	BufferLength     int
-	AgentHandler     AgentHandleFunc
-	AuthHandler      AuthHandleFunc
-	Logger           *slog.Logger
+type agentServerConfig struct {
+	// address is the TCP listening address in the form "host:port".
+	address string
+	// handshakeTimeout is the deadline for the initial authentication exchange.
+	handshakeTimeout time.Duration
+	bufferLength     int
+	agentHandler     agentHandleFunc
+	authHandler      authHandleFunc
+	logger           *slog.Logger
 }
 
-// AgentServer is the TCP server that handles bidirectional PD/FIE communication
-// with connected agents using newline-delimited JSON.
-type AgentServer struct {
-	config   *AgentServerConfig
+// agentServer handles bidirectional PD/FIE communication with agents over newline-delimited JSON.
+type agentServer struct {
+	config   *agentServerConfig
 	logger   *slog.Logger
 	shutdown atomic.Bool
 	mutex    sync.Mutex
 	// connections tracks all active agent connections for shutdown.
-	connections  map[int]*AgentStream
+	connections  map[int]*agentStream
 	listener     net.Listener
 	nextStreamID int
 	wg           sync.WaitGroup
 }
 
-// NewAgentServer creates a new AgentServer from the provided config.
-// Address and BufferLength are validated by Config.Validate() in orchestrator.go.
-// Handler validation remains here as handlers are not part of Config.
-func NewAgentServer(config *AgentServerConfig) (*AgentServer, error) {
-	if config.AuthHandler == nil || config.AgentHandler == nil {
+func newAgentServer(config *agentServerConfig) (*agentServer, error) {
+	if config.authHandler == nil || config.agentHandler == nil {
 		return nil, fmt.Errorf("handlers cannot be nil")
 	}
-	if config.Logger == nil {
-		config.Logger = slog.Default()
+	if config.logger == nil {
+		config.logger = slog.Default()
 	}
 
-	return &AgentServer{
+	return &agentServer{
 		config:      config,
-		logger:      config.Logger,
-		connections: make(map[int]*AgentStream),
+		logger:      config.logger,
+		connections: make(map[int]*agentStream),
 	}, nil
 }
 
-// ListenAndServe binds to the configured address and accepts incoming agent
-// connections. Returns ErrServerShutdown if Shutdown has been called.
-func (s *AgentServer) ListenAndServe() error {
+// listenAndServe accepts incoming agent connections. Returns ErrServerShutdown if close has been called.
+func (s *agentServer) listenAndServe() error {
 	if s.shutdown.Load() {
 		return ErrServerShutdown
 	}
 
-	listener, err := net.Listen("tcp", s.config.Address)
+	listener, err := net.Listen("tcp", s.config.address)
 	if err != nil {
 		return err
 	}
@@ -95,7 +85,7 @@ func (s *AgentServer) ListenAndServe() error {
 	s.listener = listener
 	s.mutex.Unlock()
 
-	s.logger.Info("Agent server listening", slog.String("addr", s.config.Address))
+	s.logger.Info("Agent server listening", slog.String("addr", s.config.address))
 
 	if s.shutdown.Load() {
 		return ErrServerShutdown
@@ -134,9 +124,8 @@ func (s *AgentServer) ListenAndServe() error {
 	}
 }
 
-// Shutdown closes the listener and all open connections, cancelling the context
-// of all active AgentStreams. Multiple calls are a no-op and return nil.
-func (s *AgentServer) Shutdown(timeout time.Duration) error {
+// close closes the listener and all open connections. Multiple calls are a no-op.
+func (s *agentServer) close(timeout time.Duration) error {
 	if s.shutdown.Swap(true) {
 		return nil
 	}
@@ -172,9 +161,7 @@ func (s *AgentServer) Shutdown(timeout time.Duration) error {
 	}
 }
 
-// handleAgent performs the authentication handshake and invokes the
-// AgentHandler for authenticated agents.
-func (s *AgentServer) handleAgent(stream *AgentStream) {
+func (s *agentServer) handleAgent(stream *agentStream) {
 	defer s.wg.Done()
 	defer func() {
 		s.mutex.Lock()
@@ -191,19 +178,19 @@ func (s *AgentServer) handleAgent(stream *AgentStream) {
 	}
 
 	s.logger.Info("Agent authenticated",
-		slog.String("agent_id", status.AgentID),
-		slog.String("remote_addr", status.RemoteAddress.String()))
-	s.config.AgentHandler(status, stream)
+		slog.String("agent_id", status.agentID),
+		slog.String("remote_addr", status.remoteAddress.String()))
+	s.config.agentHandler(status, stream)
 }
 
-func (s *AgentServer) handshake(stream *AgentStream) (*AgentAuthStatus, error) {
-	authReq, err := receive[api.AuthRequest](stream.conn, stream.decoder, s.config.HandshakeTimeout)
+func (s *agentServer) handshake(stream *agentStream) (*agentAuthStatus, error) {
+	authReq, err := receive[api.AuthRequest](stream.conn, stream.decoder, s.config.handshakeTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("could not receive auth request: %w", err)
 	}
 
-	authResp := s.config.AuthHandler(*authReq)
-	if err := send(stream.conn, stream.encoder, s.config.HandshakeTimeout, &authResp); err != nil {
+	authResp := s.config.authHandler(*authReq)
+	if err := send(stream.conn, stream.encoder, s.config.handshakeTimeout, &authResp); err != nil {
 		return nil, fmt.Errorf("could not send auth response: %w", err)
 	}
 
@@ -211,20 +198,19 @@ func (s *AgentServer) handshake(stream *AgentStream) (*AgentAuthStatus, error) {
 		return nil, fmt.Errorf("agent not authenticated: %s", authResp.Message)
 	}
 
+	// Clear the handshake deadline so subsequent reads/writes have no timeout.
 	if err := stream.conn.SetDeadline(time.Time{}); err != nil {
 		return nil, fmt.Errorf("could not clear deadline: %w", err)
 	}
 
-	return &AgentAuthStatus{
-		AgentID:       authReq.AgentID,
-		RemoteAddress: stream.conn.RemoteAddr(),
+	return &agentAuthStatus{
+		agentID:       authReq.AgentID,
+		remoteAddress: stream.conn.RemoteAddr(),
 	}, nil
 }
 
-// removeConnection cleans up a connection when the agent disconnects or the
-// server shuts down.
-// Must be called with s.mutex held to avoid races with concurrent connections.
-func (s *AgentServer) removeConnection(stream *AgentStream) {
+// removeConnection must be called with s.mutex held.
+func (s *agentServer) removeConnection(stream *agentStream) {
 	if _, ok := s.connections[stream.id]; !ok {
 		return
 	}
@@ -233,35 +219,32 @@ func (s *AgentServer) removeConnection(stream *AgentStream) {
 	delete(s.connections, stream.id)
 }
 
-// AgentStream is the bidirectional JSON communication channel with a single
-// connected agent. Use SendPD to issue ProbingDirectives and ReceiveFIE to
-// collect ForwardingInfoElements.
-type AgentStream struct {
+type agentStream struct {
 	id      int
 	ctx     context.Context
 	cancel  context.CancelFunc
 	conn    *net.TCPConn
 	encoder *json.Encoder
 	decoder *json.Decoder
-	server  *AgentServer
+	server  *agentServer
 }
 
-func newAgentStream(id int, conn *net.TCPConn, server *AgentServer) (*AgentStream, error) {
+func newAgentStream(id int, conn *net.TCPConn, server *agentServer) (*agentStream, error) {
 	if err := conn.SetKeepAlive(true); err != nil {
 		return nil, fmt.Errorf("failed to enable keepalive: %w", err)
 	}
 	if err := conn.SetKeepAlivePeriod(agentKeepalivePeriod); err != nil {
 		return nil, fmt.Errorf("failed to set keepalive period: %w", err)
 	}
-	if err := conn.SetReadBuffer(server.config.BufferLength); err != nil {
+	if err := conn.SetReadBuffer(server.config.bufferLength); err != nil {
 		return nil, fmt.Errorf("failed to set read buffer: %w", err)
 	}
-	if err := conn.SetWriteBuffer(server.config.BufferLength); err != nil {
+	if err := conn.SetWriteBuffer(server.config.bufferLength); err != nil {
 		return nil, fmt.Errorf("failed to set write buffer: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118
-	return &AgentStream{
+	return &agentStream{
 		id:      id,
 		conn:    conn,
 		ctx:     ctx,
@@ -272,15 +255,15 @@ func newAgentStream(id int, conn *net.TCPConn, server *AgentServer) (*AgentStrea
 	}, nil
 }
 
-func (s *AgentStream) Context() context.Context {
+func (s *agentStream) context() context.Context {
 	return s.ctx
 }
 
-func (s *AgentStream) SendPD(e *api.ProbingDirective) error {
+func (s *agentStream) sendPD(e *api.ProbingDirective) error {
 	return send(s.conn, s.encoder, 0, e)
 }
 
-func (s *AgentStream) ReceiveFIE() (*api.ForwardingInfoElement, error) {
+func (s *agentStream) receiveFIE() (*api.ForwardingInfoElement, error) {
 	return receive[api.ForwardingInfoElement](s.conn, s.decoder, 0)
 }
 

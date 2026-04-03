@@ -14,7 +14,7 @@ import (
 // Remaining coverage gaps are unreachable without refactoring *net.TCPConn to
 // an interface, as syscall-level errors cannot be injected on a real connection:
 //   - newAgentStream: SetKeepAlive, SetKeepAlivePeriod, SetReadBuffer, SetWriteBuffer
-//   - ListenAndServe: non-TCP type assertion, newAgentStream error continue,
+//   - listenAndServe: non-TCP type assertion, newAgentStream error continue,
 //     second shutdown race after listener setup
 //   - handshake: send error after auth recv — kernel buffers the write on loopback
 //     even when the client has already closed
@@ -57,15 +57,15 @@ func newTCPPair(t *testing.T) (client, server *net.TCPConn) {
 	return dial.(*net.TCPConn), <-accepted
 }
 
-func newTestServer(t *testing.T, auth AuthHandleFunc, agent AgentHandleFunc) (*AgentServer, string) {
+func newTestAgentServer(t *testing.T, auth authHandleFunc, agent agentHandleFunc) (*agentServer, string) {
 	t.Helper()
 	addr := freeAddr(t)
-	s, err := NewAgentServer(&AgentServerConfig{
-		Address:          addr,
-		HandshakeTimeout: time.Second,
-		BufferLength:     4096,
-		AuthHandler:      auth,
-		AgentHandler:     agent,
+	s, err := newAgentServer(&agentServerConfig{
+		address:          addr,
+		handshakeTimeout: time.Second,
+		bufferLength:     4096,
+		authHandler:      auth,
+		agentHandler:     agent,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -73,19 +73,19 @@ func newTestServer(t *testing.T, auth AuthHandleFunc, agent AgentHandleFunc) (*A
 	return s, addr
 }
 
-var allowAll AuthHandleFunc = func(_ api.AuthRequest) api.AuthResponse {
+var allowAll authHandleFunc = func(_ api.AuthRequest) api.AuthResponse {
 	return api.AuthResponse{Authenticated: true}
 }
 
-var denyAll AuthHandleFunc = func(_ api.AuthRequest) api.AuthResponse {
+var denyAll authHandleFunc = func(_ api.AuthRequest) api.AuthResponse {
 	return api.AuthResponse{Authenticated: false, Message: "denied"}
 }
 
-var nopAgent AgentHandleFunc = func(_ *AgentAuthStatus, _ *AgentStream) {}
+var nopAgentHandler agentHandleFunc = func(_ *agentAuthStatus, _ *agentStream) {}
 
-func startServer(t *testing.T, s *AgentServer) {
+func startAgentServer(t *testing.T, s *agentServer) {
 	t.Helper()
-	go func() { _ = s.ListenAndServe() }()
+	go func() { _ = s.listenAndServe() }()
 	time.Sleep(20 * time.Millisecond)
 }
 
@@ -99,7 +99,6 @@ func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) (api.AuthResp
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		t.Fatalf("cannot send auth request: %v", err)
 	}
-	dec = json.NewDecoder(conn)
 	var resp api.AuthResponse
 	if err := dec.Decode(&resp); err != nil {
 		t.Fatalf("cannot decode auth response: %v", err)
@@ -107,33 +106,33 @@ func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) (api.AuthResp
 	return resp, dec
 }
 
-// -- NewAgentServer -----------------------------------------------------------
+// -- newAgentServer -----------------------------------------------------------
 
 func TestNewAgentServer_NilAuthHandler(t *testing.T) {
 	t.Parallel()
-	_, err := NewAgentServer(&AgentServerConfig{AgentHandler: nopAgent})
+	_, err := newAgentServer(&agentServerConfig{agentHandler: nopAgentHandler})
 	if err == nil {
-		t.Fatal("expected error for nil AuthHandler, got nil")
+		t.Fatal("expected error for nil authHandler, got nil")
 	}
 }
 
 func TestNewAgentServer_NilAgentHandler(t *testing.T) {
 	t.Parallel()
-	_, err := NewAgentServer(&AgentServerConfig{AuthHandler: allowAll})
+	_, err := newAgentServer(&agentServerConfig{authHandler: allowAll})
 	if err == nil {
-		t.Fatal("expected error for nil AgentHandler, got nil")
+		t.Fatal("expected error for nil agentHandler, got nil")
 	}
 }
 
 func TestNewAgentServer_Valid(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestServer(t, allowAll, nopAgent)
+	s, _ := newTestAgentServer(t, allowAll, nopAgentHandler)
 	if s == nil {
 		t.Fatal("expected non-nil server")
 	}
 }
 
-// -- ListenAndServe -----------------------------------------------------------
+// -- listenAndServe -----------------------------------------------------------
 
 func TestListenAndServe_BindError(t *testing.T) {
 	t.Parallel()
@@ -143,37 +142,37 @@ func TestListenAndServe_BindError(t *testing.T) {
 	}
 	defer ln.Close()
 
-	s, err := NewAgentServer(&AgentServerConfig{
-		Address:      ln.Addr().String(),
-		BufferLength: 4096,
-		AuthHandler:  allowAll,
-		AgentHandler: nopAgent,
+	s, err := newAgentServer(&agentServerConfig{
+		address:      ln.Addr().String(),
+		bufferLength: 4096,
+		authHandler:  allowAll,
+		agentHandler: nopAgentHandler,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := s.ListenAndServe(); err == nil || err == ErrServerShutdown {
+	if err := s.listenAndServe(); err == nil || err == ErrServerShutdown {
 		t.Fatalf("expected bind error, got %v", err)
 	}
 }
 
 func TestListenAndServe_ShutdownBeforeListen(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestServer(t, allowAll, nopAgent)
-	_ = s.Shutdown(time.Second)
-	if err := s.ListenAndServe(); err != ErrServerShutdown {
+	s, _ := newTestAgentServer(t, allowAll, nopAgentHandler)
+	_ = s.close(time.Second)
+	if err := s.listenAndServe(); err != ErrServerShutdown {
 		t.Fatalf("expected ErrServerShutdown, got %v", err)
 	}
 }
 
-func TestListenAndServe_ReturnsErrServerShutdownAfterShutdown(t *testing.T) {
+func TestListenAndServe_ReturnsErrServerShutdownAfterClose(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestServer(t, allowAll, nopAgent)
+	s, _ := newTestAgentServer(t, allowAll, nopAgentHandler)
 
 	done := make(chan error, 1)
-	go func() { done <- s.ListenAndServe() }()
+	go func() { done <- s.listenAndServe() }()
 	time.Sleep(20 * time.Millisecond)
-	_ = s.Shutdown(time.Second)
+	_ = s.close(time.Second)
 
 	select {
 	case err := <-done:
@@ -181,16 +180,16 @@ func TestListenAndServe_ReturnsErrServerShutdownAfterShutdown(t *testing.T) {
 			t.Fatalf("expected ErrServerShutdown, got %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("ListenAndServe did not return after Shutdown")
+		t.Fatal("listenAndServe did not return after close")
 	}
 }
 
 func TestListenAndServe_AcceptError(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestServer(t, allowAll, nopAgent)
+	s, _ := newTestAgentServer(t, allowAll, nopAgentHandler)
 
 	done := make(chan error, 1)
-	go func() { done <- s.ListenAndServe() }()
+	go func() { done <- s.listenAndServe() }()
 	time.Sleep(20 * time.Millisecond)
 
 	s.mutex.Lock()
@@ -203,34 +202,34 @@ func TestListenAndServe_AcceptError(t *testing.T) {
 			t.Fatalf("expected raw accept error, got %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("ListenAndServe did not return after listener was closed")
+		t.Fatal("listenAndServe did not return after listener was closed")
 	}
 }
 
-// -- Shutdown -----------------------------------------------------------------
+// -- close --------------------------------------------------------------------
 
-func TestShutdown_Idempotent(t *testing.T) {
+func TestClose_Idempotent(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestServer(t, allowAll, nopAgent)
-	startServer(t, s)
+	s, _ := newTestAgentServer(t, allowAll, nopAgentHandler)
+	startAgentServer(t, s)
 
-	if err := s.Shutdown(time.Second); err != nil {
-		t.Fatalf("first Shutdown: unexpected error: %v", err)
+	if err := s.close(time.Second); err != nil {
+		t.Fatalf("first close: unexpected error: %v", err)
 	}
-	if err := s.Shutdown(time.Second); err != nil {
-		t.Fatalf("second Shutdown: unexpected error: %v", err)
+	if err := s.close(time.Second); err != nil {
+		t.Fatalf("second close: unexpected error: %v", err)
 	}
 }
 
-func TestShutdown_Timeout(t *testing.T) {
+func TestClose_Timeout(t *testing.T) {
 	t.Parallel()
 	block := make(chan struct{})
 	started := make(chan struct{})
-	s, addr := newTestServer(t, allowAll, func(_ *AgentAuthStatus, _ *AgentStream) {
+	s, addr := newTestAgentServer(t, allowAll, func(_ *agentAuthStatus, _ *agentStream) {
 		close(started)
 		<-block
 	})
-	startServer(t, s)
+	startAgentServer(t, s)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -240,10 +239,10 @@ func TestShutdown_Timeout(t *testing.T) {
 	doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
 	<-started
 
-	err = s.Shutdown(time.Millisecond)
+	err = s.close(time.Millisecond)
 	close(block)
 	if err == nil {
-		t.Fatal("expected timeout error from Shutdown, got nil")
+		t.Fatal("expected timeout error from close, got nil")
 	}
 }
 
@@ -251,12 +250,12 @@ func TestShutdown_Timeout(t *testing.T) {
 
 func TestHandshake_Success(t *testing.T) {
 	t.Parallel()
-	statusCh := make(chan *AgentAuthStatus, 1)
-	s, addr := newTestServer(t, allowAll, func(status *AgentAuthStatus, _ *AgentStream) {
+	statusCh := make(chan *agentAuthStatus, 1)
+	s, addr := newTestAgentServer(t, allowAll, func(status *agentAuthStatus, _ *agentStream) {
 		statusCh <- status
 	})
-	startServer(t, s)
-	defer s.Shutdown(time.Second)
+	startAgentServer(t, s)
+	defer s.close(time.Second)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -270,8 +269,8 @@ func TestHandshake_Success(t *testing.T) {
 	}
 	select {
 	case status := <-statusCh:
-		if status.AgentID != "agent-1" {
-			t.Errorf("expected AgentID agent-1, got %s", status.AgentID)
+		if status.agentID != "agent-1" {
+			t.Errorf("expected agentID agent-1, got %s", status.agentID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("agent handler not called")
@@ -280,9 +279,9 @@ func TestHandshake_Success(t *testing.T) {
 
 func TestHandshake_Failure(t *testing.T) {
 	t.Parallel()
-	s, addr := newTestServer(t, denyAll, nopAgent)
-	startServer(t, s)
-	defer s.Shutdown(time.Second)
+	s, addr := newTestAgentServer(t, denyAll, nopAgentHandler)
+	startAgentServer(t, s)
+	defer s.close(time.Second)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -301,9 +300,9 @@ func TestHandshake_Failure(t *testing.T) {
 
 func TestHandshake_ConnectionClosedBeforeAuth(t *testing.T) {
 	t.Parallel()
-	s, addr := newTestServer(t, allowAll, nopAgent)
-	startServer(t, s)
-	defer s.Shutdown(time.Second)
+	s, addr := newTestAgentServer(t, allowAll, nopAgentHandler)
+	startAgentServer(t, s)
+	defer s.close(time.Second)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -320,16 +319,16 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 	addr := freeAddr(t)
 	fieCh := make(chan *api.ForwardingInfoElement, 1)
 
-	s, err := NewAgentServer(&AgentServerConfig{
-		Address:          addr,
-		HandshakeTimeout: handshakeTimeout,
-		BufferLength:     4096,
-		AuthHandler:      allowAll,
-		AgentHandler: func(_ *AgentAuthStatus, stream *AgentStream) {
-			if err := stream.SendPD(&api.ProbingDirective{ProbingDirectiveID: 1}); err != nil {
+	s, err := newAgentServer(&agentServerConfig{
+		address:          addr,
+		handshakeTimeout: handshakeTimeout,
+		bufferLength:     4096,
+		authHandler:      allowAll,
+		agentHandler: func(_ *agentAuthStatus, stream *agentStream) {
+			if err := stream.sendPD(&api.ProbingDirective{ProbingDirectiveID: 1}); err != nil {
 				return
 			}
-			fie, err := stream.ReceiveFIE()
+			fie, err := stream.receiveFIE()
 			if err != nil {
 				return
 			}
@@ -339,8 +338,8 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	startServer(t, s)
-	defer s.Shutdown(time.Second)
+	startAgentServer(t, s)
+	defer s.close(time.Second)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -357,7 +356,7 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 		t.Fatalf("cannot decode PD: %v", err)
 	}
 
-	// Wait longer than HandshakeTimeout before sending the FIE — if the
+	// Wait longer than handshakeTimeout before sending the FIE — if the
 	// deadline is not cleared, the server-side connection will have timed
 	// out by now and the encode below will fail.
 	time.Sleep(handshakeTimeout * 3)
@@ -473,16 +472,16 @@ func TestReceive_ReadDeadlineError(t *testing.T) {
 	}
 }
 
-// -- AgentStream --------------------------------------------------------------
+// -- agentStream --------------------------------------------------------------
 
 func TestAgentStream_Context(t *testing.T) {
 	t.Parallel()
 	ctxCh := make(chan bool, 1)
-	s, addr := newTestServer(t, allowAll, func(_ *AgentAuthStatus, stream *AgentStream) {
-		ctxCh <- stream.Context() != nil
+	s, addr := newTestAgentServer(t, allowAll, func(_ *agentAuthStatus, stream *agentStream) {
+		ctxCh <- stream.context() != nil
 	})
-	startServer(t, s)
-	defer s.Shutdown(time.Second)
+	startAgentServer(t, s)
+	defer s.close(time.Second)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -504,18 +503,18 @@ func TestAgentStream_Context(t *testing.T) {
 func TestAgentStream_SendPDReceiveFIE(t *testing.T) {
 	t.Parallel()
 	fieCh := make(chan *api.ForwardingInfoElement, 1)
-	s, addr := newTestServer(t, allowAll, func(_ *AgentAuthStatus, stream *AgentStream) {
-		if err := stream.SendPD(&api.ProbingDirective{ProbingDirectiveID: 42}); err != nil {
+	s, addr := newTestAgentServer(t, allowAll, func(_ *agentAuthStatus, stream *agentStream) {
+		if err := stream.sendPD(&api.ProbingDirective{ProbingDirectiveID: 42}); err != nil {
 			return
 		}
-		fie, err := stream.ReceiveFIE()
+		fie, err := stream.receiveFIE()
 		if err != nil {
 			return
 		}
 		fieCh <- fie
 	})
-	startServer(t, s)
-	defer s.Shutdown(time.Second)
+	startAgentServer(t, s)
+	defer s.close(time.Second)
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -523,8 +522,7 @@ func TestAgentStream_SendPDReceiveFIE(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Reuse the decoder from doHandshake to avoid re-buffering bytes that were
-	// already consumed during the auth response read.
+	// Reuse the decoder from doHandshake to avoid re-buffering bytes already consumed.
 	_, dec := doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
 
 	var pd api.ProbingDirective
