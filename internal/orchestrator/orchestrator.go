@@ -203,7 +203,7 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 		<-ctx.Done()
 		return o.agentServer.close(3 * time.Second)
 	})
-	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
+	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) && !errors.Is(err, ErrServerShutdown) {
 		return err
 	}
 	return nil

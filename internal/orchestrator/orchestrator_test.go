@@ -3,6 +3,8 @@
 package orchestrator
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"testing"
@@ -12,11 +14,12 @@ import (
 )
 
 // Coverage gaps — unreachable without integration tests or production code changes:
-//   - Run, runScheduler, runAPIServer, runAgentServer: require live servers
-//   - fieStreamHandler, agentHandler: FIEClient and AgentStream have unexported
-//     fields and no constructors accessible from this package
-//   - NewOrch: NewQueue, NewRingBuffer, NewAPIServer, NewAgentServer error branches
+//   - NewOrch: newQueue, newRingBuffer, newAPIServer, newAgentServer error branches
 //     are unreachable — all use hardcoded safe values or non-nil handlers
+//   - runScheduler: PD drop log branch requires a queue consumer to exist then
+//     disappear between Push and send, which is not reproducible in unit tests
+//   - runAPIServer, runAgentServer: non-context error return branch requires the
+//     server to fail for reasons other than shutdown or context cancellation
 
 // -- helpers ------------------------------------------------------------------
 
@@ -122,6 +125,399 @@ func TestNewOrch_SchedulerError(t *testing.T) {
 	c.PDPath = "/nonexistent/path.jsonl"
 	if _, err := NewOrch(c); err == nil {
 		t.Fatal("expected error for bad PDPath, got nil")
+	}
+}
+
+// -- Run ----------------------------------------------------------------------
+
+func TestRun_StartsAndStopsCleanly(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err = o.Run(ctx)
+	if err != nil && err != context.DeadlineExceeded {
+		t.Fatalf("unexpected Run error: %v", err)
+	}
+}
+
+// -- runScheduler -------------------------------------------------------------
+
+func TestRunScheduler_ContextCancelled(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = o.runScheduler(ctx)
+	if err != context.Canceled {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestRunScheduler_SkipsNilPD(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Set all PD issuance probabilities to 0 so NextPD always returns nil.
+	for _, pd := range o.scheduler.pdMap {
+		pd.issuanceProb = 0.0
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err = o.runScheduler(ctx)
+	if err != context.DeadlineExceeded && err != context.Canceled {
+		t.Fatalf("expected context error, got %v", err)
+	}
+}
+
+func TestRunScheduler_DropsWhenNoQueue(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err = o.runScheduler(ctx)
+	if err != context.DeadlineExceeded && err != context.Canceled {
+		t.Fatalf("expected context error, got %v", err)
+	}
+}
+
+// -- runAPIServer -------------------------------------------------------------
+
+func TestRunAPIServer_StartsAndStops(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err = o.runAPIServer(ctx)
+	if err != nil {
+		t.Fatalf("unexpected runAPIServer error: %v", err)
+	}
+}
+
+// -- runAgentServer -----------------------------------------------------------
+
+func TestRunAgentServer_StartsAndStops(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err = o.runAgentServer(ctx)
+	if err != nil {
+		t.Fatalf("unexpected runAgentServer error: %v", err)
+	}
+}
+
+// -- fieStreamHandler ---------------------------------------------------------
+
+func TestFieStreamHandler_SendsAndStops(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var buf bytes.Buffer
+	client := &fieClient{
+		ctx:     ctx,
+		flusher: nopFlusher{},
+		encoder: json.NewEncoder(&buf),
+	}
+
+	fie := &api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+		FarInfo:            &api.Info{},
+	}
+	_ = o.ringBuffer.Push(fie)
+
+	done := make(chan struct{})
+	go func() {
+		o.fieStreamHandler(client)
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fieStreamHandler did not return after context cancel")
+	}
+}
+
+func TestFieStreamHandler_SendFIEError(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &fieClient{
+		ctx:     ctx,
+		flusher: nopFlusher{},
+		encoder: json.NewEncoder(&failWriter{}),
+	}
+
+	fie := &api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+		FarInfo:            &api.Info{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		o.fieStreamHandler(client)
+		close(done)
+	}()
+
+	// Wait for consumer to be created before pushing.
+	time.Sleep(20 * time.Millisecond)
+	_ = o.ringBuffer.Push(fie)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fieStreamHandler did not return on sendFIE error")
+	}
+}
+
+// -- agentHandler -------------------------------------------------------------
+
+func TestAgentHandler_DuplicateConnection(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	status := &agentAuthStatus{agentID: "agent-1"}
+
+	// Pre-register a consumer to simulate an already-connected agent.
+	_, err = o.pdQueue.NewConsumer("agent-1")
+	if err != nil {
+		t.Fatalf("unexpected error creating consumer: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		o.agentHandler(status, nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("agentHandler did not return for duplicate connection")
+	}
+}
+
+func TestAgentHandler_ReceivesAndForwardsPD(t *testing.T) {
+	// Not parallel — uses real TCP connections.
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	clientConn, serverConn := newTCPPair(t)
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	stream := &agentStream{
+		conn:    serverConn,
+		ctx:     ctx,
+		cancel:  cancel,
+		encoder: json.NewEncoder(serverConn),
+		decoder: json.NewDecoder(serverConn),
+	}
+
+	status := &agentAuthStatus{agentID: "agent-1"}
+
+	done := make(chan struct{})
+	go func() {
+		o.agentHandler(status, stream)
+		close(done)
+	}()
+
+	// Wait for agentHandler to register its consumer before pushing.
+	time.Sleep(20 * time.Millisecond)
+
+	pd := &api.ProbingDirective{ProbingDirectiveID: 1, AgentID: "agent-1"}
+	if err := o.pdQueue.Push(ctx, "agent-1", pd); err != nil {
+		t.Fatalf("unexpected push error: %v", err)
+	}
+
+	var received api.ProbingDirective
+	_ = clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if err := json.NewDecoder(clientConn).Decode(&received); err != nil {
+		t.Fatalf("cannot decode PD: %v", err)
+	}
+	if received.ProbingDirectiveID != 1 {
+		t.Errorf("expected PD ID 1, got %d", received.ProbingDirectiveID)
+	}
+
+	cancel()
+	_ = serverConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("agentHandler did not return after context cancel")
+	}
+}
+
+func TestAgentHandler_ReceivesFIE(t *testing.T) {
+	// Not parallel — uses real TCP connections.
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	clientConn, serverConn := newTCPPair(t)
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	stream := &agentStream{
+		conn:    serverConn,
+		ctx:     ctx,
+		cancel:  cancel,
+		encoder: json.NewEncoder(serverConn),
+		decoder: json.NewDecoder(serverConn),
+	}
+
+	status := &agentAuthStatus{agentID: "agent-2"}
+
+	done := make(chan struct{})
+	go func() {
+		o.agentHandler(status, stream)
+		close(done)
+	}()
+
+	// Give agentHandler time to start its goroutines.
+	time.Sleep(20 * time.Millisecond)
+
+	enc := json.NewEncoder(clientConn)
+
+	// Send a FIE with unknown PD ID — exercises the UpdateFromFIE error log.
+	if err := enc.Encode(&api.ForwardingInfoElement{
+		ProbingDirectiveID: 999,
+	}); err != nil {
+		t.Fatalf("cannot send unknown FIE: %v", err)
+	}
+
+	// Send an incomplete FIE (nil FarInfo) — exercises the continue branch.
+	if err := enc.Encode(&api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+	}); err != nil {
+		t.Fatalf("cannot send incomplete FIE: %v", err)
+	}
+
+	// Send a complete FIE — exercises the ring buffer push.
+	if err := enc.Encode(&api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+		FarInfo:            &api.Info{},
+	}); err != nil {
+		t.Fatalf("cannot send complete FIE: %v", err)
+	}
+
+	// Give the handler time to process both FIEs.
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+	_ = serverConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("agentHandler did not return after context cancel")
+	}
+}
+
+func TestAgentHandler_SendPDError(t *testing.T) {
+	// Not parallel — uses real TCP connections.
+	o, err := NewOrch(validConfig(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	clientConn, serverConn := newTCPPair(t)
+	defer clientConn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	stream := &agentStream{
+		conn:    serverConn,
+		ctx:     ctx,
+		cancel:  cancel,
+		encoder: json.NewEncoder(serverConn),
+		decoder: json.NewDecoder(serverConn),
+	}
+
+	status := &agentAuthStatus{agentID: "agent-3"}
+
+	done := make(chan struct{})
+	go func() {
+		o.agentHandler(status, stream)
+		close(done)
+	}()
+
+	// Wait for agentHandler to register its consumer, then close the
+	// server connection so the next sendPD fails.
+	time.Sleep(20 * time.Millisecond)
+	_ = serverConn.Close()
+
+	// Push a PD — sendPD will fail on the closed connection.
+	pd := &api.ProbingDirective{ProbingDirectiveID: 1, AgentID: "agent-3"}
+	_ = o.pdQueue.Push(ctx, "agent-3", pd)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("agentHandler did not return after sendPD error")
 	}
 }
 
