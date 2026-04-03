@@ -1,7 +1,7 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-package servers
+package orchestrator
 
 import (
 	"context"
@@ -15,8 +15,8 @@ import (
 
 	httpSwagger "github.com/swaggo/http-swagger"
 
-	// _ "github.com/dioptra-io/retina-orchestrator/docs"
 	"github.com/dioptra-io/retina-commons/api/v1"
+	_ "github.com/dioptra-io/retina-orchestrator/docs"
 )
 
 // SequencedFIE wraps a ForwardingInfoElement with a sequence number

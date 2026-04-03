@@ -1,15 +1,10 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// Package retina implements the Retina orchestrator, which schedules
-// ProbingDirectives to connected agents and streams the resulting
+// Package orchestrator implements the Retina orchestrator, which schedules
+// ProbingDirectives (PDs) to connected agents and streams the resulting
 // ForwardingInfoElements to HTTP clients.
-// TODO: rename package retina → orchestrator when internal/retina/ is
-// restructured to internal/orchestrator/.
-// TODO: flatten internal/retina/issuance, internal/retina/servers, and
-// internal/retina/structures into this package to improve testability and
-// remove unnecessary package boundaries. Defer until after first release.
-package retina
+package orchestrator
 
 import (
 	"context"
@@ -20,9 +15,7 @@ import (
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
-	"github.com/dioptra-io/retina-orchestrator/internal/retina/issuance"
-	"github.com/dioptra-io/retina-orchestrator/internal/retina/servers"
-	"github.com/dioptra-io/retina-orchestrator/internal/retina/structures"
+	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -86,9 +79,9 @@ func (c *Config) Validate() error {
 type orch struct {
 	config      *Config
 	logger      *slog.Logger
-	scheduler   *issuance.Scheduler
-	apiServer   *servers.APIServer
-	agentServer *servers.AgentServer
+	scheduler   *Scheduler
+	apiServer   *APIServer
+	agentServer *AgentServer
 	pdQueue     *structures.Queue[api.ProbingDirective]
 	ringBuffer  *structures.RingBuffer[api.ForwardingInfoElement]
 }
@@ -105,14 +98,14 @@ func NewOrch(config *Config) (*orch, error) {
 		logger: config.Logger,
 	}
 
-	scheduler, err := issuance.NewScheduler(config.Seed, config.IssuanceRate, config.PDPath,
+	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath,
 		config.Logger.With("component", "scheduler"))
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
 	o.scheduler = scheduler
 
-	apiServer, err := servers.NewAPIServer(&servers.APIServerConfig{
+	apiServer, err := NewAPIServer(&APIServerConfig{
 		Address:           config.APIAddress,
 		ReadHeaderTimeout: config.APIReadHeaderTimeout,
 		FIEHandler:        o.fieStreamHandler,
@@ -122,7 +115,7 @@ func NewOrch(config *Config) (*orch, error) {
 	}
 	o.apiServer = apiServer
 
-	agentServer, err := servers.NewAgentServer(&servers.AgentServerConfig{
+	agentServer, err := NewAgentServer(&AgentServerConfig{
 		BufferLength:     config.AgentBufferLength,
 		HandshakeTimeout: 5 * time.Second,
 		Address:          config.AgentAddress,
@@ -216,7 +209,7 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 	return nil
 }
 
-func (o *orch) fieStreamHandler(s *servers.FIEClient) {
+func (o *orch) fieStreamHandler(s *FIEClient) {
 	consumer := o.ringBuffer.NewConsumer()
 	defer consumer.Close()
 
@@ -225,7 +218,7 @@ func (o *orch) fieStreamHandler(s *servers.FIEClient) {
 		if err != nil {
 			return
 		}
-		seqFIE := &servers.SequencedFIE{
+		seqFIE := &SequencedFIE{
 			ForwardingInfoElement: *fie,
 			SequenceNumber:        seq,
 		}
@@ -239,7 +232,7 @@ func (o *orch) fieStreamHandler(s *servers.FIEClient) {
 	}
 }
 
-func (o *orch) agentHandler(status *servers.AgentAuthStatus, s *servers.AgentStream) {
+func (o *orch) agentHandler(status *AgentAuthStatus, s *AgentStream) {
 	consumer, err := o.pdQueue.NewConsumer(status.AgentID)
 	if err != nil {
 		o.logger.Warn("Agent already connected, rejecting", "agent_id", status.AgentID)

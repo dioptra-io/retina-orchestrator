@@ -1,6 +1,6 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
-package retina
+package orchestrator
 
 import (
 	"encoding/json"
