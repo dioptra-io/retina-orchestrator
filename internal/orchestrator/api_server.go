@@ -19,50 +19,43 @@ import (
 	_ "github.com/dioptra-io/retina-orchestrator/docs"
 )
 
-// SequencedFIE wraps a ForwardingInfoElement with a sequence number
-// for ordered delivery to HTTP clients.
+// SequencedFIE is a ForwardingInfoElement with a sequence number for ordered delivery to HTTP clients.
 type SequencedFIE struct {
 	api.ForwardingInfoElement
 	SequenceNumber uint64 `json:"sequence_number"`
 }
 
-// FIEHandleFunc is called for each incoming request to the /stream endpoint.
-type FIEHandleFunc func(s *FIEClient)
+type fieHandleFunc func(s *fieClient)
 
-// APIServerConfig configures the HTTP API server.
-type APIServerConfig struct {
-	// Address is the TCP listening address in the form "host:port".
-	Address string
-	// ReadHeaderTimeout is the timeout for reading HTTP request headers.
-	ReadHeaderTimeout time.Duration
-	FIEHandler        FIEHandleFunc
-	Logger            *slog.Logger
+type apiServerConfig struct {
+	// address is the TCP listening address in the form "host:port".
+	address string
+	// readHeaderTimeout is the timeout for reading HTTP request headers.
+	readHeaderTimeout time.Duration
+	fieHandler        fieHandleFunc
+	logger            *slog.Logger
 }
 
-// APIServer exposes the FIE streaming endpoint and Swagger UI over HTTP.
-type APIServer struct {
-	config  *APIServerConfig
+type apiServer struct {
+	config  *apiServerConfig
 	logger  *slog.Logger
 	server  *http.Server
 	mutex   sync.Mutex
-	clients map[*FIEClient]struct{}
+	clients map[*fieClient]struct{}
 }
 
-// NewAPIServer creates a new APIServer from the provided config.
-// FIEHandler is passed via config rather than as a direct parameter to
-// keep the constructor signature stable as new handlers are added.
-func NewAPIServer(config *APIServerConfig) (*APIServer, error) {
-	if config.FIEHandler == nil {
-		return nil, fmt.Errorf("FIEHandler cannot be nil")
+func newAPIServer(config *apiServerConfig) (*apiServer, error) {
+	if config.fieHandler == nil {
+		return nil, fmt.Errorf("fieHandler cannot be nil")
 	}
-	if config.Logger == nil {
-		config.Logger = slog.Default()
+	if config.logger == nil {
+		config.logger = slog.Default()
 	}
 
-	s := &APIServer{
+	s := &apiServer{
 		config:  config,
-		logger:  config.Logger,
-		clients: make(map[*FIEClient]struct{}),
+		logger:  config.logger,
+		clients: make(map[*fieClient]struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -70,24 +63,22 @@ func NewAPIServer(config *APIServerConfig) (*APIServer, error) {
 	mux.HandleFunc("/swagger/", httpSwagger.WrapHandler)
 
 	s.server = &http.Server{
-		Addr:              config.Address,
+		Addr:              config.address,
 		Handler:           mux,
-		ReadHeaderTimeout: config.ReadHeaderTimeout,
+		ReadHeaderTimeout: config.readHeaderTimeout,
 	}
 
 	return s, nil
 }
 
-// ListenAndServe starts the HTTP server and blocks until Shutdown is called.
-func (s *APIServer) ListenAndServe() error {
+func (s *apiServer) listenAndServe() error {
 	if err := s.server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
 }
 
-// Shutdown gracefully stops the HTTP server, respecting the provided timeout.
-func (s *APIServer) Shutdown(timeout time.Duration) error {
+func (s *apiServer) close(timeout time.Duration) error {
 	s.logger.Info("Shutting down API server")
 
 	exitCtx, exitCancel := context.WithTimeout(context.Background(), timeout)
@@ -107,7 +98,7 @@ func (s *APIServer) Shutdown(timeout time.Duration) error {
 // @Success		200	{object}	SequencedFIE
 // @Failure		500	{string}	string	"internal server error"
 // @Router			/stream [get]
-func (s *APIServer) handleStream(w http.ResponseWriter, r *http.Request) {
+func (s *apiServer) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -119,7 +110,7 @@ func (s *APIServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := &FIEClient{
+	client := &fieClient{
 		ctx:     r.Context(),
 		flusher: flusher,
 		encoder: json.NewEncoder(w),
@@ -131,30 +122,28 @@ func (s *APIServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		s.logger.Debug("Client disconnected", slog.String("remote_addr", r.RemoteAddr))
 	}()
 
-	s.config.FIEHandler(client)
+	s.config.fieHandler(client)
 }
 
-func (s *APIServer) addClient(client *FIEClient) {
+func (s *apiServer) addClient(client *fieClient) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	s.clients[client] = struct{}{}
 }
 
-func (s *APIServer) removeClient(client *FIEClient) {
+func (s *apiServer) removeClient(client *fieClient) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	delete(s.clients, client)
 }
 
-// FIEClient represents an active HTTP client consuming the FIE stream.
-type FIEClient struct {
+type fieClient struct {
 	ctx     context.Context
 	flusher http.Flusher
 	encoder *json.Encoder
 }
 
-// SendFIE encodes and sends a SequencedFIE to the client.
-func (s *FIEClient) SendFIE(fie *SequencedFIE) error {
+func (s *fieClient) sendFIE(fie *SequencedFIE) error {
 	if err := s.encoder.Encode(fie); err != nil {
 		return fmt.Errorf("failed to send FIE: %w", err)
 	}
@@ -162,6 +151,6 @@ func (s *FIEClient) SendFIE(fie *SequencedFIE) error {
 	return nil
 }
 
-func (s *FIEClient) Context() context.Context {
+func (s *fieClient) context() context.Context {
 	return s.ctx
 }

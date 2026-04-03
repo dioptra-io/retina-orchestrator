@@ -80,8 +80,8 @@ type orch struct {
 	config      *Config
 	logger      *slog.Logger
 	scheduler   *Scheduler
-	apiServer   *APIServer
 	agentServer *agentServer
+	apiServer   *apiServer
 	pdQueue     *structures.Queue[api.ProbingDirective]
 	ringBuffer  *structures.RingBuffer[api.ForwardingInfoElement]
 }
@@ -105,10 +105,10 @@ func NewOrch(config *Config) (*orch, error) {
 	}
 	o.scheduler = scheduler
 
-	apiServer, err := NewAPIServer(&APIServerConfig{
-		Address:           config.APIAddress,
-		ReadHeaderTimeout: config.APIReadHeaderTimeout,
-		FIEHandler:        o.fieStreamHandler,
+	apiServer, err := newAPIServer(&apiServerConfig{
+		address:           config.APIAddress,
+		readHeaderTimeout: config.APIReadHeaderTimeout,
+		fieHandler:        o.fieStreamHandler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error on creating API server: %w", err)
@@ -182,11 +182,11 @@ func (o *orch) runScheduler(ctx context.Context) error {
 func (o *orch) runAPIServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return o.apiServer.ListenAndServe()
+		return o.apiServer.listenAndServe()
 	})
 	group.Go(func() error {
 		<-ctx.Done()
-		return o.apiServer.Shutdown(3 * time.Second)
+		return o.apiServer.close(3 * time.Second)
 	})
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		return err
@@ -209,12 +209,12 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 	return nil
 }
 
-func (o *orch) fieStreamHandler(s *FIEClient) {
+func (o *orch) fieStreamHandler(s *fieClient) {
 	consumer := o.ringBuffer.NewConsumer()
 	defer consumer.Close()
 
 	for {
-		fie, seq, err := consumer.Pop(s.Context())
+		fie, seq, err := consumer.Pop(s.context())
 		if err != nil {
 			return
 		}
@@ -226,7 +226,7 @@ func (o *orch) fieStreamHandler(s *FIEClient) {
 		o.logger.Debug("Sending FIE to client",
 			slog.Uint64("seq", seq),
 			slog.Uint64("pd_id", fie.ProbingDirectiveID))
-		if err = s.SendFIE(seqFIE); err != nil {
+		if err = s.sendFIE(seqFIE); err != nil {
 			return
 		}
 	}

@@ -15,12 +15,12 @@ import (
 	"time"
 )
 
-// 100% coverage: every branch in NewAPIServer, ListenAndServe, Shutdown,
-// handleStream, addClient, removeClient, SendFIE, and Context is exercised.
+// 100% coverage: every branch in newAPIServer, listenAndServe, close,
+// handleStream, addClient, removeClient, sendFIE, and context is exercised.
 
 // -- helpers ------------------------------------------------------------------
 
-func newTestAPIServer(t *testing.T, handler FIEHandleFunc) (*APIServer, string) {
+func newTestAPIServer(t *testing.T, handler fieHandleFunc) (*apiServer, string) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -29,10 +29,10 @@ func newTestAPIServer(t *testing.T, handler FIEHandleFunc) (*APIServer, string) 
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
-	s, err := NewAPIServer(&APIServerConfig{
-		Address:           addr,
-		ReadHeaderTimeout: time.Second,
-		FIEHandler:        handler,
+	s, err := newAPIServer(&apiServerConfig{
+		address:           addr,
+		readHeaderTimeout: time.Second,
+		fieHandler:        handler,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -42,19 +42,19 @@ func newTestAPIServer(t *testing.T, handler FIEHandleFunc) (*APIServer, string) 
 }
 
 // startHandler starts only the HTTP mux via httptest.NewServer for handler-level
-// tests. Does NOT use s.ListenAndServe so there is no conflict with s.Shutdown.
-func startHandler(t *testing.T, s *APIServer) *httptest.Server {
+// tests. Does NOT use s.listenAndServe so there is no conflict with s.close.
+func startHandler(t *testing.T, s *apiServer) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(s.server.Handler)
 	t.Cleanup(func() { ts.Close() })
 	return ts
 }
 
-// startListening starts s.ListenAndServe in a goroutine and waits briefly for
+// startListening starts s.listenAndServe in a goroutine and waits briefly for
 // the listener to be ready.
-func startListening(t *testing.T, s *APIServer) {
+func startListening(t *testing.T, s *apiServer) {
 	t.Helper()
-	go func() { _ = s.ListenAndServe() }()
+	go func() { _ = s.listenAndServe() }()
 	time.Sleep(20 * time.Millisecond)
 }
 
@@ -82,44 +82,44 @@ func (w *nonFlushResponseWriter) Header() http.Header         { return w.header 
 func (w *nonFlushResponseWriter) WriteHeader(code int)        { w.code = code }
 func (w *nonFlushResponseWriter) Write(b []byte) (int, error) { return w.body.Write(b) }
 
-// -- NewAPIServer -------------------------------------------------------------
+// -- newAPIServer -------------------------------------------------------------
 
 func TestNewAPIServer_NilHandler(t *testing.T) {
 	t.Parallel()
-	_, err := NewAPIServer(&APIServerConfig{Address: "127.0.0.1:0"})
+	_, err := newAPIServer(&apiServerConfig{address: "127.0.0.1:0"})
 	if err == nil {
-		t.Fatal("expected error for nil FIEHandler, got nil")
+		t.Fatal("expected error for nil fieHandler, got nil")
 	}
 }
 
 func TestNewAPIServer_Valid(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestAPIServer(t, func(_ *FIEClient) {})
+	s, _ := newTestAPIServer(t, func(_ *fieClient) {})
 	if s == nil {
-		t.Fatal("expected non-nil APIServer")
+		t.Fatal("expected non-nil apiServer")
 	}
 }
 
-// -- ListenAndServe -----------------------------------------------------------
+// -- listenAndServe -----------------------------------------------------------
 
-func TestAPIServer_ListenAndServe_Shutdown(t *testing.T) {
+func TestAPIServer_ListenAndServe_Close(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestAPIServer(t, func(_ *FIEClient) {})
+	s, _ := newTestAPIServer(t, func(_ *fieClient) {})
 
 	done := make(chan error, 1)
-	go func() { done <- s.ListenAndServe() }()
+	go func() { done <- s.listenAndServe() }()
 	time.Sleep(20 * time.Millisecond)
 
-	if err := s.Shutdown(time.Second); err != nil {
-		t.Fatalf("Shutdown failed: %v", err)
+	if err := s.close(time.Second); err != nil {
+		t.Fatalf("close failed: %v", err)
 	}
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("ListenAndServe returned unexpected error: %v", err)
+			t.Fatalf("listenAndServe returned unexpected error: %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("ListenAndServe did not return after Shutdown")
+		t.Fatal("listenAndServe did not return after close")
 	}
 }
 
@@ -131,22 +131,22 @@ func TestAPIServer_ListenAndServe_BindError(t *testing.T) {
 	}
 	defer ln.Close()
 
-	s, err := NewAPIServer(&APIServerConfig{
-		Address:           ln.Addr().String(),
-		ReadHeaderTimeout: time.Second,
-		FIEHandler:        func(_ *FIEClient) {},
+	s, err := newAPIServer(&apiServerConfig{
+		address:           ln.Addr().String(),
+		readHeaderTimeout: time.Second,
+		fieHandler:        func(_ *fieClient) {},
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := s.ListenAndServe(); err == nil {
+	if err := s.listenAndServe(); err == nil {
 		t.Fatal("expected bind error, got nil")
 	}
 }
 
-// -- Shutdown -----------------------------------------------------------------
+// -- close --------------------------------------------------------------------
 
-func TestAPIServer_Shutdown_Timeout(t *testing.T) {
+func TestAPIServer_Close_Timeout(t *testing.T) {
 	t.Parallel()
 	block := make(chan struct{})
 	t.Cleanup(func() {
@@ -157,7 +157,7 @@ func TestAPIServer_Shutdown_Timeout(t *testing.T) {
 		}
 	})
 
-	s, addr := newTestAPIServer(t, func(_ *FIEClient) { <-block })
+	s, addr := newTestAPIServer(t, func(_ *fieClient) { <-block })
 	startListening(t, s)
 
 	go func() {
@@ -168,8 +168,8 @@ func TestAPIServer_Shutdown_Timeout(t *testing.T) {
 	}()
 	time.Sleep(20 * time.Millisecond)
 
-	if err := s.Shutdown(time.Millisecond); err == nil {
-		t.Fatal("expected timeout error from Shutdown, got nil")
+	if err := s.close(time.Millisecond); err == nil {
+		t.Fatal("expected timeout error from close, got nil")
 	}
 }
 
@@ -178,8 +178,8 @@ func TestAPIServer_Shutdown_Timeout(t *testing.T) {
 func TestHandleStream_SendFIE(t *testing.T) {
 	t.Parallel()
 	done := make(chan struct{})
-	s, _ := newTestAPIServer(t, func(client *FIEClient) {
-		_ = client.SendFIE(&SequencedFIE{SequenceNumber: 42})
+	s, _ := newTestAPIServer(t, func(client *fieClient) {
+		_ = client.sendFIE(&SequencedFIE{SequenceNumber: 42})
 		<-done
 	})
 	ts := startHandler(t, s)
@@ -206,7 +206,7 @@ func TestHandleStream_SendFIE(t *testing.T) {
 
 func TestHandleStream_StreamingUnsupported(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestAPIServer(t, func(_ *FIEClient) {})
+	s, _ := newTestAPIServer(t, func(_ *fieClient) {})
 
 	w := newNonFlushResponseWriter()
 	r := httptest.NewRequest(http.MethodGet, "/stream", nil)
@@ -220,7 +220,7 @@ func TestHandleStream_StreamingUnsupported(t *testing.T) {
 func TestHandleStream_DeferRemovesClient(t *testing.T) {
 	t.Parallel()
 	returned := make(chan struct{})
-	s, _ := newTestAPIServer(t, func(_ *FIEClient) {})
+	s, _ := newTestAPIServer(t, func(_ *fieClient) {})
 	ts := startHandler(t, s)
 
 	go func() {
@@ -246,8 +246,8 @@ func TestHandleStream_DeferRemovesClient(t *testing.T) {
 
 func TestAPIServer_AddRemoveClient(t *testing.T) {
 	t.Parallel()
-	s, _ := newTestAPIServer(t, func(_ *FIEClient) {})
-	client := &FIEClient{
+	s, _ := newTestAPIServer(t, func(_ *fieClient) {})
+	client := &fieClient{
 		ctx:     context.Background(),
 		flusher: nopFlusher{},
 		encoder: json.NewEncoder(&failWriter{}),
@@ -263,14 +263,14 @@ func TestAPIServer_AddRemoveClient(t *testing.T) {
 	}
 }
 
-// -- FIEClient ----------------------------------------------------------------
+// -- fieClient ----------------------------------------------------------------
 
 func TestFIEClient_Context(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	client := &FIEClient{ctx: ctx, flusher: nopFlusher{}, encoder: json.NewEncoder(&failWriter{})}
-	if client.Context() != ctx {
-		t.Error("expected Context() to return the original context")
+	client := &fieClient{ctx: ctx, flusher: nopFlusher{}, encoder: json.NewEncoder(&failWriter{})}
+	if client.context() != ctx {
+		t.Error("expected context() to return the original context")
 	}
 }
 
@@ -279,24 +279,24 @@ func TestFIEClient_SendFIE(t *testing.T) {
 	_, server := newTCPPair(t)
 	defer server.Close()
 
-	client := &FIEClient{
+	client := &fieClient{
 		ctx:     context.Background(),
 		flusher: nopFlusher{},
 		encoder: json.NewEncoder(server),
 	}
-	if err := client.SendFIE(&SequencedFIE{SequenceNumber: 1}); err != nil {
+	if err := client.sendFIE(&SequencedFIE{SequenceNumber: 1}); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 }
 
 func TestFIEClient_SendFIE_EncodeError(t *testing.T) {
 	t.Parallel()
-	client := &FIEClient{
+	client := &fieClient{
 		ctx:     context.Background(),
 		flusher: nopFlusher{},
 		encoder: json.NewEncoder(&failWriter{}),
 	}
-	if err := client.SendFIE(&SequencedFIE{}); err == nil {
-		t.Fatal("expected error from SendFIE with failing writer, got nil")
+	if err := client.sendFIE(&SequencedFIE{}); err == nil {
+		t.Fatal("expected error from sendFIE with failing writer, got nil")
 	}
 }
