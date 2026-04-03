@@ -1,6 +1,6 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
-package issuance
+package orchestrator
 
 import (
 	"testing"

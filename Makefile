@@ -18,5 +18,5 @@ orch:
 clean:
 	rm -f retina-orchestrator
 docs:
-	swag init --parseDependency --parseInternal -g ./internal/retina/servers/api_server.go --output docs
+	swag init --parseDependency --parseInternal -g ./internal/orchestrator/api_server.go --output docs
 	swag fmt

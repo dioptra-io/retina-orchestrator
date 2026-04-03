@@ -1,10 +1,7 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// Package servers provides the AgentServer for bidirectional PD/FIE
-// communication with agents, and the APIServer for streaming
-// ForwardingInfoElements to HTTP clients.
-package servers
+package orchestrator
 
 import (
 	"context"

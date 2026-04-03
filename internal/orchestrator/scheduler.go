@@ -1,9 +1,7 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// Package issuance implements the responsible probing algorithm for scheduling
-// and issuing ProbingDirectives to connected agents.
-package issuance
+package orchestrator
 
 import (
 	"bufio"

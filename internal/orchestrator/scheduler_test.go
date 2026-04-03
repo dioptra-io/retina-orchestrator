@@ -1,6 +1,6 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
-package issuance
+package orchestrator
 
 import (
 	"encoding/json"
@@ -17,7 +17,7 @@ import (
 
 // -- helpers ------------------------------------------------------------------
 
-func writePDFile(t *testing.T, pds []*api.ProbingDirective) string {
+func writeSchedulerPDFile(t *testing.T, pds []*api.ProbingDirective) string {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "pds-*.jsonl")
 	if err != nil {
@@ -55,7 +55,7 @@ func makeFIE(id uint64, near, far net.IP) *api.ForwardingInfoElement {
 
 func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
 	t.Helper()
-	s, err := NewScheduler(42, 1000.0, writePDFile(t, pds), nil)
+	s, err := NewScheduler(42, 1000.0, writeSchedulerPDFile(t, pds), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestNewScheduler_MissingFile(t *testing.T) {
 
 func TestNewScheduler_EmptyFile(t *testing.T) {
 	t.Parallel()
-	_, err := NewScheduler(0, 1.0, writePDFile(t, nil), nil)
+	_, err := NewScheduler(0, 1.0, writeSchedulerPDFile(t, nil), nil)
 	if err == nil {
 		t.Fatal("expected error for empty directive file, got nil")
 	}

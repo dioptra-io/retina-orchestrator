@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dioptra-io/retina-orchestrator/internal/retina"
+	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator"
 )
 
 const defaultAgentBufferLength = 8192
@@ -56,7 +56,7 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	orch, err := retina.NewOrch(&retina.Config{
+	orch, err := orchestrator.NewOrch(&orchestrator.Config{
 		AgentAddress:         *agentAddr,
 		AgentBufferLength:    defaultAgentBufferLength,
 		APIAddress:           *apiAddr,
