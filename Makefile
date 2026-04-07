@@ -1,22 +1,33 @@
-.PHONY: build proper help docs test clean
+.PHONY: build lint fmt tidy test docs clean help
 
 help:
-	@echo valid targets: build proper clean docs test
-build: docs proper orch
-proper:
-	find . -name '*.go' ! -name '*_test.go' | sort | xargs wc -l
-	gofmt -s -w $(shell go list -f '{{.Dir}}' ./...)
-	@if command -v goimports >/dev/null 2>&1; then \
-		echo goimports -w $(shell go list -f '{{.Dir}}' ./...); \
-		goimports -w $(shell go list -f '{{.Dir}}' ./...); \
-	fi
-	golangci-lint run --tests=false
-test:
-	go test ./...
-orch: 
+	@echo "Valid targets:"
+	@echo "  build  - Format, lint, generate docs, and build retina-orchestrator binary"
+	@echo "  lint   - Format code and run linters"
+	@echo "  fmt    - Format code"
+	@echo "  tidy   - Tidy go modules"
+	@echo "  test   - Run tests with race detection"
+	@echo "  docs   - Generate Swagger documentation"
+	@echo "  clean  - Remove built binaries"
+
+build: docs lint
 	go build -o retina-orchestrator .
-clean:
-	rm -f retina-orchestrator
+
+lint: fmt
+	golangci-lint run
+
+fmt:
+	go fmt ./...
+
+tidy:
+	go mod tidy
+
+test:
+	go test -v -race -cover ./...
+
 docs:
 	swag init --parseDependency --parseInternal -g ./internal/orchestrator/api_server.go --output docs
 	swag fmt
+
+clean:
+	rm -f retina-orchestrator

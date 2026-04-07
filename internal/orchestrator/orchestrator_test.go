@@ -50,6 +50,34 @@ func validConfig(t *testing.T) *Config {
 	}
 }
 
+// sendFIEs sends a sequence of FIEs to exercise agentHandler FIE receive paths:
+// one with an unknown PD ID (UpdateFromFIE error log), one incomplete (continue
+// branch), and one complete (ring buffer push).
+func sendFIEs(t *testing.T, enc *json.Encoder) {
+	t.Helper()
+	// Unknown PD ID — exercises the UpdateFromFIE error log.
+	if err := enc.Encode(&api.ForwardingInfoElement{
+		ProbingDirectiveID: 999,
+	}); err != nil {
+		t.Fatalf("cannot send unknown FIE: %v", err)
+	}
+	// Incomplete FIE (nil FarInfo) — exercises the continue branch.
+	if err := enc.Encode(&api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+	}); err != nil {
+		t.Fatalf("cannot send incomplete FIE: %v", err)
+	}
+	// Complete FIE — exercises the ring buffer push.
+	if err := enc.Encode(&api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+		FarInfo:            &api.Info{},
+	}); err != nil {
+		t.Fatalf("cannot send complete FIE: %v", err)
+	}
+}
+
 // -- Config.Validate ----------------------------------------------------------
 
 func TestConfig_Validate_Valid(t *testing.T) {
@@ -355,8 +383,8 @@ func TestAgentHandler_ReceivesAndForwardsPD(t *testing.T) {
 	}
 
 	clientConn, serverConn := newTCPPair(t)
-	defer clientConn.Close()
-	defer serverConn.Close()
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -412,8 +440,8 @@ func TestAgentHandler_ReceivesFIE(t *testing.T) {
 	}
 
 	clientConn, serverConn := newTCPPair(t)
-	defer clientConn.Close()
-	defer serverConn.Close()
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -436,34 +464,7 @@ func TestAgentHandler_ReceivesFIE(t *testing.T) {
 
 	// Give agentHandler time to start its goroutines.
 	time.Sleep(20 * time.Millisecond)
-
-	enc := json.NewEncoder(clientConn)
-
-	// Send a FIE with unknown PD ID — exercises the UpdateFromFIE error log.
-	if err := enc.Encode(&api.ForwardingInfoElement{
-		ProbingDirectiveID: 999,
-	}); err != nil {
-		t.Fatalf("cannot send unknown FIE: %v", err)
-	}
-
-	// Send an incomplete FIE (nil FarInfo) — exercises the continue branch.
-	if err := enc.Encode(&api.ForwardingInfoElement{
-		ProbingDirectiveID: 1,
-		NearInfo:           &api.Info{},
-	}); err != nil {
-		t.Fatalf("cannot send incomplete FIE: %v", err)
-	}
-
-	// Send a complete FIE — exercises the ring buffer push.
-	if err := enc.Encode(&api.ForwardingInfoElement{
-		ProbingDirectiveID: 1,
-		NearInfo:           &api.Info{},
-		FarInfo:            &api.Info{},
-	}); err != nil {
-		t.Fatalf("cannot send complete FIE: %v", err)
-	}
-
-	// Give the handler time to process both FIEs.
+	sendFIEs(t, json.NewEncoder(clientConn))
 	time.Sleep(50 * time.Millisecond)
 
 	cancel()
@@ -484,7 +485,7 @@ func TestAgentHandler_SendPDError(t *testing.T) {
 	}
 
 	clientConn, serverConn := newTCPPair(t)
-	defer clientConn.Close()
+	defer func() { _ = clientConn.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()

@@ -38,7 +38,7 @@ func newTCPPair(t *testing.T) (client, server *net.TCPConn) {
 	if err != nil {
 		t.Fatalf("cannot create listener: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	accepted := make(chan *net.TCPConn, 1)
 	go func() {
@@ -96,7 +96,7 @@ func startAgentServer(t *testing.T, s *agentServer) {
 func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) (api.AuthResponse, *json.Decoder) {
 	t.Helper()
 	dec := json.NewDecoder(conn)
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
+	if err := json.NewEncoder(conn).Encode(req); err != nil { //nolint:gosec // G117: test helper, not a real secret
 		t.Fatalf("cannot send auth request: %v", err)
 	}
 	var resp api.AuthResponse
@@ -140,7 +140,7 @@ func TestListenAndServe_BindError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cannot bind: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	s, err := newAgentServer(&agentServerConfig{
 		address:      ln.Addr().String(),
@@ -235,7 +235,7 @@ func TestClose_Timeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cannot dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
 	<-started
 
@@ -255,13 +255,13 @@ func TestHandshake_Success(t *testing.T) {
 		statusCh <- status
 	})
 	startAgentServer(t, s)
-	defer s.close(time.Second)
+	defer func() { _ = s.close(time.Second) }()
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("cannot dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	resp, _ := doHandshake(t, conn, api.AuthRequest{AgentID: "agent-1", Secret: "s"})
 	if !resp.Authenticated {
@@ -281,13 +281,13 @@ func TestHandshake_Failure(t *testing.T) {
 	t.Parallel()
 	s, addr := newTestAgentServer(t, denyAll, nopAgentHandler)
 	startAgentServer(t, s)
-	defer s.close(time.Second)
+	defer func() { _ = s.close(time.Second) }()
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("cannot dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	resp, _ := doHandshake(t, conn, api.AuthRequest{AgentID: "bad", Secret: "wrong"})
 	if resp.Authenticated {
@@ -302,13 +302,13 @@ func TestHandshake_ConnectionClosedBeforeAuth(t *testing.T) {
 	t.Parallel()
 	s, addr := newTestAgentServer(t, allowAll, nopAgentHandler)
 	startAgentServer(t, s)
-	defer s.close(time.Second)
+	defer func() { _ = s.close(time.Second) }()
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("cannot dial: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 	time.Sleep(50 * time.Millisecond)
 }
 
@@ -339,13 +339,13 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	startAgentServer(t, s)
-	defer s.close(time.Second)
+	defer func() { _ = s.close(time.Second) }()
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("cannot dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Reuse the decoder from doHandshake to avoid losing buffered bytes.
 	_, dec := doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
@@ -380,8 +380,8 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 func TestSendReceive_RoundTrip(t *testing.T) {
 	t.Parallel()
 	client, server := newTCPPair(t)
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	pd := &api.ProbingDirective{ProbingDirectiveID: 99}
 	if err := send(client, json.NewEncoder(client), 0, pd); err != nil {
@@ -399,8 +399,8 @@ func TestSendReceive_RoundTrip(t *testing.T) {
 func TestSendReceive_WithTimeout(t *testing.T) {
 	t.Parallel()
 	client, server := newTCPPair(t)
-	defer client.Close()
-	defer server.Close()
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
 
 	fie := &api.ForwardingInfoElement{ProbingDirectiveID: 7}
 	if err := send(client, json.NewEncoder(client), time.Second, fie); err != nil {
@@ -418,8 +418,8 @@ func TestSendReceive_WithTimeout(t *testing.T) {
 func TestSend_WriteDeadlineError(t *testing.T) {
 	t.Parallel()
 	client, server := newTCPPair(t)
-	server.Close()
-	client.Close()
+	_ = server.Close()
+	_ = client.Close()
 
 	if err := send(client, json.NewEncoder(client), time.Second, &api.ProbingDirective{}); err == nil {
 		t.Fatal("expected error sending on closed connection, got nil")
@@ -429,8 +429,8 @@ func TestSend_WriteDeadlineError(t *testing.T) {
 func TestSend_EncodeError(t *testing.T) {
 	t.Parallel()
 	client, server := newTCPPair(t)
-	server.Close()
-	client.Close()
+	_ = server.Close()
+	_ = client.Close()
 
 	if err := send(client, json.NewEncoder(client), 0, &api.ProbingDirective{}); err == nil {
 		t.Fatal("expected encode error sending on closed connection, got nil")
@@ -440,12 +440,12 @@ func TestSend_EncodeError(t *testing.T) {
 func TestReceive_DecodeError(t *testing.T) {
 	t.Parallel()
 	client, server := newTCPPair(t)
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 
 	if _, err := client.Write([]byte("not json\n")); err != nil {
 		t.Fatalf("cannot write: %v", err)
 	}
-	client.Close()
+	_ = client.Close()
 
 	if _, err := receive[api.ProbingDirective](server, json.NewDecoder(server), 0); err == nil {
 		t.Fatal("expected decode error, got nil")
@@ -455,7 +455,7 @@ func TestReceive_DecodeError(t *testing.T) {
 func TestReceive_DeadlineExceeded(t *testing.T) {
 	t.Parallel()
 	_, server := newTCPPair(t)
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 
 	if _, err := receive[api.ProbingDirective](server, json.NewDecoder(server), time.Millisecond); err == nil {
 		t.Fatal("expected timeout error, got nil")
@@ -465,7 +465,7 @@ func TestReceive_DeadlineExceeded(t *testing.T) {
 func TestReceive_ReadDeadlineError(t *testing.T) {
 	t.Parallel()
 	_, server := newTCPPair(t)
-	server.Close()
+	_ = server.Close()
 
 	if _, err := receive[api.ProbingDirective](server, json.NewDecoder(server), time.Second); err == nil {
 		t.Fatal("expected error receiving on closed connection, got nil")
@@ -481,13 +481,13 @@ func TestAgentStream_Context(t *testing.T) {
 		ctxCh <- stream.context() != nil
 	})
 	startAgentServer(t, s)
-	defer s.close(time.Second)
+	defer func() { _ = s.close(time.Second) }()
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("cannot dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
 
 	select {
@@ -514,13 +514,13 @@ func TestAgentStream_SendPDReceiveFIE(t *testing.T) {
 		fieCh <- fie
 	})
 	startAgentServer(t, s)
-	defer s.close(time.Second)
+	defer func() { _ = s.close(time.Second) }()
 
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("cannot dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Reuse the decoder from doHandshake to avoid re-buffering bytes already consumed.
 	_, dec := doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
