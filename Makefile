@@ -10,7 +10,8 @@ help:
 	@echo "  docs   - Generate Swagger documentation"
 	@echo "  clean  - Remove built binaries"
 
-build: docs lint build_orch
+build: docs lint
+	go build -o retina-orchestrator .
 
 lint: fmt
 	golangci-lint run
@@ -27,9 +28,6 @@ test:
 docs:
 	swag init --parseDependency --parseInternal -g ./internal/orchestrator/api_server.go --output docs
 	swag fmt
-
-build_orch:
-	go build -o retina-orchestrator .
 
 clean:
 	rm -f retina-orchestrator

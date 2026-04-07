@@ -129,7 +129,7 @@ func TestAPIServer_ListenAndServe_BindError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cannot bind: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	s, err := newAPIServer(&apiServerConfig{
 		address:           ln.Addr().String(),
@@ -163,7 +163,7 @@ func TestAPIServer_Close_Timeout(t *testing.T) {
 	go func() {
 		resp, err := http.Get("http://" + addr + "/stream")
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	}()
 	time.Sleep(20 * time.Millisecond)
@@ -188,7 +188,7 @@ func TestHandleStream_SendFIE(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cannot connect to /stream: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	close(done)
 
 	if ct := resp.Header.Get("Content-Type"); ct != "application/x-ndjson" {
@@ -226,7 +226,7 @@ func TestHandleStream_DeferRemovesClient(t *testing.T) {
 	go func() {
 		resp, err := http.Get(ts.URL + "/stream")
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 		close(returned)
 	}()
@@ -277,7 +277,7 @@ func TestFIEClient_Context(t *testing.T) {
 func TestFIEClient_SendFIE(t *testing.T) {
 	t.Parallel()
 	_, server := newTCPPair(t)
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 
 	client := &fieClient{
 		ctx:     context.Background(),

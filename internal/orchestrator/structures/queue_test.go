@@ -35,7 +35,7 @@ func TestNewQueue_ZeroBufferSize(t *testing.T) {
 	v := 1
 	done := make(chan struct{})
 	go func() {
-		q.Push(context.Background(), "a", &v)
+		_ = q.Push(context.Background(), "a", &v)
 		close(done)
 	}()
 
@@ -45,7 +45,7 @@ func TestNewQueue_ZeroBufferSize(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	cons.Pop(context.Background())
+	_, _ = cons.Pop(context.Background())
 
 	select {
 	case <-done:
@@ -173,8 +173,8 @@ func TestQueuePushPop_MultipleConsumers_Independent(t *testing.T) {
 	defer c2.Close()
 
 	v1, v2 := 1, 2
-	q.Push(context.Background(), "a", &v1)
-	q.Push(context.Background(), "b", &v2)
+	_ = q.Push(context.Background(), "a", &v1)
+	_ = q.Push(context.Background(), "b", &v2)
 
 	got1, err := c1.Pop(context.Background())
 	if err != nil || *got1 != 1 {
@@ -196,7 +196,7 @@ func TestQueuePop_BlocksUntilPush(t *testing.T) {
 	v := 7
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		q.Push(context.Background(), "a", &v)
+		_ = q.Push(context.Background(), "a", &v)
 	}()
 
 	got, err := cons.Pop(context.Background())
@@ -215,8 +215,8 @@ func TestPush_BlocksWhenBufferFull(t *testing.T) {
 	defer cons.Close()
 
 	v := 1
-	q.Push(context.Background(), "a", &v)
-	q.Push(context.Background(), "a", &v)
+	_ = q.Push(context.Background(), "a", &v)
+	_ = q.Push(context.Background(), "a", &v)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -236,7 +236,7 @@ func TestPush_DoesNotDeliverToOtherConsumers(t *testing.T) {
 	defer c2.Close()
 
 	v := 42
-	q.Push(context.Background(), "a", &v)
+	_ = q.Push(context.Background(), "a", &v)
 
 	got, err := c1.Pop(context.Background())
 	if err != nil || *got != 42 {
@@ -334,7 +334,7 @@ func TestPush_ContextCancelledWhileBlocking(t *testing.T) {
 	defer cons.Close()
 
 	v := 1
-	q.Push(context.Background(), "a", &v)
+	_ = q.Push(context.Background(), "a", &v)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -416,7 +416,7 @@ func TestClose_BufferedItemsStillReadableAfterClose(t *testing.T) {
 	cons, _ := q.NewConsumer("a")
 
 	v := 1
-	q.Push(context.Background(), "a", &v)
+	_ = q.Push(context.Background(), "a", &v)
 	cons.Close()
 
 	got, err := cons.Pop(context.Background())
@@ -532,7 +532,7 @@ func TestConcurrent_CloseAndPush(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			v := 1
-			q.Push(context.Background(), "a", &v)
+			_ = q.Push(context.Background(), "a", &v)
 		}()
 
 		wg.Add(1)
@@ -557,7 +557,7 @@ func TestConcurrent_CloseAndPop(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			cons.Pop(context.Background())
+			_, _ = cons.Pop(context.Background())
 		}()
 
 		wg.Add(1)
