@@ -9,7 +9,7 @@ COPY . .
 
 # docs/ must exist before swag init runs; the .gitkeep ensures the directory
 # is tracked in git but swag will overwrite the generated files at build time.
-RUN go install github.com/swaggo/swag/cmd/swag@latest && \
+RUN go install github.com/swaggo/swag/cmd/swag@v1.16.6 && \
     swag init --parseDependency --parseInternal \
               -g ./internal/orchestrator/api_server.go \
               --output docs && \
@@ -20,19 +20,14 @@ RUN go install github.com/swaggo/swag/cmd/swag@latest && \
 # ---- runtime ----------------------------------------------------------------
 FROM docker.io/library/debian:bookworm-slim
 
-LABEL maintainer="Dioptra <contact@dioptra.io>"
+LABEL  org.opencontainers.image.authors="Dioptra <contact@dioptra.io>"
 
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd -r -u 1001 retina
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /build/retina-orchestrator .
-
-# 8080 = HTTP API / Swagger UI
-# 50050 = agent TCP listener
-EXPOSE 8080 50050
 
 USER retina
 
