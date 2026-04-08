@@ -15,7 +15,7 @@ make build
 
 To build only the binary:
 ```bash
-make build_orch
+make build
 ```
 
 To generate Swagger documentation:
@@ -63,6 +63,7 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--impact-threshold`        | `1.0`            | Maximum directives allowed to impact a single address |
 | `--seed`                    | `42`             | Seed for the random scheduler                         |
 | `--api-read-header-timeout` | `5s`             | Timeout for reading HTTP request headers              |
+| `--metrics-addr`            | `:9312`          | Address to expose Prometheus metrics on              |
 | `--log-level`               | `info`           | Log level (`debug`, `info`, `warn`, `error`)          |
 
 ## Environment
