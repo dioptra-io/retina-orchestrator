@@ -6,11 +6,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"os"
 	"testing"
 	"time"
 
 	api "github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Coverage gaps — unreachable without integration tests or production code changes:
@@ -22,6 +25,14 @@ import (
 //     server to fail for reasons other than shutdown or context cancellation
 
 // -- helpers ------------------------------------------------------------------
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func testMetrics() *Metrics {
+	return NewMetrics(prometheus.NewRegistry())
+}
 
 func writePDFile(t *testing.T) string {
 	t.Helper()
@@ -129,7 +140,7 @@ func TestConfig_Validate_Errors(t *testing.T) {
 
 func TestNewOrch_Valid(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -142,7 +153,7 @@ func TestNewOrch_InvalidConfig(t *testing.T) {
 	t.Parallel()
 	c := validConfig(t)
 	c.AgentAddress = ""
-	if _, err := NewOrch(c); err == nil {
+	if _, err := NewOrch(c, testLogger(), testMetrics()); err == nil {
 		t.Fatal("expected error for invalid config, got nil")
 	}
 }
@@ -151,7 +162,7 @@ func TestNewOrch_SchedulerError(t *testing.T) {
 	t.Parallel()
 	c := validConfig(t)
 	c.PDPath = "/nonexistent/path.jsonl"
-	if _, err := NewOrch(c); err == nil {
+	if _, err := NewOrch(c, testLogger(), testMetrics()); err == nil {
 		t.Fatal("expected error for bad PDPath, got nil")
 	}
 }
@@ -160,7 +171,7 @@ func TestNewOrch_SchedulerError(t *testing.T) {
 
 func TestRun_StartsAndStopsCleanly(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -178,7 +189,7 @@ func TestRun_StartsAndStopsCleanly(t *testing.T) {
 
 func TestRunScheduler_ContextCancelled(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -194,7 +205,7 @@ func TestRunScheduler_ContextCancelled(t *testing.T) {
 
 func TestRunScheduler_SkipsNilPD(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -215,7 +226,7 @@ func TestRunScheduler_SkipsNilPD(t *testing.T) {
 
 func TestRunScheduler_DropsWhenNoQueue(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -233,7 +244,7 @@ func TestRunScheduler_DropsWhenNoQueue(t *testing.T) {
 
 func TestRunAPIServer_StartsAndStops(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -251,7 +262,7 @@ func TestRunAPIServer_StartsAndStops(t *testing.T) {
 
 func TestRunAgentServer_StartsAndStops(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -269,7 +280,7 @@ func TestRunAgentServer_StartsAndStops(t *testing.T) {
 
 func TestFieStreamHandler_SendsAndStops(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -308,7 +319,7 @@ func TestFieStreamHandler_SendsAndStops(t *testing.T) {
 
 func TestFieStreamHandler_SendFIEError(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -349,7 +360,7 @@ func TestFieStreamHandler_SendFIEError(t *testing.T) {
 
 func TestAgentHandler_DuplicateConnection(t *testing.T) {
 	t.Parallel()
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -377,7 +388,7 @@ func TestAgentHandler_DuplicateConnection(t *testing.T) {
 
 func TestAgentHandler_ReceivesAndForwardsPD(t *testing.T) {
 	// Not parallel — uses real TCP connections.
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -434,7 +445,7 @@ func TestAgentHandler_ReceivesAndForwardsPD(t *testing.T) {
 
 func TestAgentHandler_ReceivesFIE(t *testing.T) {
 	// Not parallel — uses real TCP connections.
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -479,7 +490,7 @@ func TestAgentHandler_ReceivesFIE(t *testing.T) {
 
 func TestAgentHandler_SendPDError(t *testing.T) {
 	// Not parallel — uses real TCP connections.
-	o, err := NewOrch(validConfig(t))
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -528,7 +539,7 @@ func TestAgentAuthHandler_ValidSecret(t *testing.T) {
 	t.Parallel()
 	c := validConfig(t)
 	c.Secret = "mysecret"
-	o, err := NewOrch(c)
+	o, err := NewOrch(c, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -542,7 +553,7 @@ func TestAgentAuthHandler_InvalidSecret(t *testing.T) {
 	t.Parallel()
 	c := validConfig(t)
 	c.Secret = "mysecret"
-	o, err := NewOrch(c)
+	o, err := NewOrch(c, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

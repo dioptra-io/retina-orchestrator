@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"time"
 
@@ -41,9 +40,6 @@ type Config struct {
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
-	// Logger is the structured logger for the orchestrator.
-	// Defaults to discarding all output if nil.
-	Logger *slog.Logger
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -70,15 +66,13 @@ func (c *Config) Validate() error {
 	if c.APIReadHeaderTimeout == 0 {
 		c.APIReadHeaderTimeout = 5 * time.Second
 	}
-	if c.Logger == nil {
-		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	}
 	return nil
 }
 
 type orch struct {
 	config      *Config
 	logger      *slog.Logger
+	metrics     *Metrics
 	scheduler   *Scheduler
 	agentServer *agentServer
 	apiServer   *apiServer
@@ -88,18 +82,24 @@ type orch struct {
 
 // NewOrch creates a new orchestrator from the given configuration. Returns an
 // error if the configuration is invalid or any component creation fails.
-func NewOrch(config *Config) (*orch, error) {
+func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, error) {
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
-
-	o := &orch{
-		config: config,
-		logger: config.Logger,
+	if logger == nil {
+		return nil, fmt.Errorf("logger is not provided")
+	}
+	if metrics == nil {
+		return nil, fmt.Errorf("metrics are not provided")
 	}
 
-	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath,
-		config.Logger.With("component", "scheduler"))
+	o := &orch{
+		config:  config,
+		logger:  logger,
+		metrics: metrics,
+	}
+
+	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, logger.With("component", "scheduler"))
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}

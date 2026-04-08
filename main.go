@@ -1,20 +1,24 @@
 // Copyright (c) 2025 Dioptra
 // SPDX-License-Identifier: MIT
 
-// Command retina-orchestrator runs the Retina orchestrator, which schedules
-// Probing Directives (PDs) to connected agents and streams the resulting
-// ForwardingInfoElements (FIEs) to clients.
 package main
 
 import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator"
 )
@@ -38,17 +42,20 @@ func run() error {
 		seed                 = flag.Uint64("seed", 42, "Seed for the randomizer")
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", 5*time.Second, "Timeout for reading HTTP request headers")
 		logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
+		metricsAddr          = flag.String("metrics-addr", ":9313", "Address to expose Prometheus metrics on")
 	)
 	flag.Parse()
 
-	var level slog.Level
-	invalidLevel := level.UnmarshalText([]byte(*logLevel)) != nil
-	if invalidLevel {
-		level = slog.LevelInfo
-	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
-	if invalidLevel {
-		logger.Warn("Unknown log level, defaulting to info", slog.String("log_level", *logLevel))
+	logger := newLogger(*logLevel)
+
+	// Set up Prometheus registry with Go and Process collectors.
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collectors.NewGoCollector())
+	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	metrics := orchestrator.NewMetrics(registry)
+	metricsSrv, err := startMetricsServer(logger, registry, *metricsAddr)
+	if err != nil {
+		return err
 	}
 
 	secret := os.Getenv("RETINA_SECRET")
@@ -66,25 +73,70 @@ func run() error {
 		Seed:                 *seed,
 		ImpactThreshold:      *impactThreshold,
 		Secret:               secret,
-		Logger:               logger,
-	})
-
+	}, logger, metrics)
 	if err != nil {
 		return err
 	}
+
 	logger.Info("Starting orchestrator",
 		"api_addr", *apiAddr,
 		"agent_addr", *agentAddr,
 		"pd_path", *pdPath,
 		"issuance_rate", *issuanceRate,
 		"impact_threshold", *impactThreshold,
-		"log_level", level,
+		"log_level", *logLevel,
+		"metrics_addr", *metricsAddr,
 	)
 
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {
 		return err
 	}
 
-	logger.Info("Shutting down orchestrator")
+	shutdown(logger, metricsSrv)
 	return nil
+}
+
+// startMetricsServer starts an HTTP server exposing Prometheus metrics at /metrics.
+// It binds eagerly so that a port conflict is detected before the orchestrator starts.
+func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr string) (*http.Server, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("metrics server: %w", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+
+	//nolint:gosec // G112: metrics endpoint is internal-only; timeout omitted intentionally
+	srv := &http.Server{Handler: mux}
+
+	go func() {
+		logger.Info("Starting metrics server", slog.String("addr", addr))
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("Metrics server failed", slog.Any("err", err))
+		}
+	}()
+
+	return srv, nil
+}
+
+// newLogger creates a JSON logger writing to stdout at the given level.
+// Falls back to info if the level string is unrecognised.
+func newLogger(level string) *slog.Logger {
+	var l slog.Level
+	if err := l.UnmarshalText([]byte(level)); err != nil {
+		l = slog.LevelInfo
+	}
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: l,
+	}))
+}
+
+func shutdown(logger *slog.Logger, metricsSrv *http.Server) {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("Metrics server shutdown failed", slog.Any("err", err))
+	}
+	logger.Info("Shutting down orchestrator")
 }
