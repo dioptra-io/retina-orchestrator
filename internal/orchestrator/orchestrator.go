@@ -100,7 +100,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		metrics: metrics,
 	}
 
-	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, logger.With("component", "scheduler"))
+	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, logger.With("component", "scheduler"), metrics)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
