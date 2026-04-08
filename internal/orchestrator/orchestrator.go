@@ -211,20 +211,20 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 }
 
 func (o *orch) fieStreamHandler(s *fieClient) {
-	var disconnectReason string
+	var closeReason string
 	consumer := o.ringBuffer.NewConsumer()
 	o.metrics.StreamClientsConnected.Inc()
 	o.metrics.StreamConnectionsTotal.Inc()
 	defer func() {
 		consumer.Close()
 		o.metrics.StreamClientsConnected.Dec()
-		o.metrics.StreamDisconnectionsTotal.WithLabelValues(disconnectReason).Inc()
+		o.metrics.StreamDisconnectionsTotal.WithLabelValues(closeReason).Inc()
 	}()
 
 	for {
 		fie, seq, err := consumer.Pop(s.context())
 		if err != nil {
-			disconnectReason = fmt.Sprintf("error: %s", err.Error())
+			closeReason = fmt.Sprintf("closing: %s", err)
 			return
 		}
 		seqFIE := &SequencedFIE{
@@ -236,11 +236,11 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 			slog.Uint64("seq", seq),
 			slog.Uint64("pd_id", fie.ProbingDirectiveID))
 		if err = s.sendFIE(seqFIE); err != nil {
-			disconnectReason = fmt.Sprintf("error: %s", err.Error())
+			closeReason = fmt.Sprintf("closing: %s", err)
 			return
 		}
 		o.metrics.FIEsStreamedTotal.Inc()
-		o.metrics.StreamLagSeconds.Observe(float64(time.Since(seqFIE.ProductionTimestamp).Seconds()))
+		o.metrics.StreamLagSeconds.Observe(time.Since(seqFIE.ProductionTimestamp).Seconds())
 	}
 }
 
