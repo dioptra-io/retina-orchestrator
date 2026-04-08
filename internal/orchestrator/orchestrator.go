@@ -211,12 +211,20 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 }
 
 func (o *orch) fieStreamHandler(s *fieClient) {
+	var disconnectReason string
 	consumer := o.ringBuffer.NewConsumer()
-	defer consumer.Close()
+	o.metrics.StreamClientsConnected.Inc()
+	o.metrics.StreamConnectionsTotal.Inc()
+	defer func() {
+		consumer.Close()
+		o.metrics.StreamClientsConnected.Dec()
+		o.metrics.StreamDisconnectionsTotal.WithLabelValues(disconnectReason).Inc()
+	}()
 
 	for {
 		fie, seq, err := consumer.Pop(s.context())
 		if err != nil {
+			disconnectReason = fmt.Sprintf("error: %s", err.Error())
 			return
 		}
 		seqFIE := &SequencedFIE{
@@ -228,8 +236,11 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 			slog.Uint64("seq", seq),
 			slog.Uint64("pd_id", fie.ProbingDirectiveID))
 		if err = s.sendFIE(seqFIE); err != nil {
+			disconnectReason = fmt.Sprintf("error: %s", err.Error())
 			return
 		}
+		o.metrics.FIEsStreamedTotal.Inc()
+		o.metrics.StreamLagSeconds.Observe(float64(time.Since(seqFIE.ProductionTimestamp).Seconds()))
 	}
 }
 
