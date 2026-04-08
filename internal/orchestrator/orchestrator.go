@@ -122,7 +122,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		address:          config.AgentAddress,
 		agentHandler:     o.agentHandler,
 		authHandler:      o.agentAuthHandler,
-	})
+	}, logger, metrics)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating agent server: %w", err)
 	}
@@ -242,6 +242,9 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 	defer consumer.Close()
 
 	o.logger.Info("Agent connected", "agent_id", status.agentID)
+	defer func() {
+		o.logger.Info("Agent disconnected", "agent_id", status.agentID)
+	}()
 
 	group, ctx := errgroup.WithContext(s.context())
 
@@ -251,6 +254,7 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 			if err != nil {
 				return err
 			}
+			o.metrics.FIEsReceivedTotal.WithLabelValues(status.agentID).Inc()
 
 			o.logger.Debug("FIE received",
 				slog.String("agent_id", status.agentID),
@@ -283,13 +287,13 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 			if err = s.sendPD(pd); err != nil {
 				return err
 			}
+			o.metrics.PDsSentTotal.WithLabelValues(status.agentID).Inc()
 		}
 	})
 
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		o.logger.Error("Agent stream failed", "agent_id", status.agentID, "err", err)
 	}
-	o.logger.Info("Agent disconnected", "agent_id", status.agentID)
 }
 
 func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
