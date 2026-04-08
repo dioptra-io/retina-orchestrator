@@ -15,6 +15,7 @@ import (
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -87,10 +88,10 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 	if logger == nil {
-		return nil, fmt.Errorf("logger is not provided")
+		logger = slog.Default()
 	}
 	if metrics == nil {
-		return nil, fmt.Errorf("metrics are not provided")
+		metrics = NewMetrics(prometheus.DefaultRegisterer)
 	}
 
 	o := &orch{
