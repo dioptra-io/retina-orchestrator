@@ -42,7 +42,7 @@ func run() error {
 		seed                 = flag.Uint64("seed", 42, "Seed for the randomizer")
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", 5*time.Second, "Timeout for reading HTTP request headers")
 		logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
-		metricsAddr          = flag.String("metrics-addr", ":9313", "Address to expose Prometheus metrics on")
+		metricsAddr          = flag.String("metrics-addr", ":9312", "Address to expose Prometheus metrics on")
 	)
 	flag.Parse()
 
