@@ -324,7 +324,6 @@ func TestFieStreamHandler_SendsAndStops(t *testing.T) {
 		NearInfo:           &api.Info{},
 		FarInfo:            &api.Info{},
 	}
-	_ = o.ringBuffer.Push(fie)
 
 	done := make(chan struct{})
 	go func() {
@@ -333,12 +332,19 @@ func TestFieStreamHandler_SendsAndStops(t *testing.T) {
 	}()
 
 	time.Sleep(50 * time.Millisecond)
+	_ = o.ringBuffer.Push(fie)
+
+	time.Sleep(50 * time.Millisecond)
 	cancel()
 
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("fieStreamHandler did not return after context cancel")
+	}
+
+	if buf.Len() == 0 {
+		t.Error("expected FIE to be written to buffer")
 	}
 }
 
