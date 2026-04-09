@@ -48,7 +48,6 @@ func run() error {
 
 	logger := newLogger(*logLevel)
 
-	// Set up Prometheus registry with Go and Process collectors.
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collectors.NewGoCollector())
 	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))

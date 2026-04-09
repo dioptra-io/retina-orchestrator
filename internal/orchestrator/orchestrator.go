@@ -219,12 +219,16 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 		consumer.Close()
 		o.metrics.StreamClientsConnected.Dec()
 		o.metrics.StreamDisconnectionsTotal.WithLabelValues(closeReason).Inc()
+		o.logger.Debug("FIE stream closed", slog.String("reason", closeReason))
 	}()
 
 	for {
 		fie, seq, err := consumer.Pop(s.context())
 		if err != nil {
-			closeReason = fmt.Sprintf("closing: %s", err)
+			closeReason = "internal_error"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				closeReason = "shutdown_or_disconnect"
+			}
 			return
 		}
 		seqFIE := &SequencedFIE{
@@ -236,7 +240,10 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 			slog.Uint64("seq", seq),
 			slog.Uint64("pd_id", fie.ProbingDirectiveID))
 		if err = s.sendFIE(seqFIE); err != nil {
-			closeReason = fmt.Sprintf("closing: %s", err)
+			closeReason = "internal_error"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				closeReason = "shutdown_or_disconnect"
+			}
 			return
 		}
 		o.metrics.FIEsStreamedTotal.Inc()

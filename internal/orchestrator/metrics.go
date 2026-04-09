@@ -66,7 +66,7 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 			Name: "retina_orchestrator_pds_total",
 			Help: "Total number of probing directives in the current list.",
 		}),
-		CycleDurationSeconds: factory.NewHistogram(prometheus.HistogramOpts{
+		CycleDurationSeconds: factory.NewHistogram(prometheus.HistogramOpts{ // TODO: tune buckets once we have real cycle duration data.
 			Name:    "retina_orchestrator_cycle_duration_seconds",
 			Help:    "Duration of a full PD cycle in seconds.",
 			Buckets: prometheus.DefBuckets,

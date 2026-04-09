@@ -177,6 +177,7 @@ func (s *agentServer) handleAgent(stream *agentStream) {
 			slog.Any("err", err))
 		return
 	}
+	s.metrics.AgentsConnected.Inc()
 	defer func() {
 		s.metrics.AgentDisconnectionsTotal.WithLabelValues(status.agentID).Inc()
 		s.metrics.AgentsConnected.Dec()
@@ -200,11 +201,9 @@ func (s *agentServer) handshake(stream *agentStream) (*agentAuthStatus, error) {
 	}
 
 	if !authResp.Authenticated {
-		// if the message is decoded but authentification is not successful then it is registered as a metric.
 		s.metrics.AuthFailuresTotal.Inc()
 		return nil, fmt.Errorf("agent not authenticated: %s", authResp.Message)
 	}
-	s.metrics.AgentsConnected.Inc()
 
 	// Clear the handshake deadline so subsequent reads/writes have no timeout.
 	if err := stream.conn.SetDeadline(time.Time{}); err != nil {
