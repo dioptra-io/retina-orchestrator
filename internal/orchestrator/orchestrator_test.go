@@ -17,12 +17,16 @@ import (
 )
 
 // Coverage gaps — unreachable without integration tests or production code changes:
-//   - NewOrch: newQueue, newRingBuffer, newAPIServer, newAgentServer error branches
-//     are unreachable — all use hardcoded safe values or non-nil handlers
+//   - NewOrch: newQueue, newRingBuffer error branches are unreachable — both
+//     use hardcoded safe values (100) that cannot fail
 //   - runScheduler: PD drop log branch requires a queue consumer to exist then
 //     disappear between Push and send, which is not reproducible in unit tests
-//   - runAPIServer, runAgentServer: non-context error return branch requires the
-//     server to fail for reasons other than shutdown or context cancellation
+//   - runAPIServer: non-context error return branch requires the API server to
+//     fail for reasons other than shutdown or context cancellation
+//   - runAgentServer: non-context error return branch requires the agent server
+//     to fail for reasons other than shutdown, context cancellation, or ErrServerShutdown
+//   - fieStreamHandler: sendFIE error path already covered, other branches
+//     unreachable via unit tests
 
 // -- helpers ------------------------------------------------------------------
 
@@ -164,6 +168,27 @@ func TestNewOrch_SchedulerError(t *testing.T) {
 	c.PDPath = "/nonexistent/path.jsonl"
 	if _, err := NewOrch(c, testLogger(), testMetrics()); err == nil {
 		t.Fatal("expected error for bad PDPath, got nil")
+	}
+}
+
+func TestNewOrch_NilLogger(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), nil, testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error with nil logger: %v", err)
+	}
+	if o == nil {
+		t.Fatal("expected non-nil orchestrator")
+	}
+}
+
+func TestNewOrch_NilMetrics(t *testing.T) {
+	o, err := NewOrch(validConfig(t), testLogger(), nil)
+	if err != nil {
+		t.Fatalf("unexpected error with nil metrics: %v", err)
+	}
+	if o == nil {
+		t.Fatal("expected non-nil orchestrator")
 	}
 }
 

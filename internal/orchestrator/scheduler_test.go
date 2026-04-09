@@ -98,6 +98,17 @@ func TestNewScheduler_Valid(t *testing.T) {
 	}
 }
 
+func TestNewScheduler_NilLogger(t *testing.T) {
+	t.Parallel()
+	s, err := NewScheduler(0, 1.0, writeSchedulerPDFile(t, []*api.ProbingDirective{makePD(1)}), nil, testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error with nil logger: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil scheduler")
+	}
+}
+
 // -- readPDs ------------------------------------------------------------------
 
 func TestReadPDs_InvalidJSON(t *testing.T) {

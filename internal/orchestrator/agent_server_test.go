@@ -132,6 +132,23 @@ func TestNewAgentServer_Valid(t *testing.T) {
 	}
 }
 
+func TestNewAgentServer_NilLogger(t *testing.T) {
+	t.Parallel()
+	s, err := newAgentServer(&agentServerConfig{
+		address:          "127.0.0.1:0",
+		handshakeTimeout: time.Second,
+		bufferLength:     4096,
+		authHandler:      allowAll,
+		agentHandler:     nopAgentHandler,
+	}, nil, testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error with nil logger: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil server")
+	}
+}
+
 // -- listenAndServe -----------------------------------------------------------
 
 func TestListenAndServe_BindError(t *testing.T) {
