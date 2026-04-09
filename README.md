@@ -82,6 +82,17 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 - Logs are written to stdout in JSON format, compatible with Loki/Grafana pipelines.
 - The program handles `SIGINT` and `SIGTERM` for graceful shutdown.
 
+## Observability
+
+Metrics are exposed at `--metrics-addr` (default `:9312`) in Prometheus format, covering:
+
+- **Agent connectivity**: agents currently connected, authentication failures, disconnections by agent ID
+- **Pipeline throughput**: probing directives sent and FIEs received, labelled by agent ID
+- **PD scheduling**: total directives loaded, cycle duration, cycles completed, directives skipped by the responsible probing algorithm
+- **Streaming endpoint**: connected HTTP clients, total connections/disconnections by reason, FIEs streamed, stream lag distribution
+
+See `internal/orchestrator/metrics.go` for the full list.
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details
