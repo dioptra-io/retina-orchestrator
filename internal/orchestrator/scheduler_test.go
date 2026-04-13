@@ -337,3 +337,26 @@ func TestNextPD_SkipsDirective(t *testing.T) {
 		t.Fatal("expected nil directive when issuance probability is 0")
 	}
 }
+
+// TestNextPD_CycleDurationObserved covers the branch inside NextPD that
+// records CycleDurationSeconds. The branch requires:
+//  1. A cycle transition (oldCycle != newCycle), which sets lastCycleBegin.
+//  2. A *second* cycle transition, at which point lastCycleBegin is non-zero
+//     and the Observe call is reached.
+//
+// With a single PD the randomizer completes a full cycle on every call, so
+// three calls are sufficient: call 1 ends cycle 0 (sets lastCycleBegin), call
+// 2 ends cycle 1 (hits the Observe branch).
+func TestNextPD_CycleDurationObserved(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+
+	// Force issuancePeriod to zero so NextPD does not sleep.
+	s.issuancePeriod = 0
+
+	// Three calls on a single-element scheduler guarantee two cycle
+	// transitions, which is enough to hit the Observe branch.
+	for range 3 {
+		s.NextPD()
+	}
+}
