@@ -11,7 +11,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
-	"sync"
+
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
@@ -36,10 +36,10 @@ type impactRecord struct {
 // Scheduler implements the responsible probing algorithm. It schedules
 // ProbingDirectives for issuance and updates their issuance probabilities
 // based on incoming ForwardingInfoElements.
+// All methods on Scheduler must be called from a single goroutine.
 type Scheduler struct {
 	logger  *slog.Logger
 	metrics *Metrics
-	mutex   sync.Mutex
 	// pdMap maps each ProbingDirective ID to its scheduling state, which holds
 	// the directive itself, its issuance probability, and last hit addresses.
 	pdMap map[uint64]*pdState
@@ -115,13 +115,11 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string, logger *slog
 // rate limit allows the next issuance, then runs a Bernoulli experiment to
 // decide whether to return or skip the directive. Returns nil if skipped.
 func (s *Scheduler) NextPD() *api.ProbingDirective {
-	s.mutex.Lock()
 	oldCycle := s.randomizer.Cycle()
 	pd := s.pdMap[s.randomizer.Next()]
 	newCycle := s.randomizer.Cycle()
 	nextTime := s.lastIssuance.Add(s.issuancePeriod)
 	issuanceProb := pd.issuanceProb
-	s.mutex.Unlock()
 
 	if s.issuancePeriod >= 10*time.Millisecond {
 		time.Sleep(time.Until(nextTime))
@@ -130,9 +128,7 @@ func (s *Scheduler) NextPD() *api.ProbingDirective {
 		}
 	}
 
-	s.mutex.Lock()
 	s.lastIssuance = time.Now()
-	s.mutex.Unlock()
 
 	if oldCycle != newCycle {
 		if !s.lastCycleBegin.IsZero() {
@@ -159,9 +155,6 @@ func (s *Scheduler) NextPD() *api.ProbingDirective {
 // of directives currently impacting those addresses.
 // Returns an error if the directive ID is not recognized.
 func (s *Scheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
 	pd, ok := s.pdMap[fie.ProbingDirectiveID]
 	if !ok {
 		return fmt.Errorf("probing directive ID %d is not recognized", fie.ProbingDirectiveID)
