@@ -15,7 +15,7 @@ make build
 
 To build only the binary:
 ```bash
-make build_orch
+make build
 ```
 
 To generate Swagger documentation:
@@ -63,6 +63,7 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--impact-threshold`        | `1.0`            | Maximum directives allowed to impact a single address |
 | `--seed`                    | `42`             | Seed for the random scheduler                         |
 | `--api-read-header-timeout` | `5s`             | Timeout for reading HTTP request headers              |
+| `--metrics-addr`            | `:9312`          | Address to expose Prometheus metrics on              |
 | `--log-level`               | `info`           | Log level (`debug`, `info`, `warn`, `error`)          |
 
 ## Environment
@@ -80,6 +81,17 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 - Swagger UI is available at `/swagger/index.html` when the server is running.
 - Logs are written to stdout in JSON format, compatible with Loki/Grafana pipelines.
 - The program handles `SIGINT` and `SIGTERM` for graceful shutdown.
+
+## Observability
+
+Metrics are exposed at `--metrics-addr` (default `:9312`) in Prometheus format, covering:
+
+- **Agent connectivity**: agents currently connected, authentication failures, disconnections by agent ID
+- **Pipeline throughput**: probing directives sent and FIEs received, labelled by agent ID
+- **PD scheduling**: total directives loaded, cycle duration, cycles completed, directives skipped by the responsible probing algorithm
+- **Streaming endpoint**: connected HTTP clients, total connections/disconnections by reason, FIEs streamed, stream lag distribution
+
+See `internal/orchestrator/metrics.go` for the full list.
 
 ## License
 

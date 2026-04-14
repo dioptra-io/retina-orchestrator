@@ -55,7 +55,7 @@ func makeFIE(id uint64, near, far net.IP) *api.ForwardingInfoElement {
 
 func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
 	t.Helper()
-	s, err := NewScheduler(42, 1000.0, writeSchedulerPDFile(t, pds), nil)
+	s, err := NewScheduler(42, 1000.0, writeSchedulerPDFile(t, pds), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,7 +67,7 @@ func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
 func TestNewScheduler_InvalidRate(t *testing.T) {
 	t.Parallel()
 	for _, rate := range []float64{0, -1} {
-		_, err := NewScheduler(0, rate, "irrelevant", nil)
+		_, err := NewScheduler(0, rate, "irrelevant", nil, testMetrics())
 		if err == nil {
 			t.Errorf("rate %v: expected error, got nil", rate)
 		}
@@ -76,7 +76,7 @@ func TestNewScheduler_InvalidRate(t *testing.T) {
 
 func TestNewScheduler_MissingFile(t *testing.T) {
 	t.Parallel()
-	_, err := NewScheduler(0, 1.0, "/nonexistent/path.jsonl", nil)
+	_, err := NewScheduler(0, 1.0, "/nonexistent/path.jsonl", testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -84,7 +84,7 @@ func TestNewScheduler_MissingFile(t *testing.T) {
 
 func TestNewScheduler_EmptyFile(t *testing.T) {
 	t.Parallel()
-	_, err := NewScheduler(0, 1.0, writeSchedulerPDFile(t, nil), nil)
+	_, err := NewScheduler(0, 1.0, writeSchedulerPDFile(t, nil), testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected error for empty directive file, got nil")
 	}
@@ -93,6 +93,17 @@ func TestNewScheduler_EmptyFile(t *testing.T) {
 func TestNewScheduler_Valid(t *testing.T) {
 	t.Parallel()
 	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1), makePD(2)})
+	if s == nil {
+		t.Fatal("expected non-nil scheduler")
+	}
+}
+
+func TestNewScheduler_NilLogger(t *testing.T) {
+	t.Parallel()
+	s, err := NewScheduler(0, 1.0, writeSchedulerPDFile(t, []*api.ProbingDirective{makePD(1)}), nil, testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error with nil logger: %v", err)
+	}
 	if s == nil {
 		t.Fatal("expected non-nil scheduler")
 	}
@@ -112,7 +123,7 @@ func TestReadPDs_InvalidJSON(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("cannot close temp file: %v", err)
 	}
-	_, err = NewScheduler(0, 1.0, f.Name(), nil)
+	_, err = NewScheduler(0, 1.0, f.Name(), testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected unmarshal error for invalid JSON, got nil")
 	}
@@ -132,7 +143,7 @@ func TestReadPDs_ScannerError(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("cannot close temp file: %v", err)
 	}
-	_, err = NewScheduler(0, 1.0, f.Name(), nil)
+	_, err = NewScheduler(0, 1.0, f.Name(), testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected scanner error for oversized line, got nil")
 	}
@@ -324,5 +335,28 @@ func TestNextPD_SkipsDirective(t *testing.T) {
 	s.pdMap[1].issuanceProb = 0.0
 	if pd := s.NextPD(); pd != nil {
 		t.Fatal("expected nil directive when issuance probability is 0")
+	}
+}
+
+// TestNextPD_CycleDurationObserved covers the branch inside NextPD that
+// records CycleDurationSeconds. The branch requires:
+//  1. A cycle transition (oldCycle != newCycle), which sets lastCycleBegin.
+//  2. A *second* cycle transition, at which point lastCycleBegin is non-zero
+//     and the Observe call is reached.
+//
+// With a single PD the randomizer completes a full cycle on every call, so
+// three calls are sufficient: call 1 ends cycle 0 (sets lastCycleBegin), call
+// 2 ends cycle 1 (hits the Observe branch).
+func TestNextPD_CycleDurationObserved(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+
+	// Force issuancePeriod to zero so NextPD does not sleep.
+	s.issuancePeriod = 0
+
+	// Three calls on a single-element scheduler guarantee two cycle
+	// transitions, which is enough to hit the Observe branch.
+	for range 3 {
+		s.NextPD()
 	}
 }

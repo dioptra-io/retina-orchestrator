@@ -66,7 +66,7 @@ func newTestAgentServer(t *testing.T, auth authHandleFunc, agent agentHandleFunc
 		bufferLength:     4096,
 		authHandler:      auth,
 		agentHandler:     agent,
-	})
+	}, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -110,7 +110,7 @@ func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) (api.AuthResp
 
 func TestNewAgentServer_NilAuthHandler(t *testing.T) {
 	t.Parallel()
-	_, err := newAgentServer(&agentServerConfig{agentHandler: nopAgentHandler})
+	_, err := newAgentServer(&agentServerConfig{agentHandler: nopAgentHandler}, testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected error for nil authHandler, got nil")
 	}
@@ -118,7 +118,7 @@ func TestNewAgentServer_NilAuthHandler(t *testing.T) {
 
 func TestNewAgentServer_NilAgentHandler(t *testing.T) {
 	t.Parallel()
-	_, err := newAgentServer(&agentServerConfig{authHandler: allowAll})
+	_, err := newAgentServer(&agentServerConfig{authHandler: allowAll}, testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected error for nil agentHandler, got nil")
 	}
@@ -127,6 +127,23 @@ func TestNewAgentServer_NilAgentHandler(t *testing.T) {
 func TestNewAgentServer_Valid(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestAgentServer(t, allowAll, nopAgentHandler)
+	if s == nil {
+		t.Fatal("expected non-nil server")
+	}
+}
+
+func TestNewAgentServer_NilLogger(t *testing.T) {
+	t.Parallel()
+	s, err := newAgentServer(&agentServerConfig{
+		address:          "127.0.0.1:0",
+		handshakeTimeout: time.Second,
+		bufferLength:     4096,
+		authHandler:      allowAll,
+		agentHandler:     nopAgentHandler,
+	}, nil, testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error with nil logger: %v", err)
+	}
 	if s == nil {
 		t.Fatal("expected non-nil server")
 	}
@@ -147,7 +164,7 @@ func TestListenAndServe_BindError(t *testing.T) {
 		bufferLength: 4096,
 		authHandler:  allowAll,
 		agentHandler: nopAgentHandler,
-	})
+	}, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -334,7 +351,7 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 			}
 			fieCh <- fie
 		},
-	})
+	}, testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

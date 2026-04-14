@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // pdState holds the scheduling state for a single ProbingDirective, including
@@ -37,15 +37,17 @@ type impactRecord struct {
 // ProbingDirectives for issuance and updates their issuance probabilities
 // based on incoming ForwardingInfoElements.
 type Scheduler struct {
-	logger *slog.Logger
-	mutex  sync.Mutex
+	logger  *slog.Logger
+	metrics *Metrics
+	mutex   sync.Mutex
 	// pdMap maps each ProbingDirective ID to its scheduling state, which holds
 	// the directive itself, its issuance probability, and last hit addresses.
 	pdMap map[uint64]*pdState
 	// impactRecords maps each address to the set of directives impacting it.
 	impactRecords map[string]*impactRecord
 	// lastIssuance is the time of the last issued directive, used for rate limiting.
-	lastIssuance time.Time
+	lastIssuance   time.Time
+	lastCycleBegin time.Time
 	// issuancePeriod is the minimum time between two directive issuances,
 	// derived from issuanceRate as time.Second / issuanceRate.
 	issuancePeriod time.Duration
@@ -58,14 +60,15 @@ type Scheduler struct {
 // path to the probing directives file.
 // Returns an error if the file cannot be read, issuanceRate is <= 0, or the
 // file contains no directives.
-//
-// TODO: validate issuanceRate > 0 at the Config level instead of here.
-func NewScheduler(seed uint64, issuanceRate float64, pdFile string, logger *slog.Logger) (*Scheduler, error) {
+func NewScheduler(seed uint64, issuanceRate float64, pdFile string, logger *slog.Logger, metrics *Metrics) (*Scheduler, error) {
 	if issuanceRate <= 0.0 {
 		return nil, fmt.Errorf("invalid arguments: issuance rate cannot be zero or negative")
 	}
 	if logger == nil {
-		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		logger = slog.Default()
+	}
+	if metrics == nil {
+		metrics = NewMetrics(prometheus.DefaultRegisterer)
 	}
 
 	pds, err := readPDs(pdFile)
@@ -95,8 +98,11 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string, logger *slog
 		return nil, fmt.Errorf("cannot create randomizer: %w", err)
 	}
 
+	metrics.PDsTotal.Set(float64(len(pds)))
+
 	return &Scheduler{
 		logger:         logger,
+		metrics:        metrics,
 		pdMap:          pdMap,
 		impactRecords:  make(map[string]*impactRecord),
 		issuancePeriod: time.Duration(float64(time.Second) / issuanceRate),
@@ -110,7 +116,9 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string, logger *slog
 // decide whether to return or skip the directive. Returns nil if skipped.
 func (s *Scheduler) NextPD() *api.ProbingDirective {
 	s.mutex.Lock()
+	oldCycle := s.randomizer.Cycle()
 	pd := s.pdMap[s.randomizer.Next()]
+	newCycle := s.randomizer.Cycle()
 	nextTime := s.lastIssuance.Add(s.issuancePeriod)
 	issuanceProb := pd.issuanceProb
 	s.mutex.Unlock()
@@ -121,9 +129,19 @@ func (s *Scheduler) NextPD() *api.ProbingDirective {
 	s.lastIssuance = time.Now()
 	s.mutex.Unlock()
 
+	if oldCycle != newCycle {
+		if !s.lastCycleBegin.IsZero() {
+			cycleDuration := time.Since(s.lastCycleBegin)
+			s.metrics.CycleDurationSeconds.Observe(float64(cycleDuration.Seconds()))
+		}
+		s.lastCycleBegin = time.Now()
+		s.metrics.CyclesTotal.Inc()
+	}
+
 	if s.random.Float64() < issuanceProb {
 		return pd.directive
 	}
+	s.metrics.PDsSkippedTotal.Inc()
 	s.logger.Debug("PD skipped",
 		slog.Uint64("pd_id", pd.directive.ProbingDirectiveID),
 		slog.Float64("issuance_prob", issuanceProb))

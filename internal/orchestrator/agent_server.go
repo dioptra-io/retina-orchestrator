@@ -40,13 +40,13 @@ type agentServerConfig struct {
 	bufferLength     int
 	agentHandler     agentHandleFunc
 	authHandler      authHandleFunc
-	logger           *slog.Logger
 }
 
 // agentServer handles bidirectional PD/FIE communication with agents over newline-delimited JSON.
 type agentServer struct {
 	config   *agentServerConfig
 	logger   *slog.Logger
+	metrics  *Metrics
 	shutdown atomic.Bool
 	mutex    sync.Mutex
 	// connections tracks all active agent connections for shutdown.
@@ -56,17 +56,18 @@ type agentServer struct {
 	wg           sync.WaitGroup
 }
 
-func newAgentServer(config *agentServerConfig) (*agentServer, error) {
+func newAgentServer(config *agentServerConfig, logger *slog.Logger, metrics *Metrics) (*agentServer, error) {
 	if config.authHandler == nil || config.agentHandler == nil {
 		return nil, fmt.Errorf("handlers cannot be nil")
 	}
-	if config.logger == nil {
-		config.logger = slog.Default()
+	if logger == nil {
+		logger = slog.Default()
 	}
 
 	return &agentServer{
 		config:      config,
-		logger:      config.logger,
+		logger:      logger,
+		metrics:     metrics,
 		connections: make(map[int]*agentStream),
 	}, nil
 }
@@ -176,6 +177,11 @@ func (s *agentServer) handleAgent(stream *agentStream) {
 			slog.Any("err", err))
 		return
 	}
+	s.metrics.AgentsConnected.Inc()
+	defer func() {
+		s.metrics.AgentDisconnectionsTotal.WithLabelValues(status.agentID).Inc()
+		s.metrics.AgentsConnected.Dec()
+	}()
 
 	s.logger.Info("Agent authenticated",
 		slog.String("agent_id", status.agentID),
@@ -195,6 +201,7 @@ func (s *agentServer) handshake(stream *agentStream) (*agentAuthStatus, error) {
 	}
 
 	if !authResp.Authenticated {
+		s.metrics.AuthFailuresTotal.Inc()
 		return nil, fmt.Errorf("agent not authenticated: %s", authResp.Message)
 	}
 

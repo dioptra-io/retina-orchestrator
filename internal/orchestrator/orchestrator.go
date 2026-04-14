@@ -10,12 +10,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -41,9 +41,6 @@ type Config struct {
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
-	// Logger is the structured logger for the orchestrator.
-	// Defaults to discarding all output if nil.
-	Logger *slog.Logger
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -70,15 +67,13 @@ func (c *Config) Validate() error {
 	if c.APIReadHeaderTimeout == 0 {
 		c.APIReadHeaderTimeout = 5 * time.Second
 	}
-	if c.Logger == nil {
-		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	}
 	return nil
 }
 
 type orch struct {
 	config      *Config
 	logger      *slog.Logger
+	metrics     *Metrics
 	scheduler   *Scheduler
 	agentServer *agentServer
 	apiServer   *apiServer
@@ -88,18 +83,24 @@ type orch struct {
 
 // NewOrch creates a new orchestrator from the given configuration. Returns an
 // error if the configuration is invalid or any component creation fails.
-func NewOrch(config *Config) (*orch, error) {
+func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, error) {
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
-
-	o := &orch{
-		config: config,
-		logger: config.Logger,
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if metrics == nil {
+		metrics = NewMetrics(prometheus.DefaultRegisterer)
 	}
 
-	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath,
-		config.Logger.With("component", "scheduler"))
+	o := &orch{
+		config:  config,
+		logger:  logger,
+		metrics: metrics,
+	}
+
+	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, logger.With("component", "scheduler"), metrics)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
@@ -121,7 +122,7 @@ func NewOrch(config *Config) (*orch, error) {
 		address:          config.AgentAddress,
 		agentHandler:     o.agentHandler,
 		authHandler:      o.agentAuthHandler,
-	})
+	}, logger, metrics)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating agent server: %w", err)
 	}
@@ -210,12 +211,24 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 }
 
 func (o *orch) fieStreamHandler(s *fieClient) {
+	var closeReason string
 	consumer := o.ringBuffer.NewConsumer()
-	defer consumer.Close()
+	o.metrics.StreamClientsConnected.Inc()
+	o.metrics.StreamConnectionsTotal.Inc()
+	defer func() {
+		consumer.Close()
+		o.metrics.StreamClientsConnected.Dec()
+		o.metrics.StreamDisconnectionsTotal.WithLabelValues(closeReason).Inc()
+		o.logger.Debug("FIE stream closed", slog.String("reason", closeReason))
+	}()
 
 	for {
 		fie, seq, err := consumer.Pop(s.context())
 		if err != nil {
+			closeReason = "internal_error"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				closeReason = "shutdown_or_disconnect"
+			}
 			return
 		}
 		seqFIE := &SequencedFIE{
@@ -227,8 +240,14 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 			slog.Uint64("seq", seq),
 			slog.Uint64("pd_id", fie.ProbingDirectiveID))
 		if err = s.sendFIE(seqFIE); err != nil {
+			closeReason = "internal_error"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				closeReason = "shutdown_or_disconnect"
+			}
 			return
 		}
+		o.metrics.FIEsStreamedTotal.Inc()
+		o.metrics.StreamLagSeconds.Observe(time.Since(seqFIE.ProductionTimestamp).Seconds())
 	}
 }
 
@@ -241,6 +260,9 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 	defer consumer.Close()
 
 	o.logger.Info("Agent connected", "agent_id", status.agentID)
+	defer func() {
+		o.logger.Info("Agent disconnected", "agent_id", status.agentID)
+	}()
 
 	group, ctx := errgroup.WithContext(s.context())
 
@@ -250,6 +272,7 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 			if err != nil {
 				return err
 			}
+			o.metrics.FIEsReceivedTotal.WithLabelValues(status.agentID).Inc()
 
 			o.logger.Debug("FIE received",
 				slog.String("agent_id", status.agentID),
@@ -282,13 +305,13 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 			if err = s.sendPD(pd); err != nil {
 				return err
 			}
+			o.metrics.PDsSentTotal.WithLabelValues(status.agentID).Inc()
 		}
 	})
 
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		o.logger.Error("Agent stream failed", "agent_id", status.agentID, "err", err)
 	}
-	o.logger.Info("Agent disconnected", "agent_id", status.agentID)
 }
 
 func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
