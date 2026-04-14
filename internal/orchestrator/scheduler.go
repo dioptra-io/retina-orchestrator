@@ -123,7 +123,12 @@ func (s *Scheduler) NextPD() *api.ProbingDirective {
 	issuanceProb := pd.issuanceProb
 	s.mutex.Unlock()
 
-	time.Sleep(time.Until(nextTime))
+	if s.issuancePeriod >= 10*time.Millisecond {
+		time.Sleep(time.Until(nextTime))
+	} else {
+		for time.Now().Before(nextTime) { // busylock
+		}
+	}
 
 	s.mutex.Lock()
 	s.lastIssuance = time.Now()
