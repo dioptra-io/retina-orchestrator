@@ -121,15 +121,3 @@ func (q *Queue[T]) Push(ctx context.Context, id string, item *T) error {
 		return nil
 	}
 }
-
-// Len returns the number of elements currently buffered for the consumer.
-// Returns 0 if the consumer is not found.
-func (q *Queue[T]) Len(id string) int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	c, ok := q.consumers[id]
-	if !ok {
-		return 0
-	}
-	return len(c.ch)
-}
