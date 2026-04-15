@@ -172,10 +172,11 @@ func (o *orch) runScheduler(ctx context.Context) error {
 		}
 
 		if err := o.pdQueue.Push(ctx, pd.AgentID, pd); err != nil {
-			// PD drops before agent connection are expected during startup.
 			o.logger.Debug("PD dropped: no queue for agent",
 				slog.String("agent_id", pd.AgentID),
 				slog.Uint64("pd_id", pd.ProbingDirectiveID))
+		} else {
+			o.metrics.AgentQueueSize.WithLabelValues(pd.AgentID).Inc()
 		}
 	}
 }
@@ -260,8 +261,10 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 	defer consumer.Close()
 
 	o.logger.Info("Agent connected", "agent_id", status.agentID)
+	o.metrics.AgentQueueSize.WithLabelValues(status.agentID).Set(0)
 	defer func() {
 		o.logger.Info("Agent disconnected", "agent_id", status.agentID)
+		o.metrics.AgentQueueSize.DeleteLabelValues(status.agentID)
 	}()
 
 	group, ctx := errgroup.WithContext(s.context())
@@ -306,6 +309,7 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 				return err
 			}
 			o.metrics.PDsSentTotal.WithLabelValues(status.agentID).Inc()
+			o.metrics.AgentQueueSize.WithLabelValues(status.agentID).Dec()
 		}
 	})
 

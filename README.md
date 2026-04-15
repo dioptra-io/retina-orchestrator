@@ -87,7 +87,7 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 Metrics are exposed at `--metrics-addr` (default `:9312`) in Prometheus format, covering:
 
 - **Agent connectivity**: agents currently connected, authentication failures, disconnections by agent ID
-- **Pipeline throughput**: probing directives sent and FIEs received, labelled by agent ID
+- **Pipeline throughput**: probing directives sent and FIEs received, queue size per agent, labelled by agent ID
 - **PD scheduling**: total directives loaded, cycle duration, cycles completed, directives skipped by the responsible probing algorithm
 - **Streaming endpoint**: connected HTTP clients, total connections/disconnections by reason, FIEs streamed, stream lag distribution
 

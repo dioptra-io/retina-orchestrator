@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"sync"
+
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
@@ -38,8 +39,8 @@ type impactRecord struct {
 // based on incoming ForwardingInfoElements.
 type Scheduler struct {
 	logger  *slog.Logger
-	metrics *Metrics
 	mutex   sync.Mutex
+	metrics *Metrics
 	// pdMap maps each ProbingDirective ID to its scheduling state, which holds
 	// the directive itself, its issuance probability, and last hit addresses.
 	pdMap map[uint64]*pdState
