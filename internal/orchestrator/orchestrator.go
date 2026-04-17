@@ -41,6 +41,8 @@ type Config struct {
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
+
+	PDQueueSize uint64
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -64,9 +66,13 @@ func (c *Config) Validate() error {
 	if c.ImpactThreshold <= 0 {
 		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
 	}
+	if c.PDQueueSize <= 0 {
+		return fmt.Errorf("PDQueueSize must be greater than zero: got %f", c.PDQueueSize)
+	}
 	if c.APIReadHeaderTimeout == 0 {
 		c.APIReadHeaderTimeout = 5 * time.Second
 	}
+
 	return nil
 }
 

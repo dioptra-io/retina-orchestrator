@@ -43,6 +43,7 @@ func run() error {
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", 5*time.Second, "Timeout for reading HTTP request headers")
 		logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 		metricsAddr          = flag.String("metrics-addr", ":9312", "Address to expose Prometheus metrics on")
+		pdQueueSize          = flag.String("pd-queue-size", 100, "The size of the agent queue")
 	)
 	flag.Parse()
 
@@ -72,6 +73,7 @@ func run() error {
 		Seed:                 *seed,
 		ImpactThreshold:      *impactThreshold,
 		Secret:               secret,
+		PDQueueSize:          *pdQueueSize,
 	}, logger, metrics)
 	if err != nil {
 		return err
