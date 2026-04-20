@@ -54,7 +54,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("AgentAddress cannot be empty")
 	}
 	if c.PDQueueSize <= 0 {
-		return fmt.Errorf("PDQueueSize must be greater than zero: got %f", c.PDQueueSize)
+		return fmt.Errorf("PDQueueSize must be greater than zero: got %d", c.PDQueueSize)
 	}
 	if c.AgentBufferLength < 8192 {
 		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
