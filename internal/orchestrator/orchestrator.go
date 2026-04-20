@@ -25,6 +25,10 @@ type Config struct {
 	AgentAddress      string
 	AgentBufferLength int
 
+	// PDQueueSize is the number of PDs that can be queued per agent.
+	// Increase this value if agents are slow to consume directives.
+	PDQueueSize uint64
+
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
 	APIAddress string
 	// APIReadHeaderTimeout defaults to 5 seconds if zero.
@@ -49,6 +53,9 @@ func (c *Config) Validate() error {
 	if c.AgentAddress == "" {
 		return fmt.Errorf("AgentAddress cannot be empty")
 	}
+	if c.PDQueueSize <= 0 {
+		return fmt.Errorf("PDQueueSize must be greater than zero: got %d", c.PDQueueSize)
+	}
 	if c.AgentBufferLength < 8192 {
 		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
 	}
@@ -67,6 +74,7 @@ func (c *Config) Validate() error {
 	if c.APIReadHeaderTimeout == 0 {
 		c.APIReadHeaderTimeout = 5 * time.Second
 	}
+
 	return nil
 }
 

@@ -56,6 +56,7 @@ func validConfig(t *testing.T) *Config {
 	return &Config{
 		AgentAddress:      "127.0.0.1:0",
 		AgentBufferLength: 8192,
+		PDQueueSize:       100,
 		APIAddress:        "127.0.0.1:0",
 		PDPath:            writePDFile(t),
 		Seed:              0,
@@ -121,6 +122,7 @@ func TestConfig_Validate_Errors(t *testing.T) {
 	}{
 		{"empty AgentAddress", func(c *Config) { c.AgentAddress = "" }},
 		{"small AgentBufferLength", func(c *Config) { c.AgentBufferLength = 100 }},
+		{"zero PDQueueSize", func(c *Config) { c.PDQueueSize = 0 }},
 		{"empty APIAddress", func(c *Config) { c.APIAddress = "" }},
 		{"empty PDPath", func(c *Config) { c.PDPath = "" }},
 		{"zero IssuanceRate", func(c *Config) { c.IssuanceRate = 0 }},
