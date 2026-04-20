@@ -62,6 +62,7 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--issuance-rate`           | `1.0`            | Target PD issuance rate in PDs per second             |
 | `--impact-threshold`        | `1.0`            | Maximum directives allowed to impact a single address |
 | `--seed`                    | `42`             | Seed for the random scheduler                         |
+| `--pd-queue-size`           | `100`            | Size of the per-agent PD queue buffer                 |
 | `--api-read-header-timeout` | `5s`             | Timeout for reading HTTP request headers              |
 | `--metrics-addr`            | `:9312`          | Address to expose Prometheus metrics on              |
 | `--log-level`               | `info`           | Log level (`debug`, `info`, `warn`, `error`)          |

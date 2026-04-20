@@ -23,6 +23,7 @@ import (
 type Config struct {
 	// AgentAddress is the TCP listening address for agent connections, in the form "host:port".
 	AgentAddress      string
+	PDQueueSize uint64
 	AgentBufferLength int
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
@@ -41,8 +42,6 @@ type Config struct {
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
-
-	PDQueueSize uint64
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -50,6 +49,9 @@ type Config struct {
 func (c *Config) Validate() error {
 	if c.AgentAddress == "" {
 		return fmt.Errorf("AgentAddress cannot be empty")
+	}
+	if c.PDQueueSize <= 0 {
+		return fmt.Errorf("PDQueueSize must be greater than zero: got %f", c.PDQueueSize)
 	}
 	if c.AgentBufferLength < 8192 {
 		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
@@ -65,9 +67,6 @@ func (c *Config) Validate() error {
 	}
 	if c.ImpactThreshold <= 0 {
 		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
-	}
-	if c.PDQueueSize <= 0 {
-		return fmt.Errorf("PDQueueSize must be greater than zero: got %f", c.PDQueueSize)
 	}
 	if c.APIReadHeaderTimeout == 0 {
 		c.APIReadHeaderTimeout = 5 * time.Second

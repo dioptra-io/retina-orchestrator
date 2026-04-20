@@ -36,6 +36,7 @@ func run() error {
 	var (
 		apiAddr              = flag.String("api-addr", "localhost:8080", "Listening address for the HTTP API server")
 		agentAddr            = flag.String("agent-addr", "localhost:50050", "Listening address for agent connections")
+		pdQueueSize          = flag.Uint64("pd-queue-size", 100, "The size of the agent queue")
 		pdPath               = flag.String("pd-path", "", "Path to the probing directives file")
 		issuanceRate         = flag.Float64("issuance-rate", 1.0, "Target global issuance rate of probing directives (PDs per second, approximate)")
 		impactThreshold      = flag.Float64("impact-threshold", 1.0, "Maximum impact threshold per address for the responsible probing algorithm")
@@ -43,7 +44,6 @@ func run() error {
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", 5*time.Second, "Timeout for reading HTTP request headers")
 		logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 		metricsAddr          = flag.String("metrics-addr", ":9312", "Address to expose Prometheus metrics on")
-		pdQueueSize          = flag.Uint64("pd-queue-size", 100, "The size of the agent queue")
 	)
 	flag.Parse()
 
@@ -65,6 +65,7 @@ func run() error {
 
 	orch, err := orchestrator.NewOrch(&orchestrator.Config{
 		AgentAddress:         *agentAddr,
+		PDQueueSize:          *pdQueueSize,
 		AgentBufferLength:    defaultAgentBufferLength,
 		APIAddress:           *apiAddr,
 		APIReadHeaderTimeout: *apiReadHeaderTimeout,
@@ -73,7 +74,6 @@ func run() error {
 		Seed:                 *seed,
 		ImpactThreshold:      *impactThreshold,
 		Secret:               secret,
-		PDQueueSize:          *pdQueueSize,
 	}, logger, metrics)
 	if err != nil {
 		return err
