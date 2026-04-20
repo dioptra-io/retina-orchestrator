@@ -23,8 +23,11 @@ import (
 type Config struct {
 	// AgentAddress is the TCP listening address for agent connections, in the form "host:port".
 	AgentAddress      string
-	PDQueueSize uint64
 	AgentBufferLength int
+
+	// PDQueueSize is the number of PDs that can be queued per agent.
+	// Increase this value if agents are slow to consume directives.
+	PDQueueSize uint64
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
 	APIAddress string
