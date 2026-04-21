@@ -179,7 +179,7 @@ func (o *orch) runScheduler(ctx context.Context) error {
 			continue
 		}
 
-		if err := o.pdQueue.Push(ctx, pd.AgentID, pd); err != nil {
+		if err := o.pdQueue.TryPush(pd.AgentID, pd); err != nil {
 			o.logger.Debug("PD dropped: no queue for agent",
 				slog.String("agent_id", pd.AgentID),
 				slog.Uint64("pd_id", pd.ProbingDirectiveID))

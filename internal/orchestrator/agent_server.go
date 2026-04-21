@@ -18,7 +18,7 @@ import (
 
 // agentKeepalivePeriod is the interval between TCP keepalive probes
 // for agent connections.
-const agentKeepalivePeriod = 30 * time.Second
+const agentKeepalivePeriod = 1 * time.Second
 
 type agentAuthStatus struct {
 	agentID       string
@@ -242,12 +242,6 @@ func newAgentStream(id int, conn *net.TCPConn, server *agentServer) (*agentStrea
 	}
 	if err := conn.SetKeepAlivePeriod(agentKeepalivePeriod); err != nil {
 		return nil, fmt.Errorf("failed to set keepalive period: %w", err)
-	}
-	if err := conn.SetReadBuffer(server.config.bufferLength); err != nil {
-		return nil, fmt.Errorf("failed to set read buffer: %w", err)
-	}
-	if err := conn.SetWriteBuffer(server.config.bufferLength); err != nil {
-		return nil, fmt.Errorf("failed to set write buffer: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118
