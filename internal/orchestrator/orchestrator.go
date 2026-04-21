@@ -28,6 +28,9 @@ type Config struct {
 	// PDQueueSize is the number of PDs that can be queued per agent.
 	// Increase this value if agents are slow to consume directives.
 	PDQueueSize uint64
+	// RingBufferSize is the size of the ringbuffer which enqueues FIEs for
+	// streaming clients.
+	RingBufferSize uint64
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
 	APIAddress string
@@ -55,6 +58,9 @@ func (c *Config) Validate() error {
 	}
 	if c.PDQueueSize <= 0 {
 		return fmt.Errorf("PDQueueSize must be greater than zero: got %d", c.PDQueueSize)
+	}
+	if c.RingBufferSize <= 0 {
+		return fmt.Errorf("RingBufferSize must be greater than zero: got %d", c.RingBufferSize)
 	}
 	if c.AgentBufferLength < 8192 {
 		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
@@ -142,7 +148,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.pdQueue = pdQueue
 
-	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](100)
+	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](config.RingBufferSize)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating ring buffer: %w", err)
 	}
