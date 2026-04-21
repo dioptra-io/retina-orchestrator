@@ -66,6 +66,7 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--api-read-header-timeout` | `5s`             | Timeout for reading HTTP request headers              |
 | `--metrics-addr`            | `:9312`          | Address to expose Prometheus metrics on              |
 | `--log-level`               | `info`           | Log level (`debug`, `info`, `warn`, `error`)          |
+| `--fie-filter-policy`       | `both`           | FIE filtering policy: `any`, `one`, or `both` (controls which FIEs are streamed) |
 
 ## Environment
 
