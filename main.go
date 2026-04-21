@@ -44,6 +44,7 @@ func run() error {
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", 5*time.Second, "Timeout for reading HTTP request headers")
 		logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
 		metricsAddr          = flag.String("metrics-addr", ":9312", "Address to expose Prometheus metrics on")
+		fieFilterPolicy      = flag.String("fie-filter-policy", "both", "Filter policy for FIEs (any, one, both)")
 	)
 	flag.Parse()
 
@@ -73,6 +74,7 @@ func run() error {
 		IssuanceRate:         *issuanceRate,
 		Seed:                 *seed,
 		ImpactThreshold:      *impactThreshold,
+		FIEFilterPolicy:      *fieFilterPolicy,
 		Secret:               secret,
 	}, logger, metrics)
 	if err != nil {

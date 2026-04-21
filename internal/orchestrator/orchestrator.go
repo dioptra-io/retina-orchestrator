@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
@@ -34,8 +35,9 @@ type Config struct {
 	// APIReadHeaderTimeout defaults to 5 seconds if zero.
 	APIReadHeaderTimeout time.Duration
 
-	PDPath string
-	Seed   uint64
+	FIEFilterPolicy string
+	PDPath          string
+	Seed            uint64
 	// IssuanceRate is the target global issuance rate of probing directives
 	// (PDs per second, approximate).
 	IssuanceRate float64
@@ -70,6 +72,9 @@ func (c *Config) Validate() error {
 	}
 	if c.ImpactThreshold <= 0 {
 		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
+	}
+	if slices.Contains([]string{"any", "ont", "both"}, c.FIEFilterPolicy) {
+		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
 	}
 	if c.APIReadHeaderTimeout == 0 {
 		c.APIReadHeaderTimeout = 5 * time.Second
@@ -293,8 +298,11 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.agentID, "err", err)
 			}
 
-			// Only push complete FIEs to the ring buffer for streaming.
-			if fie.NearInfo == nil || fie.FarInfo == nil {
+			allow, err := o.filterFIE(fie)
+			if err != nil {
+				return fmt.Errorf("error on filtering FIE: %w", err)
+			}
+			if !allow {
 				continue
 			}
 
@@ -337,5 +345,21 @@ func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
 	return api.AuthResponse{
 		Authenticated: false,
 		Message:       "secret is not correct",
+	}
+}
+
+// filterFIE reports whether a FIE should be streamed based on the policy.
+// Returns true if the FIE is allowed.
+func (o *orch) filterFIE(fie *api.ForwardingInfoElement) (bool, error) {
+	// FIE streaming is determined by the flag --fie-filter-policy
+	switch o.config.FIEFilterPolicy {
+	case "any": // allow all FIEs
+		return true, nil
+	case "both": // allow FIEs with two non-nil response addresses
+		return fie.NearInfo != nil && fie.FarInfo != nil, nil
+	case "one": // allow FIEs with at least one non-nil response address
+		return fie.NearInfo != nil || fie.FarInfo != nil, nil
+	default:
+		return false, fmt.Errorf("unsupported fie filtering policy: %q", o.config.FIEFilterPolicy)
 	}
 }
