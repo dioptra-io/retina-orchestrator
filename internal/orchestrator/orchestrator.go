@@ -136,7 +136,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.agentServer = agentServer
 
-	pdQueue, err := structures.NewQueue[api.ProbingDirective](100)
+	pdQueue, err := structures.NewQueue[api.ProbingDirective](config.PDQueueSize)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating pd queue: %w", err)
 	}
