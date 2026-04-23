@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -34,17 +35,16 @@ func main() {
 
 func run() error {
 	var (
-		apiAddr              = flag.String("api-addr", "localhost:8080", "Listening address for the HTTP API server")
-		agentAddr            = flag.String("agent-addr", "localhost:50050", "Listening address for agent connections")
-		pdQueueSize          = flag.Uint64("pd-queue-size", 100, "The size of the agent queue")
-		ringBufferSize       = flag.Uint64("ring-buffer-size", 100, "The size of the ring buffer")
-		pdPath               = flag.String("pd-path", "", "Path to the probing directives file")
-		issuanceRate         = flag.Float64("issuance-rate", 1.0, "Target global issuance rate of probing directives (PDs per second, approximate)")
-		impactThreshold      = flag.Float64("impact-threshold", 1.0, "Maximum impact threshold per address for the responsible probing algorithm")
-		seed                 = flag.Uint64("seed", 42, "Seed for the randomizer")
-		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", 5*time.Second, "Timeout for reading HTTP request headers")
-		logLevel             = flag.String("log-level", "info", "Log level (debug, info, warn, error)")
-		metricsAddr          = flag.String("metrics-addr", ":9312", "Address to expose Prometheus metrics on")
+		apiAddr              = flag.String("api-addr", envOrDefault("RETINA_API_ADDR", "localhost:8080"), "Listening address for the HTTP API server")
+		agentAddr            = flag.String("agent-addr", envOrDefault("RETINA_AGENT_ADDR", "localhost:50050"), "Listening address for agent connections")
+		pdQueueSize          = flag.Int("pd-queue-size", envOrDefaultInt("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
+		pdPath               = flag.String("pd-path", envOrDefault("RETINA_PD_PATH", ""), "Path to the probing directives file")
+		issuanceRate         = flag.Float64("issuance-rate", envOrDefaultFloat64("RETINA_ISSUANCE_RATE", 1.0), "Target global issuance rate of probing directives (PDs per second, approximate)")
+		impactThreshold      = flag.Float64("impact-threshold", envOrDefaultFloat64("RETINA_IMPACT_THRESHOLD", 1.0), "Maximum impact threshold per address for the responsible probing algorithm")
+		seed                 = flag.Uint64("seed", envOrDefaultUInt64("RETINA_SEED", 42), "Seed for the randomizer")
+		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", envOrDefaultDuration("RETINA_API_READ_HEADER_TIMEOUT", 5*time.Second), "Timeout for reading HTTP request headers")
+		logLevel             = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
+		metricsAddr          = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
 	)
 	flag.Parse()
 
@@ -142,4 +142,59 @@ func shutdown(logger *slog.Logger, metricsSrv *http.Server) {
 		logger.Error("Metrics server shutdown failed", slog.Any("err", err))
 	}
 	logger.Info("Shutting down orchestrator")
+}
+
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envOrDefaultUInt64(key string, def uint64) uint64 {
+	if v := os.Getenv(key); v != "" {
+		i, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
+			os.Exit(1)
+		}
+		return i
+	}
+	return def
+}
+
+func envOrDefaultInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
+			os.Exit(1)
+		}
+		return int(i)
+	}
+	return def
+}
+
+func envOrDefaultFloat64(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		i, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
+			os.Exit(1)
+		}
+		return i
+	}
+	return def
+}
+
+func envOrDefaultDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
+			os.Exit(1)
+		}
+		return d
+	}
+	return def
 }

@@ -68,11 +68,30 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--metrics-addr`            | `:9312`          | Address to expose Prometheus metrics on              |
 | `--log-level`               | `info`           | Log level (`debug`, `info`, `warn`, `error`)          |
 
-## Environment
 
-| Variable        | Description                            |
-| --------------- | -------------------------------------- |
-| `RETINA_SECRET` | Shared secret for agent authentication |
+## Environment Variables
+
+All flags can be configured via environment variables. These act as defaults and are overridden by CLI flags.
+
+Precedence:
+
+```
+CLI flags > environment variables > hardcoded defaults
+```
+
+| Variable                         | Default           | Description                                          |
+| -------------------------------- | ----------------- | ---------------------------------------------------- |
+| `RETINA_SECRET`                  | *                 | Shared secret for agent authentication, required     |
+| `RETINA_API_ADDR`                | `localhost:8080`  | TCP address for the HTTP API server                  |
+| `RETINA_AGENT_ADDR`              | `localhost:50050` | TCP address for agent connections                    |
+| `RETINA_PD_QUEUE_SIZE`           | `100`             | Size of the per-agent PD queue buffer                |
+| `RETINA_PD_PATH`                 | `""`              | Path to the JSONL file containing Probing Directives |
+| `RETINA_ISSUANCE_RATE`           | `1.0`             | Target PD issuance rate in PDs per second            |
+| `RETINA_IMPACT_THRESHOLD`        | `1.0`             | Maximum directives allowed per address               |
+| `RETINA_SEED`                    | `42`              | Seed for the random scheduler                        |
+| `RETINA_API_READ_HEADER_TIMEOUT` | `5s`              | Timeout for reading HTTP request headers             |
+| `RETINA_METRICS_ADDR`            | `:9312`           | Address to expose Prometheus metrics on              |
+| `RETINA_LOG_LEVEL`               | `info`            | Log level (`debug`, `info`, `warn`, `error`)         |
 
 ## Behavior
 

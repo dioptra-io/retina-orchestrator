@@ -27,10 +27,7 @@ type Config struct {
 
 	// PDQueueSize is the number of PDs that can be queued per agent.
 	// Increase this value if agents are slow to consume directives.
-	PDQueueSize uint64
-	// RingBufferSize is the size of the ringbuffer which enqueues FIEs for
-	// streaming clients.
-	RingBufferSize uint64
+	PDQueueSize int
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
 	APIAddress string
