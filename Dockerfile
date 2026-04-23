@@ -11,7 +11,7 @@ COPY . .
 # is tracked in git but swag will overwrite the generated files at build time.
 RUN go install github.com/swaggo/swag/cmd/swag@v1.16.6 && \
     swag init --parseDependency --parseInternal \
-              -g ./internal/orchestrator/api_server.go \
+              -g main.go \
               --output docs && \
     CGO_ENABLED=0 GOOS=linux \
     go build -trimpath -ldflags="-s -w" \
