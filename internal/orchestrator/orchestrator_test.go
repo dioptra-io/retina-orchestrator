@@ -57,6 +57,7 @@ func validConfig(t *testing.T) *Config {
 		AgentAddress:      "127.0.0.1:0",
 		AgentBufferLength: 8192,
 		PDQueueSize:       100,
+		RingBufferSize:    100,
 		APIAddress:        "127.0.0.1:0",
 		PDPath:            writePDFile(t),
 		Seed:              0,

@@ -37,6 +37,7 @@ func run() error {
 		apiAddr              = flag.String("api-addr", "localhost:8080", "Listening address for the HTTP API server")
 		agentAddr            = flag.String("agent-addr", "localhost:50050", "Listening address for agent connections")
 		pdQueueSize          = flag.Uint64("pd-queue-size", 100, "The size of the agent queue")
+		ringBufferSize       = flag.Uint64("ring-buffer-size", 100, "The size of the ring buffer")
 		pdPath               = flag.String("pd-path", "", "Path to the probing directives file")
 		issuanceRate         = flag.Float64("issuance-rate", 1.0, "Target global issuance rate of probing directives (PDs per second, approximate)")
 		impactThreshold      = flag.Float64("impact-threshold", 1.0, "Maximum impact threshold per address for the responsible probing algorithm")
@@ -66,6 +67,7 @@ func run() error {
 	orch, err := orchestrator.NewOrch(&orchestrator.Config{
 		AgentAddress:         *agentAddr,
 		PDQueueSize:          *pdQueueSize,
+		RingBufferSize:       *ringBufferSize,
 		AgentBufferLength:    defaultAgentBufferLength,
 		APIAddress:           *apiAddr,
 		APIReadHeaderTimeout: *apiReadHeaderTimeout,

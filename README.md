@@ -59,6 +59,7 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--api-addr`                | `localhost:8080` | TCP address for the HTTP API server (host:port)       |
 | `--agent-addr`              | `localhost:50050`| TCP address for agent connections (host:port)         |
 | `--pd-queue-size`           | `100`            | Size of the per-agent PD queue buffer                 |
+| `--ring-buffer-size`        | `100`            | Size of the ring buffer                               |
 | `--pd-path`                 | `""`             | Path to the JSONL file containing Probing Directives  |
 | `--issuance-rate`           | `1.0`            | Target PD issuance rate in PDs per second             |
 | `--impact-threshold`        | `1.0`            | Maximum directives allowed to impact a single address |
