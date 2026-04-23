@@ -18,7 +18,7 @@ import (
 
 // agentKeepalivePeriod is the interval between TCP keepalive probes
 // for agent connections.
-const agentKeepalivePeriod = 1 * time.Second
+const agentKeepalivePeriod = 10 * time.Second
 
 type agentAuthStatus struct {
 	agentID       string
