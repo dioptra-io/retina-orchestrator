@@ -25,6 +25,7 @@ func TestNewMetrics_WithRegistry(t *testing.T) {
 		t.Fatal("expected non-nil Metrics")
 	}
 
+	// NOTE: If a new metric is added to Metrics, add a corresponding nil check here.
 	if m.AgentsConnected == nil {
 		t.Error("expected AgentsConnected to be non-nil")
 	}
@@ -73,7 +74,7 @@ func TestNewMetrics_WithRegistry(t *testing.T) {
 }
 
 func TestNewMetrics_DefaultRegistry(t *testing.T) {
-	if !testing.Short() {
+	if testing.Short() {
 		t.Skip("skipping: registers global metrics")
 	}
 	m := NewMetrics(prometheus.DefaultRegisterer)
@@ -181,7 +182,4 @@ func TestMetrics_Histogram(t *testing.T) {
 
 	m.CycleDurationSeconds.Observe(0.5)
 	m.StreamLagSeconds.Observe(0.1)
-
-	m.CycleDurationSeconds.(prometheus.Histogram).Observe(0.5)
-	m.StreamLagSeconds.(prometheus.Histogram).Observe(0.1)
 }
