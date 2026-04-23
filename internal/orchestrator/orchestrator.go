@@ -27,7 +27,7 @@ type Config struct {
 
 	// PDQueueSize is the number of PDs that can be queued per agent.
 	// Increase this value if agents are slow to consume directives.
-	PDQueueSize uint64
+	PDQueueSize int
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
 	APIAddress string
@@ -136,7 +136,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.agentServer = agentServer
 
-	pdQueue, err := structures.NewQueue[api.ProbingDirective](100)
+	pdQueue, err := structures.NewQueue[api.ProbingDirective](config.PDQueueSize)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating pd queue: %w", err)
 	}

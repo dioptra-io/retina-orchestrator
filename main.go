@@ -37,7 +37,7 @@ func run() error {
 	var (
 		apiAddr              = flag.String("api-addr", envOrDefault("RETINA_API_ADDR", "localhost:8080"), "Listening address for the HTTP API server")
 		agentAddr            = flag.String("agent-addr", envOrDefault("RETINA_AGENT_ADDR", "localhost:50050"), "Listening address for agent connections")
-		pdQueueSize          = flag.Uint64("pd-queue-size", envOrDefaultUInt64("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
+		pdQueueSize          = flag.Int("pd-queue-size", envOrDefaultInt("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
 		pdPath               = flag.String("pd-path", envOrDefault("RETINA_PD_PATH", ""), "Path to the probing directives file")
 		issuanceRate         = flag.Float64("issuance-rate", envOrDefaultFloat64("RETINA_ISSUANCE_RATE", 1.0), "Target global issuance rate of probing directives (PDs per second, approximate)")
 		impactThreshold      = flag.Float64("impact-threshold", envOrDefaultFloat64("RETINA_IMPACT_THRESHOLD", 1.0), "Maximum impact threshold per address for the responsible probing algorithm")
@@ -158,6 +158,18 @@ func envOrDefaultUInt64(key string, def uint64) uint64 {
 			os.Exit(1)
 		}
 		return i
+	}
+	return def
+}
+
+func envOrDefaultInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
+			os.Exit(1)
+		}
+		return int(i)
 	}
 	return def
 }
