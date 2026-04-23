@@ -67,6 +67,7 @@ func run() error {
 	orch, err := orchestrator.NewOrch(&orchestrator.Config{
 		AgentAddress:         *agentAddr,
 		PDQueueSize:          *pdQueueSize,
+		RingBufferSize:       *ringBufferSize,
 		AgentBufferLength:    defaultAgentBufferLength,
 		APIAddress:           *apiAddr,
 		APIReadHeaderTimeout: *apiReadHeaderTimeout,

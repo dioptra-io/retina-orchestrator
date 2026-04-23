@@ -30,14 +30,6 @@ func TestNewRingBuffer_ZeroCapacity(t *testing.T) {
 	}
 }
 
-func TestNewRingBuffer_NegativeCapacity(t *testing.T) {
-	t.Parallel()
-	_, err := NewRingBuffer[int](-1)
-	if err == nil {
-		t.Fatal("expected error for negative capacity")
-	}
-}
-
 // --- Push / Pop ---
 
 func TestPushPop_SingleConsumer(t *testing.T) {

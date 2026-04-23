@@ -121,3 +121,20 @@ func (q *Queue[T]) Push(ctx context.Context, id string, item *T) error {
 		return nil
 	}
 }
+
+// TryPush attempts to send an element to a specific consumer without blocking.
+// Returns an error if the consumer is not registered or the buffer is full.
+func (q *Queue[T]) TryPush(id string, item *T) error {
+	q.mu.Lock()
+	consumer, ok := q.consumers[id]
+	q.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("consumer not registered")
+	}
+	select {
+	case consumer.ch <- item:
+		return nil
+	default:
+		return fmt.Errorf("consumer buffer full")
+	}
+}
