@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Dioptra
+// Copyright (c) 2026 Sorbonne Université
 // SPDX-License-Identifier: MIT
 
 package orchestrator
