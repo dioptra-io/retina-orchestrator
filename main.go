@@ -75,6 +75,7 @@ func run() error {
 		IssuanceRate:         *issuanceRate,
 		Seed:                 *seed,
 		ImpactThreshold:      *impactThreshold,
+		FIEFilterPolicy:      *fieFilterPolicy,
 		Secret:               secret,
 	}, logger, metrics)
 	if err != nil {
