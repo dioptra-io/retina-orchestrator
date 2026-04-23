@@ -59,6 +59,7 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--api-addr`                | `localhost:8080` | TCP address for the HTTP API server (host:port)       |
 | `--agent-addr`              | `localhost:50050`| TCP address for agent connections (host:port)         |
 | `--pd-queue-size`           | `100`            | Size of the per-agent PD queue buffer                 |
+| `--ring-buffer-size`        | `100`            | Size of the ring buffer                               |
 | `--pd-path`                 | `""`             | Path to the JSONL file containing Probing Directives  |
 | `--issuance-rate`           | `1.0`            | Target PD issuance rate in PDs per second             |
 | `--impact-threshold`        | `1.0`            | Maximum directives allowed to impact a single address |
@@ -68,11 +69,30 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--log-level`               | `info`           | Log level (`debug`, `info`, `warn`, `error`)          |
 | `--fie-filter-policy`       | `both`           | FIE filtering policy: `any`, `one`, or `both` (controls which FIEs are streamed) |
 
-## Environment
 
-| Variable        | Description                            |
-| --------------- | -------------------------------------- |
-| `RETINA_SECRET` | Shared secret for agent authentication |
+## Environment Variables
+
+All flags can be configured via environment variables. These act as defaults and are overridden by CLI flags.
+
+Precedence:
+
+```
+CLI flags > environment variables > hardcoded defaults
+```
+
+| Variable                         | Default           | Description                                          |
+| -------------------------------- | ----------------- | ---------------------------------------------------- |
+| `RETINA_SECRET`                  | *                 | Shared secret for agent authentication, required     |
+| `RETINA_API_ADDR`                | `localhost:8080`  | TCP address for the HTTP API server                  |
+| `RETINA_AGENT_ADDR`              | `localhost:50050` | TCP address for agent connections                    |
+| `RETINA_PD_QUEUE_SIZE`           | `100`             | Size of the per-agent PD queue buffer                |
+| `RETINA_PD_PATH`                 | `""`              | Path to the JSONL file containing Probing Directives |
+| `RETINA_ISSUANCE_RATE`           | `1.0`             | Target PD issuance rate in PDs per second            |
+| `RETINA_IMPACT_THRESHOLD`        | `1.0`             | Maximum directives allowed per address               |
+| `RETINA_SEED`                    | `42`              | Seed for the random scheduler                        |
+| `RETINA_API_READ_HEADER_TIMEOUT` | `5s`              | Timeout for reading HTTP request headers             |
+| `RETINA_METRICS_ADDR`            | `:9312`           | Address to expose Prometheus metrics on              |
+| `RETINA_LOG_LEVEL`               | `info`            | Log level (`debug`, `info`, `warn`, `error`)         |
 
 ## Behavior
 

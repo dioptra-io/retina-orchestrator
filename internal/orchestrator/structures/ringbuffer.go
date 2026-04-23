@@ -13,7 +13,7 @@ import (
 // All methods on ringConsumer must be called from the same goroutine.
 type ringConsumer[T any] struct {
 	rb           *RingBuffer[T]
-	tail         uint
+	tail         uint64
 	seq          uint64
 	totalSkipped atomic.Uint64
 }
@@ -88,14 +88,14 @@ func (rbc *ringConsumer[T]) Skipped() uint64 {
 type RingBuffer[T any] struct {
 	mutex     *sync.Mutex
 	cond      *sync.Cond
-	head      uint
+	head      uint64
 	buffer    []*T
-	capacity  uint
+	capacity  uint64
 	consumers map[*ringConsumer[T]]struct{}
 }
 
 // NewRingBuffer creates a new RingBuffer with the given capacity.
-func NewRingBuffer[T any](capacity int) (*RingBuffer[T], error) {
+func NewRingBuffer[T any](capacity uint64) (*RingBuffer[T], error) {
 	if capacity <= 0 {
 		return nil, fmt.Errorf("invalid argument: capacity must be greater than zero")
 	}
@@ -103,7 +103,7 @@ func NewRingBuffer[T any](capacity int) (*RingBuffer[T], error) {
 	return &RingBuffer[T]{
 		mutex:     mu,
 		buffer:    make([]*T, capacity),
-		capacity:  uint(capacity),
+		capacity:  capacity,
 		consumers: make(map[*ringConsumer[T]]struct{}),
 		cond:      sync.NewCond(mu),
 	}, nil

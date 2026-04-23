@@ -28,7 +28,7 @@ type Config struct {
 
 	// PDQueueSize is the number of PDs that can be queued per agent.
 	// Increase this value if agents are slow to consume directives.
-	PDQueueSize uint64
+	PDQueueSize int
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
 	APIAddress string
@@ -57,6 +57,9 @@ func (c *Config) Validate() error {
 	}
 	if c.PDQueueSize <= 0 {
 		return fmt.Errorf("PDQueueSize must be greater than zero: got %d", c.PDQueueSize)
+	}
+	if c.RingBufferSize <= 0 {
+		return fmt.Errorf("RingBufferSize must be greater than zero: got %d", c.RingBufferSize)
 	}
 	if c.AgentBufferLength < 8192 {
 		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
@@ -144,13 +147,13 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.agentServer = agentServer
 
-	pdQueue, err := structures.NewQueue[api.ProbingDirective](100)
+	pdQueue, err := structures.NewQueue[api.ProbingDirective](config.PDQueueSize)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating pd queue: %w", err)
 	}
 	o.pdQueue = pdQueue
 
-	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](100)
+	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](config.RingBufferSize)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating ring buffer: %w", err)
 	}
@@ -187,7 +190,7 @@ func (o *orch) runScheduler(ctx context.Context) error {
 			continue
 		}
 
-		if err := o.pdQueue.Push(ctx, pd.AgentID, pd); err != nil {
+		if err := o.pdQueue.TryPush(pd.AgentID, pd); err != nil {
 			o.logger.Debug("PD dropped: no queue for agent",
 				slog.String("agent_id", pd.AgentID),
 				slog.Uint64("pd_id", pd.ProbingDirectiveID))
