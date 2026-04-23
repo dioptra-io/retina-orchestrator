@@ -73,7 +73,10 @@ func (c *Config) Validate() error {
 	if c.ImpactThreshold <= 0 {
 		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
 	}
-	if slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
+	if c.FIEFilterPolicy == "" {
+		c.FIEFilterPolicy = "both"
+	}
+	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
 		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
 	}
 	if c.APIReadHeaderTimeout == 0 {
@@ -351,7 +354,6 @@ func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
 // filterFIE reports whether a FIE should be streamed based on the policy.
 // Returns true if the FIE is allowed.
 func (o *orch) filterFIE(fie *api.ForwardingInfoElement) (bool, error) {
-	// FIE streaming is determined by the flag --fie-filter-policy
 	switch o.config.FIEFilterPolicy {
 	case "any": // allow all FIEs
 		return true, nil
