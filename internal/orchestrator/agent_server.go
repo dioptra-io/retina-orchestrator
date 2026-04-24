@@ -20,6 +20,11 @@ import (
 // for agent connections.
 const agentKeepalivePeriod = 10 * time.Second
 
+// agentSendTimeout is the deadline for sending a probing directive to an agent.
+// Without a deadline, a dead agent will block the sender goroutine indefinitely
+// once the TCP send buffer fills up
+const agentSendTimeout = 5 * time.Second
+
 type agentAuthStatus struct {
 	agentID       string
 	remoteAddress net.Addr
@@ -261,7 +266,7 @@ func (s *agentStream) context() context.Context {
 }
 
 func (s *agentStream) sendPD(e *api.ProbingDirective) error {
-	return send(s.conn, s.encoder, 0, e)
+	return send(s.conn, s.encoder, agentSendTimeout, e)
 }
 
 func (s *agentStream) receiveFIE() (*api.ForwardingInfoElement, error) {
