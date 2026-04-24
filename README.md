@@ -67,7 +67,7 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--api-read-header-timeout` | `5s`             | Timeout for reading HTTP request headers              |
 | `--metrics-addr`            | `:9312`          | Address to expose Prometheus metrics on              |
 | `--log-level`               | `info`           | Log level (`debug`, `info`, `warn`, `error`)          |
-| `--fie-filter-policy`       | `both`           | FIE filtering policy: `any`, `one`, or `both` (controls which FIEs are streamed) |
+| `--fie-filter-policy`       | `both`           | FIE filtering policy: `any`, `one`, or `both` (controls which FIEs are streamed, checks the response addresses) |
 
 
 ## Environment Variables
@@ -86,6 +86,7 @@ CLI flags > environment variables > hardcoded defaults
 | `RETINA_API_ADDR`                | `localhost:8080`  | TCP address for the HTTP API server                  |
 | `RETINA_AGENT_ADDR`              | `localhost:50050` | TCP address for agent connections                    |
 | `RETINA_PD_QUEUE_SIZE`           | `100`             | Size of the per-agent PD queue buffer                |
+| `RETINA_RING_BUFFER_SIZE`        | `100`             | Size of the ring buffer used in streaming FIEs       |
 | `RETINA_PD_PATH`                 | `""`              | Path to the JSONL file containing Probing Directives |
 | `RETINA_ISSUANCE_RATE`           | `1.0`             | Target PD issuance rate in PDs per second            |
 | `RETINA_IMPACT_THRESHOLD`        | `1.0`             | Maximum directives allowed per address               |
@@ -93,6 +94,7 @@ CLI flags > environment variables > hardcoded defaults
 | `RETINA_API_READ_HEADER_TIMEOUT` | `5s`              | Timeout for reading HTTP request headers             |
 | `RETINA_METRICS_ADDR`            | `:9312`           | Address to expose Prometheus metrics on              |
 | `RETINA_LOG_LEVEL`               | `info`            | Log level (`debug`, `info`, `warn`, `error`)         |
+| `RETINA_FIE_FILTER_POLICY`       | `both`            | Filtering policy for FIEs (`any`, `one`, `both`)     |
 
 ## Behavior
 
