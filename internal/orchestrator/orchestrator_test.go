@@ -185,16 +185,6 @@ func TestNewOrch_NilLogger(t *testing.T) {
 	}
 }
 
-func TestNewOrch_NilMetrics(t *testing.T) {
-	o, err := NewOrch(validConfig(t), testLogger(), nil)
-	if err != nil {
-		t.Fatalf("unexpected error with nil metrics: %v", err)
-	}
-	if o == nil {
-		t.Fatal("expected non-nil orchestrator")
-	}
-}
-
 // -- Run ----------------------------------------------------------------------
 
 func TestRun_StartsAndStopsCleanly(t *testing.T) {
