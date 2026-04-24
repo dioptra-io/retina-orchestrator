@@ -1,6 +1,11 @@
 // Copyright (c) 2025 Sorbonne Université
 // SPDX-License-Identifier: MIT
 
+// @title			IP Routes Live API
+// @version			1.0
+// @description		Streams forwarding info elements from connected Retina agents.
+// @host			iprl.dioptra.io
+// @BasePath		/
 package main
 
 import (
