@@ -337,6 +337,12 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 		}
 	})
 
+	group.Go(func() error {
+		<-ctx.Done()
+		_ = s.conn.Close()
+		return nil
+	})
+
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
 		o.logger.Error("Agent stream failed", "agent_id", status.agentID, "err", err)
 	}
