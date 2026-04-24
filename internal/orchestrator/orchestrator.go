@@ -28,7 +28,8 @@ type Config struct {
 
 	// PDQueueSize is the number of PDs that can be queued per agent.
 	// Increase this value if agents are slow to consume directives.
-	PDQueueSize int
+	PDQueueSize    int
+	RingBufferSize int
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
 	APIAddress string
@@ -271,6 +272,7 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 	}
 }
 
+//nolint:funlen
 func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 	consumer, err := o.pdQueue.NewConsumer(status.agentID)
 	if err != nil {
