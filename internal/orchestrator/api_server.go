@@ -226,15 +226,14 @@ type sseClient struct {
 }
 
 func (s *sseClient) sendEvent(event *SSEEvent) error {
-	data, err := json.Marshal(event.Data)
+	data, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("failed to marshal event data: %w", err)
+		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	// SSE format: event: <type>\ndata: <data>\n\n
-	_, err = fmt.Fprintf(s.writer, "event: %s\ndata: %s\n\n", event.Type, data)
+	_, err = s.writer.Write(append(data, '\n'))
 	if err != nil {
-		return fmt.Errorf("failed to write SSE event: %w", err)
+		return fmt.Errorf("failed to write event: %w", err)
 	}
 	s.writer.(*sseResponseWriter).flusher.Flush()
 	return nil

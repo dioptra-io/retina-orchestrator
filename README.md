@@ -4,6 +4,7 @@
 
 ### Features in this branch
 
+- SSE endpoint now streams plain JSON (single-line) instead of SSE-formatted events.
 - SSE endpoint used for streaming the events in the orchestrator.
 - `--max-cycles` flag determines the maximum number of cycles the orchestrator is going to run.
 - `--fie-filter-policy` flag defaults to `any` (instead of `both`) to stream FIEs with any response address.
