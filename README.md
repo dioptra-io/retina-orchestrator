@@ -1,3 +1,14 @@
+# ⚠️ Research Branch
+
+**This is a research branch.** The features implemented here might not be available in the upcoming releases of Retina.
+
+### Features in this branch
+
+- SSE endpoint used for streaming the events in the orchestrator.
+- `--max-cycles` flag determines the maximum number of cycles the orchestrator is going to run.
+
+---
+
 # retina-orchestrator
 
 `retina-orchestrator` schedules Probing Directives (PDs) to connected agents, collects the resulting Forwarding Info Elements (FIEs), and streams them to HTTP clients.
