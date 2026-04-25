@@ -91,7 +91,7 @@ All flags can also be set via environment variables (e.g., `--api-addr` → `RET
 | `--impact-threshold` | `1.0` | Max directives per address (responsible probing) |
 | `--max-cycles` | `0 (unlimited)` | Maximum cycles (0 = indefinite) |
 | `--seed` | `42` | Randomizer seed |
-| `--fie-filter-policy` | `both` | FIE filtering: `any`, `one`, or `both` |
+| `--fie-filter-policy` | `any` | FIE filtering: `any`, `one`, or `both` |
 | `--log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 | `--metrics-addr` | `:9312` | Prometheus metrics endpoint |
 
@@ -134,3 +134,18 @@ go test ./internal/orchestrator -v
 - This is currently a **research branch** - features may change
 - Code has linting (golangci-lint) and formatting checks in CI
 - Uses `slog` for structured logging
+
+## Commit Message Conventions
+
+Use the following format for commit messages:
+
+```
+change: <short description of what was changed>
+```
+
+Examples:
+- `change: remove the line in my file`
+- `change: add new flag for max cycles`
+- `change: fix bug in scheduler logic`
+
+Keep descriptions concise and in lowercase.
