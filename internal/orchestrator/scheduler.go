@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -41,6 +42,8 @@ type Scheduler struct {
 	logger  *slog.Logger
 	mutex   sync.Mutex
 	metrics *Metrics
+	// eventBuffer is the ring buffer for SSE events.
+	eventBuffer *structures.RingBuffer[SSEEvent]
 	// pdMap maps each ProbingDirective ID to its scheduling state, which holds
 	// the directive itself, its issuance probability, and last hit addresses.
 	pdMap map[uint64]*pdState
@@ -57,13 +60,15 @@ type Scheduler struct {
 	random *rand.Rand
 	// maxCycles is the maximum allowed cycle count, 0 means indefinite.
 	maxCycles int
+	// issuedThisCycle counts the directives issued in the current cycle.
+	issuedThisCycle int
 }
 
 // NewScheduler creates a new Scheduler from the given seed, issuance rate, and
 // path to the probing directives file.
 // Returns an error if the file cannot be read, issuanceRate is <= 0, or the
 // file contains no directives.
-func NewScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles int, logger *slog.Logger, metrics *Metrics) (*Scheduler, error) {
+func NewScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles int, logger *slog.Logger, metrics *Metrics, eventBuffer *structures.RingBuffer[SSEEvent]) (*Scheduler, error) {
 	if issuanceRate <= 0.0 {
 		return nil, fmt.Errorf("invalid arguments: issuance rate cannot be zero or negative")
 	}
@@ -109,6 +114,7 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles in
 	return &Scheduler{
 		logger:         logger,
 		metrics:        metrics,
+		eventBuffer:    eventBuffer,
 		pdMap:          pdMap,
 		impactRecords:  make(map[string]*impactRecord),
 		issuancePeriod: time.Duration(float64(time.Second) / issuanceRate),
@@ -149,12 +155,26 @@ func (s *Scheduler) NextPD() (*api.ProbingDirective, error) {
 		if !s.lastCycleBegin.IsZero() {
 			cycleDuration := time.Since(s.lastCycleBegin)
 			s.metrics.CycleDurationSeconds.Observe(float64(cycleDuration.Seconds()))
+			// Publish CycleFinished event
+			s.publishEvent(SSEEvent{
+				Type:      SSEEventCycleFinished,
+				Timestamp: time.Now(),
+				Data:      CycleFinishedData{Cycle: oldCycle, Issued: s.issuedThisCycle},
+			})
 		}
 		s.lastCycleBegin = time.Now()
+		s.issuedThisCycle = 0
 		s.metrics.CyclesTotal.Inc()
+		// Publish CycleStarted event
+		s.publishEvent(SSEEvent{
+			Type:      SSEEventCycleStarted,
+			Timestamp: time.Now(),
+			Data:      CycleStartedData{Cycle: newCycle},
+		})
 	}
 
 	if s.random.Float64() < issuanceProb {
+		s.issuedThisCycle++
 		return pd.directive, nil
 	}
 	s.metrics.PDsSkippedTotal.Inc()
@@ -230,6 +250,13 @@ func (s *Scheduler) recordImpact(address net.IP, pd *pdState) {
 		s.impactRecords[key] = record
 	}
 	record.pds[pd.directive.ProbingDirectiveID] = pd
+}
+
+// publishEvent sends an SSE event to the event buffer if available.
+func (s *Scheduler) publishEvent(event SSEEvent) {
+	if s.eventBuffer != nil {
+		s.eventBuffer.Push(&event)
+	}
 }
 
 // removeImpact removes the given PD from the impact record of the specified

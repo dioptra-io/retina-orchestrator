@@ -46,13 +46,13 @@ type AgentDisconnectedData struct {
 
 // CycleStartedData is the payload for CycleStarted events.
 type CycleStartedData struct {
-	Cycle uint64 `json:"cycle"`
+	Cycle int `json:"cycle"`
 }
 
 // CycleFinishedData is the payload for CycleFinished events.
 type CycleFinishedData struct {
-	Cycle  uint64 `json:"cycle"`
-	Issued uint64 `json:"issued"`
+	Cycle  int `json:"cycle"`
+	Issued int `json:"issued"`
 }
 
 // MarshalJSON implements json.Marshaler for SSEEvent.
