@@ -140,12 +140,21 @@ go test ./internal/orchestrator -v
 Use the following format for commit messages:
 
 ```
-change: <short description of what was changed>
+<word><optional context in pharanthesis>: <short description of what was changed>
 ```
 
 Examples:
 - `change: remove the line in my file`
-- `change: add new flag for max cycles`
 - `change: fix bug in scheduler logic`
+- `add: new flag for determining pdQueue size`
+- `feat(metrics): add agent queue size metric`
+- `scheduler: avoid sleep granularity issues with busy-wait for sub-10ms issuance periods`
+- `feat(orchestrator): add Prometheus metrics instrumentation`
+- `ci: add test and docker build workflow`
+- `add Dockerfile for containerized deployment`
+- `refactor: clean up orchestrator tooling, docs, and test data`
+- `test: improve orchestrator coverage`
+- `refactor: unexport apiServer types and methods`
+- `fix: update swag command and dependencies; suppress G118 false positive`
 
 Keep descriptions concise and in lowercase.
