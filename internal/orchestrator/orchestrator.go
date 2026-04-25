@@ -36,6 +36,7 @@ type Config struct {
 	// APIReadHeaderTimeout defaults to 5 seconds if zero.
 	APIReadHeaderTimeout time.Duration
 
+	MaxCycles       uint64
 	FIEFilterPolicy string
 	PDPath          string
 	Seed            uint64
@@ -120,7 +121,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		metrics: metrics,
 	}
 
-	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, logger.With("component", "scheduler"), metrics)
+	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, config.MaxCycles, logger.With("component", "scheduler"), metrics)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
@@ -186,7 +187,10 @@ func (o *orch) runScheduler(ctx context.Context) error {
 		default:
 		}
 
-		pd := o.scheduler.NextPD()
+		pd, err := o.scheduler.NextPD()
+		if err != nil {
+			return fmt.Errorf("cannot get the next PD: %w", err)
+		}
 		if pd == nil {
 			continue
 		}

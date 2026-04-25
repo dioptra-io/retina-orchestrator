@@ -55,13 +55,15 @@ type Scheduler struct {
 	randomizer     *randomizer
 	// random is used for the Bernoulli experiment in NextPD.
 	random *rand.Rand
+	// maxCycles is the maximum allowed cycle count, 0 means indefinite.
+	maxCycles uint64
 }
 
 // NewScheduler creates a new Scheduler from the given seed, issuance rate, and
 // path to the probing directives file.
 // Returns an error if the file cannot be read, issuanceRate is <= 0, or the
 // file contains no directives.
-func NewScheduler(seed uint64, issuanceRate float64, pdFile string, logger *slog.Logger, metrics *Metrics) (*Scheduler, error) {
+func NewScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles uint64, logger *slog.Logger, metrics *Metrics) (*Scheduler, error) {
 	if issuanceRate <= 0.0 {
 		return nil, fmt.Errorf("invalid arguments: issuance rate cannot be zero or negative")
 	}
@@ -109,17 +111,22 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string, logger *slog
 		issuancePeriod: time.Duration(float64(time.Second) / issuanceRate),
 		randomizer:     randomizer,
 		random:         rand.New(rand.NewPCG(seed, 0)), // #nosec G404
+		maxCycles:      maxCycles,
 	}, nil
 }
 
 // NextPD returns the next ProbingDirective candidate. It blocks until the
 // rate limit allows the next issuance, then runs a Bernoulli experiment to
 // decide whether to return or skip the directive. Returns nil if skipped.
-func (s *Scheduler) NextPD() *api.ProbingDirective {
+func (s *Scheduler) NextPD() (*api.ProbingDirective, error) {
 	s.mutex.Lock()
 	oldCycle := s.randomizer.Cycle()
 	pd := s.pdMap[s.randomizer.Next()]
 	newCycle := s.randomizer.Cycle()
+	if s.maxCycles != 0 && newCycle == int(s.maxCycles) {
+		// this means we exceeded the cycle count.
+		return nil, fmt.Errorf("exceeded --max-cycles stopping: %d", s.maxCycles)
+	}
 	nextTime := s.lastIssuance.Add(s.issuancePeriod)
 	issuanceProb := pd.issuanceProb
 	s.mutex.Unlock()
@@ -145,13 +152,13 @@ func (s *Scheduler) NextPD() *api.ProbingDirective {
 	}
 
 	if s.random.Float64() < issuanceProb {
-		return pd.directive
+		return pd.directive, nil
 	}
 	s.metrics.PDsSkippedTotal.Inc()
 	s.logger.Debug("PD skipped",
 		slog.Uint64("pd_id", pd.directive.ProbingDirectiveID),
 		slog.Float64("issuance_prob", issuanceProb))
-	return nil
+	return nil, nil
 }
 
 // UpdateFromFIE adjusts the issuance probability of a directive based on an

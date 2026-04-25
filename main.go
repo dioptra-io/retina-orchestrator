@@ -48,6 +48,7 @@ func run() error {
 		pdPath               = flag.String("pd-path", envOrDefault("RETINA_PD_PATH", ""), "Path to the probing directives file")
 		issuanceRate         = flag.Float64("issuance-rate", envOrDefaultFloat64("RETINA_ISSUANCE_RATE", 1.0), "Target global issuance rate of probing directives (PDs per second, approximate)")
 		impactThreshold      = flag.Float64("impact-threshold", envOrDefaultFloat64("RETINA_IMPACT_THRESHOLD", 1.0), "Maximum impact threshold per address for the responsible probing algorithm")
+		maxCycles            = flag.Uint64("max-cycles", envOrDefaultUInt64("RETINA_MAX_CYCLES", 0), "Maximum cycles the orchestrator is going to run, o for indefinite")
 		seed                 = flag.Uint64("seed", envOrDefaultUInt64("RETINA_SEED", 42), "Seed for the randomizer")
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", envOrDefaultDuration("RETINA_API_READ_HEADER_TIMEOUT", 5*time.Second), "Timeout for reading HTTP request headers")
 		fieFilterPolicy      = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", ""), "Path to the probing directives file")
@@ -81,8 +82,9 @@ func run() error {
 		APIReadHeaderTimeout: *apiReadHeaderTimeout,
 		PDPath:               *pdPath,
 		IssuanceRate:         *issuanceRate,
-		Seed:                 *seed,
 		ImpactThreshold:      *impactThreshold,
+		MaxCycles:            *maxCycles,
+		Seed:                 *seed,
 		FIEFilterPolicy:      *fieFilterPolicy,
 		Secret:               secret,
 	}, logger, metrics)
