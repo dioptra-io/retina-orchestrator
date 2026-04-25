@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 // @title			IP Routes Live API
-// @version			1.0
-// @description		Streams forwarding info elements from connected Retina agents.
+// @version		1.0
+// @description	Streams forwarding info elements from connected Retina agents.
 // @host			iprl.dioptra.io
 // @BasePath		/
 package main
@@ -48,9 +48,10 @@ func run() error {
 		pdPath               = flag.String("pd-path", envOrDefault("RETINA_PD_PATH", ""), "Path to the probing directives file")
 		issuanceRate         = flag.Float64("issuance-rate", envOrDefaultFloat64("RETINA_ISSUANCE_RATE", 1.0), "Target global issuance rate of probing directives (PDs per second, approximate)")
 		impactThreshold      = flag.Float64("impact-threshold", envOrDefaultFloat64("RETINA_IMPACT_THRESHOLD", 1.0), "Maximum impact threshold per address for the responsible probing algorithm")
+		maxCycles            = flag.Int("max-cycles", envOrDefaultInt("RETINA_MAX_CYCLES", 0), "Maximum cycles the orchestrator is going to run, o for indefinite")
 		seed                 = flag.Uint64("seed", envOrDefaultUInt64("RETINA_SEED", 42), "Seed for the randomizer")
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", envOrDefaultDuration("RETINA_API_READ_HEADER_TIMEOUT", 5*time.Second), "Timeout for reading HTTP request headers")
-		fieFilterPolicy      = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", ""), "Path to the probing directives file")
+		fieFilterPolicy      = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", "any"), "FIE filtering policy: any, one, or both")
 		logLevel             = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 		metricsAddr          = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
 	)
@@ -81,8 +82,9 @@ func run() error {
 		APIReadHeaderTimeout: *apiReadHeaderTimeout,
 		PDPath:               *pdPath,
 		IssuanceRate:         *issuanceRate,
-		Seed:                 *seed,
 		ImpactThreshold:      *impactThreshold,
+		MaxCycles:            *maxCycles,
+		Seed:                 *seed,
 		FIEFilterPolicy:      *fieFilterPolicy,
 		Secret:               secret,
 	}, logger, metrics)
