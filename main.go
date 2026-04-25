@@ -51,7 +51,7 @@ func run() error {
 		maxCycles            = flag.Uint64("max-cycles", envOrDefaultUInt64("RETINA_MAX_CYCLES", 0), "Maximum cycles the orchestrator is going to run, o for indefinite")
 		seed                 = flag.Uint64("seed", envOrDefaultUInt64("RETINA_SEED", 42), "Seed for the randomizer")
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", envOrDefaultDuration("RETINA_API_READ_HEADER_TIMEOUT", 5*time.Second), "Timeout for reading HTTP request headers")
-		fieFilterPolicy      = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", ""), "Path to the probing directives file")
+		fieFilterPolicy      = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", "any"), "FIE filtering policy: any, one, or both")
 		logLevel             = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 		metricsAddr          = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
 	)

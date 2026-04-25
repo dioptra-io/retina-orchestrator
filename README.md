@@ -6,6 +6,7 @@
 
 - SSE endpoint used for streaming the events in the orchestrator.
 - `--max-cycles` flag determines the maximum number of cycles the orchestrator is going to run.
+- `--fie-filter-policy` flag defaults to `any` (instead of `both`) to stream FIEs with any response address.
 
 ---
 
@@ -78,7 +79,7 @@ RETINA_SECRET=mysecret ./retina-orchestrator \
 | `--api-read-header-timeout` | `5s`             | Timeout for reading HTTP request headers              |
 | `--metrics-addr`            | `:9312`          | Address to expose Prometheus metrics on              |
 | `--log-level`               | `info`           | Log level (`debug`, `info`, `warn`, `error`)          |
-| `--fie-filter-policy`       | `both`           | FIE filtering policy: `any`, `one`, or `both` (controls which FIEs are streamed, checks the response addresses) |
+| `--fie-filter-policy`       | `any`            | FIE filtering policy: `any`, `one`, or `both` (controls which FIEs are streamed, checks the response addresses) |
 
 
 ## Environment Variables
@@ -105,7 +106,7 @@ CLI flags > environment variables > hardcoded defaults
 | `RETINA_API_READ_HEADER_TIMEOUT` | `5s`              | Timeout for reading HTTP request headers             |
 | `RETINA_METRICS_ADDR`            | `:9312`           | Address to expose Prometheus metrics on              |
 | `RETINA_LOG_LEVEL`               | `info`            | Log level (`debug`, `info`, `warn`, `error`)         |
-| `RETINA_FIE_FILTER_POLICY`       | `both`            | Filtering policy for FIEs (`any`, `one`, `both`)     |
+| `RETINA_FIE_FILTER_POLICY`       | `any`            | Filtering policy for FIEs (`any`, `one`, `both`)     |
 
 ## Behavior
 
