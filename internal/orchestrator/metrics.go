@@ -31,6 +31,12 @@ type Metrics struct {
 	StreamDisconnectionsTotal *prometheus.CounterVec
 	FIEsStreamedTotal         prometheus.Counter
 	StreamLagSeconds          prometheus.Histogram
+
+	// SSE endpoint
+	SSEClientsConnected    prometheus.Gauge
+	SSEConnectionsTotal    prometheus.Counter
+	SSEDisconnectionsTotal *prometheus.CounterVec
+	SSEEventsTotal         *prometheus.CounterVec
 }
 
 // NewMetrics creates and registers all orchestrator metrics with the given registry.
@@ -107,5 +113,23 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 			Help:    "Time between receiving a FIE from an agent and delivering it to streaming clients.",
 			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
 		}),
+
+		// SSE endpoint
+		SSEClientsConnected: factory.NewGauge(prometheus.GaugeOpts{
+			Name: "retina_orchestrator_sse_clients_connected",
+			Help: "Number of currently active SSE clients.",
+		}),
+		SSEConnectionsTotal: factory.NewCounter(prometheus.CounterOpts{
+			Name: "retina_orchestrator_sse_connections_total",
+			Help: "Total number of SSE connections opened.",
+		}),
+		SSEDisconnectionsTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_sse_disconnections_total",
+			Help: "Total number of SSE disconnections, labelled by reason.",
+		}, []string{"reason"}),
+		SSEEventsTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_sse_events_total",
+			Help: "Total number of SSE events published, labelled by event type.",
+		}, []string{"event_type"}),
 	}
 }

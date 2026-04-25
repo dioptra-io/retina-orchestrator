@@ -36,7 +36,7 @@ type Config struct {
 	// APIReadHeaderTimeout defaults to 5 seconds if zero.
 	APIReadHeaderTimeout time.Duration
 
-	MaxCycles       uint64
+	MaxCycles       int
 	FIEFilterPolicy string
 	PDPath          string
 	Seed            uint64
@@ -92,18 +92,21 @@ func (c *Config) Validate() error {
 }
 
 type orch struct {
-	config      *Config
-	logger      *slog.Logger
-	metrics     *Metrics
-	scheduler   *Scheduler
-	agentServer *agentServer
-	apiServer   *apiServer
-	pdQueue     *structures.Queue[api.ProbingDirective]
-	ringBuffer  *structures.RingBuffer[api.ForwardingInfoElement]
+	config          *Config
+	logger          *slog.Logger
+	metrics         *Metrics
+	scheduler       *Scheduler
+	agentServer     *agentServer
+	apiServer       *apiServer
+	pdQueue         *structures.Queue[api.ProbingDirective]
+	fieRingBuffer   *structures.RingBuffer[api.ForwardingInfoElement]
+	eventRingBuffer *structures.RingBuffer[SSEEvent]
 }
 
 // NewOrch creates a new orchestrator from the given configuration. Returns an
 // error if the configuration is invalid or any component creation fails.
+//
+//nolint:funlen
 func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, error) {
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
@@ -127,16 +130,6 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.scheduler = scheduler
 
-	apiServer, err := newAPIServer(&apiServerConfig{
-		address:           config.APIAddress,
-		readHeaderTimeout: config.APIReadHeaderTimeout,
-		fieHandler:        o.fieStreamHandler,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error on creating API server: %w", err)
-	}
-	o.apiServer = apiServer
-
 	agentServer, err := newAgentServer(&agentServerConfig{
 		bufferLength:     config.AgentBufferLength,
 		handshakeTimeout: 5 * time.Second,
@@ -159,7 +152,25 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	if err != nil {
 		return nil, fmt.Errorf("error on creating ring buffer: %w", err)
 	}
-	o.ringBuffer = ringBuffer
+	o.fieRingBuffer = ringBuffer
+
+	eventBuffer, err := structures.NewRingBuffer[SSEEvent](256)
+	if err != nil {
+		return nil, fmt.Errorf("error on creating event buffer: %w", err)
+	}
+	o.eventRingBuffer = eventBuffer
+
+	apiServer, err := newAPIServer(&apiServerConfig{
+		address:           config.APIAddress,
+		readHeaderTimeout: config.APIReadHeaderTimeout,
+		fieHandler:        o.fieStreamHandler,
+		sseHandler:        o.sseStreamHandler,
+		eventBuffer:       eventBuffer,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error on creating API server: %w", err)
+	}
+	o.apiServer = apiServer
 
 	return o, nil
 }
@@ -237,7 +248,7 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 
 func (o *orch) fieStreamHandler(s *fieClient) {
 	var closeReason string
-	consumer := o.ringBuffer.NewConsumer()
+	consumer := o.fieRingBuffer.NewConsumer()
 	o.metrics.StreamClientsConnected.Inc()
 	o.metrics.StreamConnectionsTotal.Inc()
 	defer func() {
@@ -273,6 +284,42 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 		}
 		o.metrics.FIEsStreamedTotal.Inc()
 		o.metrics.StreamLagSeconds.Observe(time.Since(seqFIE.ProductionTimestamp).Seconds())
+	}
+}
+
+// sseStreamHandler handles SSE client connections for system events.
+func (o *orch) sseStreamHandler(s *sseClient) {
+	var closeReason string
+	consumer := o.eventRingBuffer.NewConsumer()
+	o.metrics.SSEClientsConnected.Inc()
+	o.metrics.SSEConnectionsTotal.Inc()
+	defer func() {
+		consumer.Close()
+		o.metrics.SSEClientsConnected.Dec()
+		o.metrics.SSEDisconnectionsTotal.WithLabelValues(closeReason).Inc()
+		o.logger.Debug("SSE stream closed", slog.String("reason", closeReason))
+	}()
+
+	for {
+		event, _, err := consumer.Pop(s.context())
+		if err != nil {
+			closeReason = "internal_error"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				closeReason = "shutdown_or_disconnect"
+			}
+			return
+		}
+
+		o.logger.Debug("Sending SSE event",
+			slog.String("type", string(event.Type)))
+		if err = s.sendEvent(event); err != nil {
+			closeReason = "internal_error"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				closeReason = "shutdown_or_disconnect"
+			}
+			return
+		}
+		o.metrics.SSEEventsTotal.WithLabelValues(string(event.Type)).Inc()
 	}
 }
 
@@ -318,7 +365,7 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 				continue
 			}
 
-			_ = o.ringBuffer.Push(fie)
+			_ = o.fieRingBuffer.Push(fie)
 		}
 	})
 

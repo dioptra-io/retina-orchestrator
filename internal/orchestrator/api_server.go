@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 	_ "github.com/dioptra-io/retina-orchestrator/docs"
+	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
 )
 
 // SequencedFIE is a ForwardingInfoElement with a sequence number for ordered delivery to HTTP clients.
@@ -26,6 +28,7 @@ type SequencedFIE struct {
 }
 
 type fieHandleFunc func(s *fieClient)
+type sseHandleFunc func(s *sseClient)
 
 type apiServerConfig struct {
 	// address is the TCP listening address in the form "host:port".
@@ -33,7 +36,10 @@ type apiServerConfig struct {
 	// readHeaderTimeout is the timeout for reading HTTP request headers.
 	readHeaderTimeout time.Duration
 	fieHandler        fieHandleFunc
-	logger            *slog.Logger
+	sseHandler        sseHandleFunc
+	// eventBuffer is the ring buffer for SSE events.
+	eventBuffer *structures.RingBuffer[SSEEvent]
+	logger      *slog.Logger
 }
 
 type apiServer struct {
@@ -58,8 +64,20 @@ func newAPIServer(config *apiServerConfig) (*apiServer, error) {
 		clients: make(map[*fieClient]struct{}),
 	}
 
+	// Create default event buffer if not provided
+	if config.eventBuffer == nil && config.sseHandler != nil {
+		rb, err := structures.NewRingBuffer[SSEEvent](256)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create default event buffer: %w", err)
+		}
+		config.eventBuffer = rb
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stream", s.handleStream)
+	if config.sseHandler != nil {
+		mux.HandleFunc("/sse", s.handleSSE)
+	}
 	mux.HandleFunc("/swagger/", httpSwagger.WrapHandler)
 
 	s.server = &http.Server{
@@ -125,6 +143,38 @@ func (s *apiServer) handleStream(w http.ResponseWriter, r *http.Request) {
 	s.config.fieHandler(client)
 }
 
+// @Summary		Stream server-sent events
+// @Description	Opens a long-lived SSE stream of system events.
+// @Tags			sse
+// @Produce		text/event-stream
+// @Success		200	{object}	SSEEvent
+// @Failure		500	{string}	string	"internal server error"
+// @Router			/sse [get]
+func (s *apiServer) handleSSE(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		s.logger.Error("Streaming unsupported: ResponseWriter does not implement http.Flusher")
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	// Wrap ResponseWriter to implement io.WriteCloser
+	ww := &sseResponseWriter{ResponseWriter: w, flusher: flusher}
+
+	client := &sseClient{
+		ctx:    r.Context(),
+		writer: ww,
+	}
+	s.logger.Debug("SSE client connected", slog.String("remote_addr", r.RemoteAddr))
+
+	// No client tracking for SSE yet - just call handler
+	s.config.sseHandler(client)
+}
+
 func (s *apiServer) addClient(client *fieClient) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -152,5 +202,44 @@ func (s *fieClient) sendFIE(fie *SequencedFIE) error {
 }
 
 func (s *fieClient) context() context.Context {
+	return s.ctx
+}
+
+// sseResponseWriter wraps http.ResponseWriter to implement io.WriteCloser.
+type sseResponseWriter struct {
+	http.ResponseWriter
+	flusher http.Flusher
+}
+
+func (w *sseResponseWriter) Write(b []byte) (int, error) {
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *sseResponseWriter) Close() error {
+	return nil
+}
+
+// sseClient is a client for SSE streaming.
+type sseClient struct {
+	ctx    context.Context
+	writer io.WriteCloser
+}
+
+func (s *sseClient) sendEvent(event *SSEEvent) error {
+	data, err := json.Marshal(event.Data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal event data: %w", err)
+	}
+
+	// SSE format: event: <type>\ndata: <data>\n\n
+	_, err = fmt.Fprintf(s.writer, "event: %s\ndata: %s\n\n", event.Type, data)
+	if err != nil {
+		return fmt.Errorf("failed to write SSE event: %w", err)
+	}
+	s.writer.(*sseResponseWriter).flusher.Flush()
+	return nil
+}
+
+func (s *sseClient) context() context.Context {
 	return s.ctx
 }

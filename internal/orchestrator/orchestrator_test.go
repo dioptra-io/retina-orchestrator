@@ -325,7 +325,7 @@ func TestFieStreamHandler_SendsAndStops(t *testing.T) {
 	}()
 
 	time.Sleep(50 * time.Millisecond)
-	_ = o.ringBuffer.Push(fie)
+	_ = o.fieRingBuffer.Push(fie)
 
 	time.Sleep(50 * time.Millisecond)
 	cancel()
@@ -371,7 +371,7 @@ func TestFieStreamHandler_SendFIEError(t *testing.T) {
 
 	// Wait for consumer to be created before pushing.
 	time.Sleep(20 * time.Millisecond)
-	_ = o.ringBuffer.Push(fie)
+	_ = o.fieRingBuffer.Push(fie)
 
 	select {
 	case <-done:

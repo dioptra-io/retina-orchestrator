@@ -357,6 +357,6 @@ func TestNextPD_CycleDurationObserved(t *testing.T) {
 	// Three calls on a single-element scheduler guarantee two cycle
 	// transitions, which is enough to hit the Observe branch.
 	for range 3 {
-		s.NextPD()
+		_, _ = s.NextPD()
 	}
 }
