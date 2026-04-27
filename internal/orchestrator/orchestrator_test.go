@@ -16,17 +16,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// Coverage gaps — unreachable without integration tests or production code changes:
-//   - NewOrch: newQueue, newRingBuffer error branches are unreachable — both
-//     use hardcoded safe values (100) that cannot fail
-//   - runScheduler: PD drop log branch requires a queue consumer to exist then
-//     disappear between Push and send, which is not reproducible in unit tests
-//   - runAPIServer: non-context error return branch requires the API server to
-//     fail for reasons other than shutdown or context cancellation
-//   - runAgentServer: non-context error return branch requires the agent server
-//     to fail for reasons other than shutdown, context cancellation, or ErrServerShutdown
-//   - fieStreamHandler: sendFIE error path already covered, other branches
-//     unreachable via unit tests
+// Intentionally uncovered:
+//
+//   - NewOrch: newQueue/newRingBuffer errors are unreachable (hardcoded safe
+//     values); newAPIServer only fails on nil fieHandler, never nil here.
+//   - runScheduler: PD drop branch requires a consumer to vanish between
+//     TryPush and send — not reproducible in unit tests.
+//   - runAPIServer/runAgentServer: non-context error branches require server
+//     failure unrelated to shutdown — not injectable without refactoring.
+//   - fieStreamHandler: internal_error on Pop requires a non-context error
+//     from RingBuffer, which has no injectable trigger.
 
 // -- helpers ------------------------------------------------------------------
 
@@ -114,6 +113,16 @@ func TestConfig_Validate_DefaultsAPIReadHeaderTimeout(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_DefaultsFIEFilterPolicy(t *testing.T) {
+	t.Parallel()
+	c := validConfig(t)
+	c.FIEFilterPolicy = ""
+	_ = c.Validate()
+	if c.FIEFilterPolicy != "both" {
+		t.Errorf("expected default 'both', got %q", c.FIEFilterPolicy)
+	}
+}
+
 func TestConfig_Validate_Errors(t *testing.T) {
 	t.Parallel()
 	base := validConfig(t)
@@ -124,12 +133,14 @@ func TestConfig_Validate_Errors(t *testing.T) {
 		{"empty AgentAddress", func(c *Config) { c.AgentAddress = "" }},
 		{"small AgentBufferLength", func(c *Config) { c.AgentBufferLength = 100 }},
 		{"zero PDQueueSize", func(c *Config) { c.PDQueueSize = 0 }},
+		{"zero RingBufferSize", func(c *Config) { c.RingBufferSize = 0 }},
 		{"empty APIAddress", func(c *Config) { c.APIAddress = "" }},
 		{"empty PDPath", func(c *Config) { c.PDPath = "" }},
 		{"zero IssuanceRate", func(c *Config) { c.IssuanceRate = 0 }},
 		{"negative IssuanceRate", func(c *Config) { c.IssuanceRate = -1 }},
 		{"zero ImpactThreshold", func(c *Config) { c.ImpactThreshold = 0 }},
 		{"negative ImpactThreshold", func(c *Config) { c.ImpactThreshold = -1 }},
+		{"invalid FIEFilterPolicy", func(c *Config) { c.FIEFilterPolicy = "invalid" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -182,6 +193,13 @@ func TestNewOrch_NilLogger(t *testing.T) {
 	}
 	if o == nil {
 		t.Fatal("expected non-nil orchestrator")
+	}
+}
+
+func TestNewOrch_NilMetrics(t *testing.T) {
+	t.Parallel()
+	if _, err := NewOrch(validConfig(t), testLogger(), nil); err == nil {
+		t.Fatal("expected error for nil metrics, got nil")
 	}
 }
 
@@ -248,6 +266,30 @@ func TestRunScheduler_DropsWhenNoQueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err = o.runScheduler(ctx)
+	if err != context.DeadlineExceeded && err != context.Canceled {
+		t.Fatalf("expected context error, got %v", err)
+	}
+}
+
+func TestRunScheduler_PushesToExistingQueue(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Register a consumer for the agent ID used in the PD file (empty string
+	// since writePDFile sets no AgentID).
+	consumer, err := o.pdQueue.NewConsumer("")
+	if err != nil {
+		t.Fatalf("unexpected error creating consumer: %v", err)
+	}
+	defer consumer.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -444,7 +486,7 @@ func TestAgentHandler_ReceivesAndForwardsPD(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 
 	pd := &api.ProbingDirective{ProbingDirectiveID: 1, AgentID: "agent-1"}
-	if err := o.pdQueue.Push(ctx, "agent-1", pd); err != nil {
+	if err := o.pdQueue.TryPush("agent-1", pd); err != nil {
 		t.Fatalf("unexpected push error: %v", err)
 	}
 
@@ -548,12 +590,115 @@ func TestAgentHandler_SendPDError(t *testing.T) {
 
 	// Push a PD — sendPD will fail on the closed connection.
 	pd := &api.ProbingDirective{ProbingDirectiveID: 1, AgentID: "agent-3"}
-	_ = o.pdQueue.Push(ctx, "agent-3", pd)
+	_ = o.pdQueue.TryPush("agent-3", pd)
 
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("agentHandler did not return after sendPD error")
+	}
+}
+
+// -- filterFIE ----------------------------------------------------------------
+
+func TestFilterFIE_PolicyAny(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	o.config.FIEFilterPolicy = "any"
+
+	allow, err := o.filterFIE(&api.ForwardingInfoElement{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !allow {
+		t.Error("expected policy 'any' to allow all FIEs")
+	}
+}
+
+func TestFilterFIE_PolicyOne(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	o.config.FIEFilterPolicy = "one"
+
+	tests := []struct {
+		name string
+		fie  *api.ForwardingInfoElement
+		want bool
+	}{
+		{"both nil", &api.ForwardingInfoElement{}, false},
+		{"near only", &api.ForwardingInfoElement{NearInfo: &api.Info{}}, true},
+		{"far only", &api.ForwardingInfoElement{FarInfo: &api.Info{}}, true},
+		{"both set", &api.ForwardingInfoElement{NearInfo: &api.Info{}, FarInfo: &api.Info{}}, true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			allow, err := o.filterFIE(tt.fie)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if allow != tt.want {
+				t.Errorf("filterFIE(%s) = %v, want %v", tt.name, allow, tt.want)
+			}
+		})
+	}
+}
+
+func TestFilterFIE_InvalidPolicy(t *testing.T) {
+	// Not parallel — uses real TCP connections.
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Force an invalid policy after construction to trigger the filterFIE error path.
+	o.config.FIEFilterPolicy = "invalid"
+
+	clientConn, serverConn := newTCPPair(t)
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	stream := &agentStream{
+		conn:    serverConn,
+		ctx:     ctx,
+		cancel:  cancel,
+		encoder: json.NewEncoder(serverConn),
+		decoder: json.NewDecoder(serverConn),
+	}
+
+	status := &agentAuthStatus{agentID: "agent-filter"}
+
+	done := make(chan struct{})
+	go func() {
+		o.agentHandler(status, stream)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	// Send a complete FIE — filterFIE will fail on the invalid policy.
+	if err := json.NewEncoder(clientConn).Encode(&api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+		FarInfo:            &api.Info{},
+	}); err != nil {
+		t.Fatalf("cannot send FIE: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("agentHandler did not return after filterFIE error")
 	}
 }
 

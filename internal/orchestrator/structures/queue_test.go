@@ -24,7 +24,7 @@ func TestNewQueue_Valid(t *testing.T) {
 
 func TestNewQueue_ZeroBufferSize(t *testing.T) {
 	t.Parallel()
-	// Zero buffer size creates an unbuffered channel — Push blocks until Pop is called.
+	// Zero buffer size creates an unbuffered channel — TryPush always fails immediately.
 	q, err := NewQueue[int](0)
 	if err != nil {
 		t.Fatalf("expected not to get an error")
@@ -33,24 +33,8 @@ func TestNewQueue_ZeroBufferSize(t *testing.T) {
 	defer cons.Close()
 
 	v := 1
-	done := make(chan struct{})
-	go func() {
-		_ = q.Push(context.Background(), "a", &v)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		t.Fatal("expected Push to block on unbuffered queue")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	_, _ = cons.Pop(context.Background())
-
-	select {
-	case <-done:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("expected Push to unblock after Pop")
+	if err := q.TryPush("a", &v); err == nil {
+		t.Fatal("expected TryPush to fail on unbuffered channel")
 	}
 }
 
@@ -118,16 +102,16 @@ func TestNewConsumer_MultipleDistinctIDs(t *testing.T) {
 	}
 }
 
-// --- Push / Pop ---
+// --- TryPush / Pop ---
 
-func TestQueuePushPop_SingleConsumer(t *testing.T) {
+func TestQueueTryPushPop_SingleConsumer(t *testing.T) {
 	t.Parallel()
 	q, _ := NewQueue[int](4)
 	cons, _ := q.NewConsumer("a")
 	defer cons.Close()
 
 	v := 42
-	if err := q.Push(context.Background(), "a", &v); err != nil {
+	if err := q.TryPush("a", &v); err != nil {
 		t.Fatalf("unexpected push error: %v", err)
 	}
 
@@ -140,7 +124,7 @@ func TestQueuePushPop_SingleConsumer(t *testing.T) {
 	}
 }
 
-func TestQueuePushPop_Order(t *testing.T) {
+func TestQueueTryPushPop_Order(t *testing.T) {
 	t.Parallel()
 	q, _ := NewQueue[int](8)
 	cons, _ := q.NewConsumer("a")
@@ -148,7 +132,7 @@ func TestQueuePushPop_Order(t *testing.T) {
 
 	for i := range 5 {
 		v := i
-		if err := q.Push(context.Background(), "a", &v); err != nil {
+		if err := q.TryPush("a", &v); err != nil {
 			t.Fatalf("unexpected push error: %v", err)
 		}
 	}
@@ -164,7 +148,7 @@ func TestQueuePushPop_Order(t *testing.T) {
 	}
 }
 
-func TestQueuePushPop_MultipleConsumers_Independent(t *testing.T) {
+func TestQueueTryPushPop_MultipleConsumers_Independent(t *testing.T) {
 	t.Parallel()
 	q, _ := NewQueue[int](4)
 	c1, _ := q.NewConsumer("a")
@@ -173,8 +157,8 @@ func TestQueuePushPop_MultipleConsumers_Independent(t *testing.T) {
 	defer c2.Close()
 
 	v1, v2 := 1, 2
-	_ = q.Push(context.Background(), "a", &v1)
-	_ = q.Push(context.Background(), "b", &v2)
+	_ = q.TryPush("a", &v1)
+	_ = q.TryPush("b", &v2)
 
 	got1, err := c1.Pop(context.Background())
 	if err != nil || *got1 != 1 {
@@ -187,7 +171,7 @@ func TestQueuePushPop_MultipleConsumers_Independent(t *testing.T) {
 	}
 }
 
-func TestQueuePop_BlocksUntilPush(t *testing.T) {
+func TestQueuePop_BlocksUntilTryPush(t *testing.T) {
 	t.Parallel()
 	q, _ := NewQueue[int](4)
 	cons, _ := q.NewConsumer("a")
@@ -196,7 +180,7 @@ func TestQueuePop_BlocksUntilPush(t *testing.T) {
 	v := 7
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		_ = q.Push(context.Background(), "a", &v)
+		_ = q.TryPush("a", &v)
 	}()
 
 	got, err := cons.Pop(context.Background())
@@ -208,26 +192,22 @@ func TestQueuePop_BlocksUntilPush(t *testing.T) {
 	}
 }
 
-func TestPush_BlocksWhenBufferFull(t *testing.T) {
+func TestTryPush_BufferFull(t *testing.T) {
 	t.Parallel()
 	q, _ := NewQueue[int](2)
 	cons, _ := q.NewConsumer("a")
 	defer cons.Close()
 
 	v := 1
-	_ = q.Push(context.Background(), "a", &v)
-	_ = q.Push(context.Background(), "a", &v)
+	_ = q.TryPush("a", &v)
+	_ = q.TryPush("a", &v)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-
-	err := q.Push(ctx, "a", &v)
-	if err == nil {
+	if err := q.TryPush("a", &v); err == nil {
 		t.Fatal("expected error when pushing to full buffer")
 	}
 }
 
-func TestPush_DoesNotDeliverToOtherConsumers(t *testing.T) {
+func TestTryPush_DoesNotDeliverToOtherConsumers(t *testing.T) {
 	t.Parallel()
 	q, _ := NewQueue[int](4)
 	c1, _ := q.NewConsumer("a")
@@ -236,7 +216,7 @@ func TestPush_DoesNotDeliverToOtherConsumers(t *testing.T) {
 	defer c2.Close()
 
 	v := 42
-	_ = q.Push(context.Background(), "a", &v)
+	_ = q.TryPush("a", &v)
 
 	got, err := c1.Pop(context.Background())
 	if err != nil || *got != 42 {
@@ -251,28 +231,26 @@ func TestPush_DoesNotDeliverToOtherConsumers(t *testing.T) {
 	}
 }
 
-// --- Push to unregistered / closed consumer ---
+// --- TryPush to unregistered / closed consumer ---
 
-func TestPush_UnknownID(t *testing.T) {
+func TestTryPush_UnknownID(t *testing.T) {
 	t.Parallel()
 	q, _ := NewQueue[int](4)
 
 	v := 1
-	err := q.Push(context.Background(), "nonexistent", &v)
-	if err == nil {
+	if err := q.TryPush("nonexistent", &v); err == nil {
 		t.Fatal("expected error when pushing to unknown id")
 	}
 }
 
-func TestPush_AfterClose(t *testing.T) {
+func TestTryPush_AfterClose(t *testing.T) {
 	t.Parallel()
 	q, _ := NewQueue[int](4)
 	cons, _ := q.NewConsumer("a")
 	cons.Close()
 
 	v := 1
-	err := q.Push(context.Background(), "a", &v)
-	if err == nil {
+	if err := q.TryPush("a", &v); err == nil {
 		t.Fatal("expected error pushing to closed consumer")
 	}
 }
@@ -327,49 +305,6 @@ func TestQueuePop_ContextTimeout(t *testing.T) {
 	}
 }
 
-func TestPush_ContextCancelledWhileBlocking(t *testing.T) {
-	t.Parallel()
-	q, _ := NewQueue[int](1)
-	cons, _ := q.NewConsumer("a")
-	defer cons.Close()
-
-	v := 1
-	_ = q.Push(context.Background(), "a", &v)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-
-	err := q.Push(ctx, "a", &v)
-	if err == nil {
-		t.Fatal("expected error on context cancellation")
-	}
-}
-
-func TestPush_BlocksUntilConsumerClosed(t *testing.T) {
-	t.Parallel()
-	// Unbuffered so Push blocks immediately in the select,
-	// exercising the <-done arm when Close fires concurrently.
-	q, _ := NewQueue[int](0)
-	cons, _ := q.NewConsumer("a")
-
-	v := 1
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- q.Push(context.Background(), "a", &v)
-	}()
-
-	time.Sleep(10 * time.Millisecond)
-	cons.Close()
-
-	err := <-errCh
-	if err == nil {
-		t.Fatal("expected error when consumer closed while Push blocking")
-	}
-}
-
 // --- Close ---
 
 func TestQueueClose_Idempotent(t *testing.T) {
@@ -416,7 +351,7 @@ func TestClose_BufferedItemsStillReadableAfterClose(t *testing.T) {
 	cons, _ := q.NewConsumer("a")
 
 	v := 1
-	_ = q.Push(context.Background(), "a", &v)
+	_ = q.TryPush("a", &v)
 	cons.Close()
 
 	got, err := cons.Pop(context.Background())
@@ -435,7 +370,7 @@ func TestClose_BufferedItemsStillReadableAfterClose(t *testing.T) {
 
 // --- Concurrency ---
 
-func TestQueueConcurrent_PushPop(t *testing.T) {
+func TestQueueConcurrent_TryPushPop(t *testing.T) {
 	t.Parallel()
 	q, _ := NewQueue[int](128)
 	cons, _ := q.NewConsumer("a")
@@ -463,7 +398,7 @@ func TestQueueConcurrent_PushPop(t *testing.T) {
 
 	for i := range n {
 		v := i
-		if err := q.Push(context.Background(), "a", &v); err != nil {
+		if err := q.TryPush("a", &v); err != nil {
 			t.Fatalf("unexpected push error: %v", err)
 		}
 	}
@@ -510,7 +445,7 @@ func TestConcurrent_MultipleConsumers(t *testing.T) {
 	for i := range n {
 		v := i
 		for _, id := range ids {
-			if err := q.Push(context.Background(), id, &v); err != nil {
+			if err := q.TryPush(id, &v); err != nil {
 				t.Fatalf("unexpected push error: %v", err)
 			}
 		}
@@ -519,9 +454,9 @@ func TestConcurrent_MultipleConsumers(t *testing.T) {
 	wg.Wait()
 }
 
-func TestConcurrent_CloseAndPush(t *testing.T) {
+func TestConcurrent_CloseAndTryPush(t *testing.T) {
 	t.Parallel()
-	// Race between Close and Push — Push should return an error, not panic.
+	// Race between Close and TryPush — TryPush should return an error, not panic.
 	for range 100 {
 		q, _ := NewQueue[int](4)
 		cons, _ := q.NewConsumer("a")
@@ -532,7 +467,7 @@ func TestConcurrent_CloseAndPush(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			v := 1
-			_ = q.Push(context.Background(), "a", &v)
+			_ = q.TryPush("a", &v)
 		}()
 
 		wg.Add(1)
@@ -572,10 +507,9 @@ func TestConcurrent_CloseAndPop(t *testing.T) {
 
 func TestConcurrent_ManyConsumers(t *testing.T) {
 	t.Parallel()
-	q, _ := NewQueue[int](16)
 	const numConsumers = 100
 	const n = 50
-
+	q, _ := NewQueue[int](n) // buffer sized to n so TryPush never fails
 	consumers := make([]*consumer[int], numConsumers)
 	for i := range numConsumers {
 		cons, err := q.NewConsumer(fmt.Sprintf("consumer-%d", i))
@@ -606,7 +540,7 @@ func TestConcurrent_ManyConsumers(t *testing.T) {
 		v := i
 		for j := range numConsumers {
 			id := fmt.Sprintf("consumer-%d", j)
-			if err := q.Push(context.Background(), id, &v); err != nil {
+			if err := q.TryPush(id, &v); err != nil {
 				t.Fatalf("unexpected push error: %v", err)
 			}
 		}
