@@ -56,17 +56,26 @@ func (c *Config) Validate() error {
 	if c.AgentAddress == "" {
 		return fmt.Errorf("AgentAddress cannot be empty")
 	}
+	if c.AgentBufferLength < 8192 {
+		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
+	}
 	if c.PDQueueSize <= 0 {
 		return fmt.Errorf("PDQueueSize must be greater than zero: got %d", c.PDQueueSize)
 	}
 	if c.RingBufferSize <= 0 {
 		return fmt.Errorf("RingBufferSize must be greater than zero: got %d", c.RingBufferSize)
 	}
-	if c.AgentBufferLength < 8192 {
-		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
-	}
 	if c.APIAddress == "" {
 		return fmt.Errorf("APIAddress cannot be empty")
+	}
+	if c.APIReadHeaderTimeout == 0 {
+		c.APIReadHeaderTimeout = 5 * time.Second
+	}
+	if c.FIEFilterPolicy == "" {
+		c.FIEFilterPolicy = "both"
+	}
+	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
+		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
 	}
 	if c.PDPath == "" {
 		return fmt.Errorf("PDPath cannot be empty")
@@ -77,16 +86,6 @@ func (c *Config) Validate() error {
 	if c.ImpactThreshold <= 0 {
 		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
 	}
-	if c.FIEFilterPolicy == "" {
-		c.FIEFilterPolicy = "both"
-	}
-	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
-		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
-	}
-	if c.APIReadHeaderTimeout == 0 {
-		c.APIReadHeaderTimeout = 5 * time.Second
-	}
-
 	return nil
 }
 
