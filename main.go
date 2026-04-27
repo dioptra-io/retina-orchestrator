@@ -133,7 +133,7 @@ func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr
 }
 
 // newLogger creates a JSON logger writing to stdout at the given level.
-// Falls back to info if the level string is unrecognised.
+// Falls back to info if the level string is unrecognized.
 func newLogger(level string) *slog.Logger {
 	var l slog.Level
 	if err := l.UnmarshalText([]byte(level)); err != nil {

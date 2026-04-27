@@ -20,7 +20,7 @@ type consumer[T any] struct {
 }
 
 // Pop returns the next element, blocking until one is available, the context
-// is cancelled, or the consumer is closed.
+// is canceled, or the consumer is closed.
 func (qc *consumer[T]) Pop(ctx context.Context) (*T, error) {
 	// Drain any buffered item first before blocking.
 	select {

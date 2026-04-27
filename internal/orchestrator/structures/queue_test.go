@@ -268,7 +268,7 @@ func TestQueuePop_ContextCancelledBeforeCall(t *testing.T) {
 
 	_, err := cons.Pop(ctx)
 	if err == nil {
-		t.Fatal("expected error on cancelled context")
+		t.Fatal("expected error on canceled context")
 	}
 }
 

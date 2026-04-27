@@ -16,6 +16,7 @@ func TestNewMetrics_NilRegistry(t *testing.T) {
 	}
 }
 
+//nolint:gocyclo // Complexity comes from one nil-check per metric field; splitting would hurt readability.
 func TestNewMetrics_WithRegistry(t *testing.T) {
 	t.Parallel()
 	reg := prometheus.NewRegistry()
