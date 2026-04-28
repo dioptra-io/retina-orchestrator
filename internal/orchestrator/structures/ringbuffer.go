@@ -20,7 +20,7 @@ type ringConsumer[T any] struct {
 
 // Pop returns the next element and a monotonically increasing sequence number
 // that reflects any skipped elements, allowing clients to detect gaps in the
-// FIE stream. Blocks until an element is available or the context is cancelled.
+// FIE stream. Blocks until an element is available or the context is canceled.
 func (rbc *ringConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
 	// Safe because Pop and Close must be called from the same goroutine.
 	if rbc.rb == nil {
@@ -31,7 +31,7 @@ func (rbc *ringConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
 		return nil, 0, ctx.Err()
 	}
 
-	// Wake waiting goroutines if this consumer's context is cancelled.
+	// Wake waiting goroutines if this consumer's context is canceled.
 	cond := rbc.rb.cond
 	stop := context.AfterFunc(ctx, func() {
 		cond.Broadcast()

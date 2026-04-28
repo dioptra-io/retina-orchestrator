@@ -51,15 +51,15 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 		}),
 		AgentDisconnectionsTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "retina_orchestrator_agent_disconnections_total",
-			Help: "Total number of agent disconnections, labelled by agent ID.",
+			Help: "Total number of agent disconnections, labeled by agent ID.",
 		}, []string{"agent_id"}),
 		PDsSentTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "retina_orchestrator_pds_sent_total",
-			Help: "Total number of probing directives dispatched, labelled by agent ID.",
+			Help: "Total number of probing directives dispatched, labeled by agent ID.",
 		}, []string{"agent_id"}),
 		FIEsReceivedTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "retina_orchestrator_fies_received_total",
-			Help: "Total number of forwarding info elements received, labelled by agent ID.",
+			Help: "Total number of forwarding info elements received, labeled by agent ID.",
 		}, []string{"agent_id"}),
 		AgentQueueSize: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "retina_orchestrator_agent_queue_size",
@@ -96,7 +96,7 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 		}),
 		StreamDisconnectionsTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "retina_orchestrator_stream_disconnections_total",
-			Help: "Total number of streaming disconnections, labelled by reason.",
+			Help: "Total number of streaming disconnections, labeled by reason.",
 		}, []string{"reason"}),
 		FIEsStreamedTotal: factory.NewCounter(prometheus.CounterOpts{
 			Name: "retina_orchestrator_fies_streamed_total",
