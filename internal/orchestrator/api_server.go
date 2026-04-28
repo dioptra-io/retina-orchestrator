@@ -59,8 +59,8 @@ func newAPIServer(config *apiServerConfig) (*apiServer, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stream", s.handleStream)
-	mux.HandleFunc("/swagger/", httpSwagger.WrapHandler)
+	mux.HandleFunc("/api/v1/stream", s.handleStream)
+	mux.HandleFunc("/api/v1/swagger/", httpSwagger.WrapHandler)
 
 	s.server = &http.Server{
 		Addr:              config.address,

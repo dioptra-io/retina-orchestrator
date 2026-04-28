@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 // @title			IP Routes Live API
-// @version			1.0
-// @description		Streams forwarding info elements from connected Retina agents.
+// @version		1.0.0
+// @description	Streams forwarding info elements from connected Retina agents.
 // @host			iprl.dioptra.io
-// @BasePath		/
+// @BasePath		/api/v1
 package main
 
 import (

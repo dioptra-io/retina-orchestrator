@@ -26,7 +26,7 @@ test:
 	go test -v -race -cover ./...
 
 docs:
-	swag init --parseDependency --parseInternal -g ./internal/orchestrator/api_server.go --output docs
+	swag init --parseDependency --parseInternal -g main.go --output docs
 	swag fmt
 
 clean:
