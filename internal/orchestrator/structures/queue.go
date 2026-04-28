@@ -95,33 +95,6 @@ func (q *Queue[T]) NewConsumer(id string) (*consumer[T], error) {
 	return c, nil
 }
 
-// Push sends an element to a specific consumer. Blocks if the consumer's
-// buffer is full until space is available or the context is cancelled.
-// Push is safe to call concurrently with Pop and Close.
-//
-// Returns an error if the context is cancelled, if the consumer is not found,
-// or if the consumer is closed.
-func (q *Queue[T]) Push(ctx context.Context, id string, item *T) error {
-	q.mu.Lock()
-	if _, ok := q.consumers[id]; !ok {
-		q.mu.Unlock()
-		return fmt.Errorf("consumer %q not found", id)
-	}
-	// Capture both ch and done under the lock so Close() cannot race between
-	// the two reads.
-	ch, done := q.consumers[id].ch, q.consumers[id].done
-	q.mu.Unlock()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-done:
-		return fmt.Errorf("consumer %q closed", id)
-	case ch <- item:
-		return nil
-	}
-}
-
 // TryPush attempts to send an element to a specific consumer without blocking.
 // Returns an error if the consumer is not registered or the buffer is full.
 func (q *Queue[T]) TryPush(id string, item *T) error {

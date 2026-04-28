@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 // pdState holds the scheduling state for a single ProbingDirective, including
@@ -69,7 +68,7 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string, logger *slog
 		logger = slog.Default()
 	}
 	if metrics == nil {
-		metrics = NewMetrics(prometheus.DefaultRegisterer)
+		return nil, fmt.Errorf("metrics cannot be nil")
 	}
 
 	pds, err := readPDs(pdFile)
