@@ -8,12 +8,33 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          
       - name: Stub docs package
         run: |
           mkdir -p docs
           printf 'package docs\n' > docs/docs.go
-      - name: Run tests
-        run: go test $(go list ./... | grep -v /docs)
+          
+      - name: Run linters
+        uses: golangci/golangci-lint-action@v3
+        with:
+          version: latest
+
+      - name: Run tests with race detector and coverage
+        run: go test -race -coverprofile=coverage.out $(go list ./... | grep -v /docs)
+
+      - name: Enforce 95% Coverage
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep "^total:" | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: $COVERAGE%"
+          awk -v cov="$COVERAGE" 'BEGIN { 
+            if (cov < 95.0) { 
+              print "❌ Error: Test coverage (" cov "%) is below the required 95%."; 
+              exit 1 
+            } else { 
+              print "✅ Coverage is sufficient."; 
+              exit 0 
+            } 
+          }'
 
   docker:
     if: "!contains(github.event.head_commit.message, 'skip docker build')"
