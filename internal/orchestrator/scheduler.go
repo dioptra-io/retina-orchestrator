@@ -170,9 +170,11 @@ func (s *Scheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
 	oldNearAddress, oldFarAddress := pd.lastHitNearAddress, pd.lastHitFarAddress
 
 	// Last hit addresses can be nil (e.g. on probe timeout).
+	pd.lastHitNearAddress = nil
 	if fie.NearInfo != nil {
 		pd.lastHitNearAddress = fie.NearInfo.ReplyAddress
 	}
+	pd.lastHitFarAddress = nil
 	if fie.FarInfo != nil {
 		pd.lastHitFarAddress = fie.FarInfo.ReplyAddress
 	}
@@ -187,11 +189,15 @@ func (s *Scheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
 	}
 
 	numNearImpacts, numFarImpacts := 0, 0
-	if rec, ok := s.impactRecords[ipKey(pd.lastHitNearAddress)]; ok {
-		numNearImpacts = len(rec.pds)
+	if pd.lastHitNearAddress != nil {
+		if rec, ok := s.impactRecords[ipKey(pd.lastHitNearAddress)]; ok {
+			numNearImpacts = len(rec.pds)
+		}
 	}
-	if rec, ok := s.impactRecords[ipKey(pd.lastHitFarAddress)]; ok {
-		numFarImpacts = len(rec.pds)
+	if pd.lastHitFarAddress != nil {
+		if rec, ok := s.impactRecords[ipKey(pd.lastHitFarAddress)]; ok {
+			numFarImpacts = len(rec.pds)
+		}
 	}
 
 	maxImpacts := max(numNearImpacts, numFarImpacts)
