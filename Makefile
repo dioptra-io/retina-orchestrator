@@ -27,7 +27,7 @@ tidy:
 test:
 	go test -v -race -coverprofile=coverage.out ./...
 
-cover: test
+cover:
 	go tool cover -html=coverage.out
 
 docs:

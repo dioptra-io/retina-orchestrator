@@ -18,17 +18,15 @@ jobs:
         run: |
           chmod +x .githooks/commit-msg
           
-          COMMITS=$(git rev-list ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }})
+          COMMITS=$(git rev-list origin/${{ github.base_ref }}..${{ github.event.pull_request.head.sha }})
           
           for COMMIT in $COMMITS; do
             echo "Checking commit $COMMIT..."
             git log --format=%B -n 1 $COMMIT > /tmp/commit_msg.txt
             
-            ./.githooks/commit-msg /tmp/commit_msg.txt
-            
-            if [ $? -ne 0 ]; then
-              echo "❌ Commit $COMMIT is invalid. Please fix it (git commit --amend) and force push."
+            ./.githooks/commit-msg /tmp/commit_msg.txt || {
+              echo "❌ Please fix the above error(s) using 'git rebase -i' and force push."
               exit 1
-            fi
+            }
           done
-          echo "✅ All commits comply with the Handbook rules."
+          echo "✅ All commits comply with the rules."

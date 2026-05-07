@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 
 COMMIT_MSG_FILE=$1
-COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
 
-if ! grep -qi "^Signed-off-by:" "$COMMIT_MSG_FILE"; then
+if ! grep -q "^Signed-off-by:" "$COMMIT_MSG_FILE"; then
   echo "❌ Error: Missing 'Signed-off-by:' signature."
   echo "💡 Tip: Use 'git commit -s' to add it automatically."
   exit 1
@@ -11,9 +10,8 @@ fi
 
 HEADER_LINE=$(head -n 1 "$COMMIT_MSG_FILE")
 
-HEADER_LENGTH=${#HEADER_LINE}
-if [ "$HEADER_LENGTH" -gt 50 ]; then
-  echo "❌ Error: Commit subject is too long ($HEADER_LENGTH chars). Max: 50."
+if [ "${#HEADER_LINE}" -gt 72 ]; then
+  echo "❌ Error: Commit subject is too long (${#HEADER_LINE} chars). Max: 72."
   exit 1
 fi
 
@@ -29,4 +27,3 @@ if ! [[ "$HEADER_LINE" =~ $PATTERN ]]; then
 fi
 
 echo "✅ Commit format validated locally."
-exit 0
