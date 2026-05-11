@@ -70,9 +70,6 @@ func (c *Config) Validate() error {
 	if c.APIReadHeaderTimeout == 0 {
 		c.APIReadHeaderTimeout = 5 * time.Second
 	}
-	if c.DefaultFIEFilterPolicy == "" {
-		c.DefaultFIEFilterPolicy = "both"
-	}
 	if !slices.Contains([]string{"any", "one", "both"}, c.DefaultFIEFilterPolicy) {
 		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.DefaultFIEFilterPolicy)
 	}

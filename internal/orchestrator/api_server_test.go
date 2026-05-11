@@ -210,7 +210,7 @@ func TestHandleStream_StreamingUnsupported(t *testing.T) {
 
 	w := newNonFlushResponseWriter()
 	r := httptest.NewRequest(http.MethodGet, "/stream", nil)
-	s.handleStream(w, r)
+	s.handleFilterlessStream(w, r)
 
 	if w.code != http.StatusInternalServerError {
 		t.Errorf("expected status 500, got %d", w.code)

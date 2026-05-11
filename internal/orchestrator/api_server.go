@@ -60,7 +60,8 @@ func newAPIServer(config *apiServerConfig) (*apiServer, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/stream", s.handleStream)
+	mux.HandleFunc("/api/v1/stream", s.handleFilterlessStream)
+	mux.HandleFunc("/api/v1/internal/stream", s.handleFilterfulStream)
 	mux.HandleFunc("/api/v1/swagger/", httpSwagger.WrapHandler)
 
 	s.server = &http.Server{
@@ -100,8 +101,8 @@ func (s *apiServer) close(timeout time.Duration) error {
 // @Success		200	{object}	SequencedFIE
 // @Failure		400	{string}	string	"invalid filter"
 // @Failure		500	{string}	string	"internal server error"
-// @Router			/stream [get]
-func (s *apiServer) handleStream(w http.ResponseWriter, r *http.Request) {
+// @Router			/internal/stream [get]
+func (s *apiServer) handleFilterfulStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -126,6 +127,41 @@ func (s *apiServer) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	client := &fieClient{
 		fieFilterPolicy: fieFilterPolicy,
+		ctx:             r.Context(),
+		flusher:         flusher,
+		encoder:         json.NewEncoder(w),
+	}
+	s.addClient(client)
+	s.logger.Debug("Client connected", slog.String("remote_addr", r.RemoteAddr))
+	defer func() {
+		s.removeClient(client)
+		s.logger.Debug("Client disconnected", slog.String("remote_addr", r.RemoteAddr))
+	}()
+
+	s.config.fieHandler(client)
+}
+
+// @Summary		Stream forwarding info elements
+// @Description	Opens a long-lived NDJSON stream of FIEs from connected agents.
+// @Tags			stream
+// @Produce		application/x-ndjson
+// @Success		200	{object}	SequencedFIE
+// @Failure		500	{string}	string	"internal server error"
+// @Router			/stream [get]
+func (s *apiServer) handleFilterlessStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		s.logger.Error("Streaming unsupported: ResponseWriter does not implement http.Flusher")
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	client := &fieClient{
+		fieFilterPolicy: s.config.defaultFIEFilterPolicy,
 		ctx:             r.Context(),
 		flusher:         flusher,
 		encoder:         json.NewEncoder(w),

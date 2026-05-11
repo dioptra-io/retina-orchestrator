@@ -114,16 +114,6 @@ func TestConfig_Validate_DefaultsAPIReadHeaderTimeout(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_DefaultsFIEFilterPolicy(t *testing.T) {
-	t.Parallel()
-	c := validConfig(t)
-	c.DefaultFIEFilterPolicy = ""
-	_ = c.Validate()
-	if c.DefaultFIEFilterPolicy != "both" {
-		t.Errorf("expected default 'both', got %q", c.DefaultFIEFilterPolicy)
-	}
-}
-
 func TestConfig_Validate_Errors(t *testing.T) {
 	t.Parallel()
 	base := validConfig(t)
