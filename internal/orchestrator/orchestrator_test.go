@@ -53,16 +53,17 @@ func writePDFile(t *testing.T) string {
 func validConfig(t *testing.T) *Config {
 	t.Helper()
 	return &Config{
-		AgentAddress:      "127.0.0.1:0",
-		AgentBufferLength: 8192,
-		PDQueueSize:       100,
-		RingBufferSize:    100,
-		APIAddress:        "127.0.0.1:0",
-		PDPath:            writePDFile(t),
-		Seed:              0,
-		IssuanceRate:      1.0,
-		ImpactThreshold:   1.0,
-		Secret:            "secret",
+		AgentAddress:           "127.0.0.1:0",
+		AgentBufferLength:      8192,
+		PDQueueSize:            100,
+		RingBufferSize:         100,
+		APIAddress:             "127.0.0.1:0",
+		PDPath:                 writePDFile(t),
+		Seed:                   0,
+		IssuanceRate:           1.0,
+		ImpactThreshold:        1.0,
+		Secret:                 "secret",
+		DefaultFIEFilterPolicy: "any",
 	}
 }
 
@@ -116,10 +117,10 @@ func TestConfig_Validate_DefaultsAPIReadHeaderTimeout(t *testing.T) {
 func TestConfig_Validate_DefaultsFIEFilterPolicy(t *testing.T) {
 	t.Parallel()
 	c := validConfig(t)
-	c.FIEFilterPolicy = ""
+	c.DefaultFIEFilterPolicy = ""
 	_ = c.Validate()
-	if c.FIEFilterPolicy != "both" {
-		t.Errorf("expected default 'both', got %q", c.FIEFilterPolicy)
+	if c.DefaultFIEFilterPolicy != "both" {
+		t.Errorf("expected default 'both', got %q", c.DefaultFIEFilterPolicy)
 	}
 }
 
@@ -140,7 +141,7 @@ func TestConfig_Validate_Errors(t *testing.T) {
 		{"negative IssuanceRate", func(c *Config) { c.IssuanceRate = -1 }},
 		{"zero ImpactThreshold", func(c *Config) { c.ImpactThreshold = 0 }},
 		{"negative ImpactThreshold", func(c *Config) { c.ImpactThreshold = -1 }},
-		{"invalid FIEFilterPolicy", func(c *Config) { c.FIEFilterPolicy = "invalid" }},
+		{"invalid FIEFilterPolicy", func(c *Config) { c.DefaultFIEFilterPolicy = "invalid" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -349,9 +350,10 @@ func TestFieStreamHandler_SendsAndStops(t *testing.T) {
 
 	var buf bytes.Buffer
 	client := &fieClient{
-		ctx:     ctx,
-		flusher: nopFlusher{},
-		encoder: json.NewEncoder(&buf),
+		fieFilterPolicy: o.config.DefaultFIEFilterPolicy,
+		ctx:             ctx,
+		flusher:         nopFlusher{},
+		encoder:         json.NewEncoder(&buf),
 	}
 
 	fie := &api.ForwardingInfoElement{
@@ -607,9 +609,9 @@ func TestFilterFIE_PolicyAny(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	o.config.FIEFilterPolicy = "any"
+	o.config.DefaultFIEFilterPolicy = "any"
 
-	allow, err := o.filterFIE(&api.ForwardingInfoElement{})
+	allow, err := o.filterFIE(&api.ForwardingInfoElement{}, "any")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -624,7 +626,7 @@ func TestFilterFIE_PolicyOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	o.config.FIEFilterPolicy = "one"
+	o.config.DefaultFIEFilterPolicy = "one"
 
 	tests := []struct {
 		name string
@@ -640,7 +642,7 @@ func TestFilterFIE_PolicyOne(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			allow, err := o.filterFIE(tt.fie)
+			allow, err := o.filterFIE(tt.fie, o.config.DefaultFIEFilterPolicy)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -659,7 +661,7 @@ func TestFilterFIE_InvalidPolicy(t *testing.T) {
 	}
 
 	// Force an invalid policy after construction to trigger the filterFIE error path.
-	o.config.FIEFilterPolicy = "invalid"
+	o.config.DefaultFIEFilterPolicy = "invalid"
 
 	clientConn, serverConn := newTCPPair(t)
 	defer func() { _ = clientConn.Close() }()

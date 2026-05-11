@@ -35,9 +35,9 @@ type Config struct {
 	// APIReadHeaderTimeout defaults to 5 seconds if zero.
 	APIReadHeaderTimeout time.Duration
 
-	FIEFilterPolicy string
-	PDPath          string
-	Seed            uint64
+	DefaultFIEFilterPolicy string
+	PDPath                 string
+	Seed                   uint64
 	// IssuanceRate is the target global issuance rate of probing directives
 	// (PDs per second, approximate).
 	IssuanceRate float64
@@ -70,11 +70,11 @@ func (c *Config) Validate() error {
 	if c.APIReadHeaderTimeout == 0 {
 		c.APIReadHeaderTimeout = 5 * time.Second
 	}
-	if c.FIEFilterPolicy == "" {
-		c.FIEFilterPolicy = "both"
+	if c.DefaultFIEFilterPolicy == "" {
+		c.DefaultFIEFilterPolicy = "both"
 	}
-	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
-		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
+	if !slices.Contains([]string{"any", "one", "both"}, c.DefaultFIEFilterPolicy) {
+		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.DefaultFIEFilterPolicy)
 	}
 	if c.PDPath == "" {
 		return fmt.Errorf("PDPath cannot be empty")
@@ -125,9 +125,10 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	o.scheduler = scheduler
 
 	apiServer, err := newAPIServer(&apiServerConfig{
-		address:           config.APIAddress,
-		readHeaderTimeout: config.APIReadHeaderTimeout,
-		fieHandler:        o.fieStreamHandler,
+		defaultFIEFilterPolicy: config.DefaultFIEFilterPolicy,
+		address:                config.APIAddress,
+		readHeaderTimeout:      config.APIReadHeaderTimeout,
+		fieHandler:             o.fieStreamHandler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error on creating API server: %w", err)
@@ -250,6 +251,17 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 			}
 			return
 		}
+
+		allow, err := o.filterFIE(fie, s.fieFilterPolicy)
+		if err != nil {
+			closeReason = "bad_arguments"
+			o.logger.Warn("error on filtering FIE, closing connection", slog.String("err", err.Error()))
+			return
+		}
+		if !allow {
+			continue
+		}
+
 		seqFIE := &SequencedFIE{
 			ForwardingInfoElement: *fie,
 			SequenceNumber:        seq,
@@ -304,14 +316,7 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.agentID, "err", err)
 			}
 
-			allow, err := o.filterFIE(fie)
-			if err != nil {
-				return fmt.Errorf("error on filtering FIE: %w", err)
-			}
-			if !allow {
-				continue
-			}
-
+			// received FIE is pushed to the ring buffer.
 			_ = o.ringBuffer.Push(fie)
 		}
 	})
@@ -362,8 +367,8 @@ func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
 
 // filterFIE reports whether a FIE should be streamed based on the policy.
 // Returns true if the FIE is allowed.
-func (o *orch) filterFIE(fie *api.ForwardingInfoElement) (bool, error) {
-	switch o.config.FIEFilterPolicy {
+func (o *orch) filterFIE(fie *api.ForwardingInfoElement, fieFilterPolicy string) (bool, error) {
+	switch fieFilterPolicy {
 	case "any": // allow all FIEs
 		return true, nil
 	case "both": // allow FIEs with two non-nil response addresses
@@ -371,6 +376,6 @@ func (o *orch) filterFIE(fie *api.ForwardingInfoElement) (bool, error) {
 	case "one": // allow FIEs with at least one non-nil response address
 		return fie.NearInfo != nil || fie.FarInfo != nil, nil
 	default:
-		return false, fmt.Errorf("unsupported fie filtering policy: %q", o.config.FIEFilterPolicy)
+		return false, fmt.Errorf("unsupported fie filtering policy: %q", o.config.DefaultFIEFilterPolicy)
 	}
 }

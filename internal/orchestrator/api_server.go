@@ -28,6 +28,7 @@ type SequencedFIE struct {
 type fieHandleFunc func(s *fieClient)
 
 type apiServerConfig struct {
+	defaultFIEFilterPolicy string
 	// address is the TCP listening address in the form "host:port".
 	address string
 	// readHeaderTimeout is the timeout for reading HTTP request headers.
@@ -95,13 +96,26 @@ func (s *apiServer) close(timeout time.Duration) error {
 // @Description	Opens a long-lived NDJSON stream of FIEs from connected agents.
 // @Tags			stream
 // @Produce		application/x-ndjson
+// @Param			f	query		string	false	"Filtering policy"	Enums(any,one,both)
 // @Success		200	{object}	SequencedFIE
+// @Failure		400	{string}	string	"invalid filter"
 // @Failure		500	{string}	string	"internal server error"
 // @Router			/stream [get]
 func (s *apiServer) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+
+	fieFilterPolicy := r.URL.Query().Get("f")
+	switch fieFilterPolicy {
+	case "":
+		fieFilterPolicy = s.config.defaultFIEFilterPolicy
+	case "any", "one", "both":
+		// valid
+	default:
+		http.Error(w, "invalid filter", http.StatusBadRequest)
+		return
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -111,9 +125,10 @@ func (s *apiServer) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	client := &fieClient{
-		ctx:     r.Context(),
-		flusher: flusher,
-		encoder: json.NewEncoder(w),
+		fieFilterPolicy: fieFilterPolicy,
+		ctx:             r.Context(),
+		flusher:         flusher,
+		encoder:         json.NewEncoder(w),
 	}
 	s.addClient(client)
 	s.logger.Debug("Client connected", slog.String("remote_addr", r.RemoteAddr))
@@ -138,9 +153,10 @@ func (s *apiServer) removeClient(client *fieClient) {
 }
 
 type fieClient struct {
-	ctx     context.Context
-	flusher http.Flusher
-	encoder *json.Encoder
+	fieFilterPolicy string
+	ctx             context.Context
+	flusher         http.Flusher
+	encoder         *json.Encoder
 }
 
 func (s *fieClient) sendFIE(fie *SequencedFIE) error {
