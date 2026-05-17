@@ -60,8 +60,8 @@ func newAPIServer(config *apiServerConfig) (*apiServer, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/stream", s.handleFilterlessStream)
-	mux.HandleFunc("/api/v1/internal/stream", s.handleFilterfulStream)
+	mux.HandleFunc("/api/v1/stream", s.handleStream)
+	mux.HandleFunc("/api/v1/internal/stream", s.handleInternalStream)
 	mux.HandleFunc("/api/v1/swagger/", httpSwagger.WrapHandler)
 
 	s.server = &http.Server{
@@ -102,7 +102,7 @@ func (s *apiServer) close(timeout time.Duration) error {
 // @Failure		400	{string}	string	"invalid filter"
 // @Failure		500	{string}	string	"internal server error"
 // @Router			/internal/stream [get]
-func (s *apiServer) handleFilterfulStream(w http.ResponseWriter, r *http.Request) {
+func (s *apiServer) handleInternalStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -148,7 +148,7 @@ func (s *apiServer) handleFilterfulStream(w http.ResponseWriter, r *http.Request
 // @Success		200	{object}	SequencedFIE
 // @Failure		500	{string}	string	"internal server error"
 // @Router			/stream [get]
-func (s *apiServer) handleFilterlessStream(w http.ResponseWriter, r *http.Request) {
+func (s *apiServer) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
