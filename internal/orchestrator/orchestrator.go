@@ -373,6 +373,6 @@ func (o *orch) filterFIE(fie *api.ForwardingInfoElement, fieFilterPolicy string)
 	case "one": // allow FIEs with at least one non-nil response address
 		return fie.NearInfo != nil || fie.FarInfo != nil, nil
 	default:
-		return false, fmt.Errorf("unsupported fie filtering policy: %q", o.config.DefaultFIEFilterPolicy)
+		return false, fmt.Errorf("unsupported fie filtering policy: %q", fieFilterPolicy)
 	}
 }
