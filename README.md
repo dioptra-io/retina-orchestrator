@@ -99,6 +99,7 @@ CLI flags > environment variables > hardcoded defaults
 - Agents authenticate using the `RETINA_SECRET` environment variable before receiving directives.
 - PDs are scheduled using a responsible probing algorithm that limits the number of concurrent directives impacting any single address.
 - FIEs received from agents are streamed to HTTP clients via the `/stream` endpoint as NDJSON.
+- An internal NDJSON streaming endpoint is also available at `/api/v1/internal/stream`. The `f` query parameter controls FIE filtering (`any`, `one`, `both`) based on response addresses. 
 - Swagger UI is available at `/swagger/index.html` when the server is running.
 - Logs are written to stdout in JSON format, compatible with Loki/Grafana pipelines.
 - The program handles `SIGINT` and `SIGTERM` for graceful shutdown.
@@ -111,7 +112,6 @@ Metrics are exposed at `--metrics-addr` (default `:9312`) in Prometheus format, 
 - **Pipeline throughput**: probing directives sent and FIEs received, queue size per agent, labelled by agent ID
 - **PD scheduling**: total directives loaded, cycle duration, cycles completed, directives skipped by the responsible probing algorithm
 - **Streaming endpoint**: connected HTTP clients, total connections/disconnections by reason, FIEs streamed, stream lag distribution
-- **Internal streaming endpoint**: an internal NDJSON streaming endpoint is available at `/api/v1/internal/stream`. The `f` query parameter controls FIE filtering (`any`, `one`, `both`) based on response addresses. This endpoint is not intended for public exposure and should only be accessed through SSH tunneling or trusted internal networks.
 See `internal/orchestrator/metrics.go` for the full list.
 
 ## License

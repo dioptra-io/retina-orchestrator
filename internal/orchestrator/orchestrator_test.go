@@ -643,6 +643,39 @@ func TestFilterFIE_PolicyOne(t *testing.T) {
 	}
 }
 
+func TestFilterFIE_PolicyBoth(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	o.config.DefaultFIEFilterPolicy = "both"
+
+	tests := []struct {
+		name string
+		fie  *api.ForwardingInfoElement
+		want bool
+	}{
+		{"both nil", &api.ForwardingInfoElement{}, false},
+		{"near only", &api.ForwardingInfoElement{NearInfo: &api.Info{}}, false},
+		{"far only", &api.ForwardingInfoElement{FarInfo: &api.Info{}}, false},
+		{"both set", &api.ForwardingInfoElement{NearInfo: &api.Info{}, FarInfo: &api.Info{}}, true},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			allow, err := o.filterFIE(tt.fie, o.config.DefaultFIEFilterPolicy)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if allow != tt.want {
+				t.Errorf("filterFIE(%s) = %v, want %v", tt.name, allow, tt.want)
+			}
+		})
+	}
+}
+
 func TestFilterFIE_InvalidPolicy(t *testing.T) {
 	// Not parallel — uses real TCP connections.
 	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
@@ -691,6 +724,148 @@ func TestFilterFIE_InvalidPolicy(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("agentHandler did not return after filterFIE error")
+	}
+}
+
+// -- handleInternalStream ---------------------------------------------------------
+
+func TestHandleInternalStream_SendsAndStops(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var buf bytes.Buffer
+	client := &fieClient{
+		fieFilterPolicy: o.config.DefaultFIEFilterPolicy,
+		ctx:             ctx,
+		flusher:         nopFlusher{},
+		encoder:         json.NewEncoder(&buf),
+	}
+
+	fie := &api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+		FarInfo:            &api.Info{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		o.fieStreamHandler(client)
+		close(done)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	_ = o.ringBuffer.Push(fie)
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fieStreamHandler did not return after context cancel")
+	}
+
+	if buf.Len() == 0 {
+		t.Error("expected FIE to be written to buffer")
+	}
+}
+
+func TestHandleInternalStream_WithFilterPolicy(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var buf bytes.Buffer
+	client := &fieClient{
+		fieFilterPolicy: "both",
+		ctx:             ctx,
+		flusher:         nopFlusher{},
+		encoder:         json.NewEncoder(&buf),
+	}
+
+	// Incomplete FIE (missing FarInfo) — should be filtered out with "both" policy.
+	incompleteFie := &api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+	}
+
+	// Complete FIE — should pass through with "both" policy.
+	completeFie := &api.ForwardingInfoElement{
+		ProbingDirectiveID: 2,
+		NearInfo:           &api.Info{},
+		FarInfo:            &api.Info{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		o.fieStreamHandler(client)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	_ = o.ringBuffer.Push(incompleteFie)
+	_ = o.ringBuffer.Push(completeFie)
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fieStreamHandler did not return after context cancel")
+	}
+
+	if buf.Len() == 0 {
+		t.Error("expected FIE to be written to buffer")
+	}
+}
+
+func TestHandleInternalStream_SendFIEError(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := &fieClient{
+		ctx:     ctx,
+		flusher: nopFlusher{},
+		encoder: json.NewEncoder(&failWriter{}),
+	}
+
+	fie := &api.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		NearInfo:           &api.Info{},
+		FarInfo:            &api.Info{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		o.fieStreamHandler(client)
+		close(done)
+	}()
+
+	// Wait for consumer to be created before pushing.
+	time.Sleep(20 * time.Millisecond)
+	_ = o.ringBuffer.Push(fie)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fieStreamHandler did not return on sendFIE error")
 	}
 }
 

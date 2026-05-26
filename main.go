@@ -98,6 +98,7 @@ func run() error {
 		"impact_threshold", *impactThreshold,
 		"log_level", *logLevel,
 		"metrics_addr", *metricsAddr,
+		"retina_default_fie_filter_policy", *defaultFieFilterPolicy,
 	)
 
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {
