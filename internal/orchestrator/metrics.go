@@ -125,11 +125,11 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 		}),
 		SSEDisconnectionsTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "retina_orchestrator_sse_disconnections_total",
-			Help: "Total number of SSE disconnections, labelled by reason.",
+			Help: "Total number of SSE disconnections, labeled by reason.",
 		}, []string{"reason"}),
 		SSEEventsTotal: factory.NewCounterVec(prometheus.CounterOpts{
 			Name: "retina_orchestrator_sse_events_total",
-			Help: "Total number of SSE events published, labelled by event type.",
+			Help: "Total number of SSE events published, labeled by event type.",
 		}, []string{"event_type"}),
 	}
 }

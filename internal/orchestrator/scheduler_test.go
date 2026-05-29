@@ -268,7 +268,6 @@ func TestUpdateFromFIE_AddressImpactsProb(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			s := newTestScheduler(t, []*api.ProbingDirective{makePD(1), makePD(2)})
@@ -377,52 +376,63 @@ func TestNextPD_CycleDurationObserved(t *testing.T) {
 	}
 }
 
-func TestUpdateFromFIE_TimeoutClearsNearAddress(t *testing.T) {
+func TestUpdateFromFIE_TimeoutClearsStaleAddress(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
-	addr := net.ParseIP("10.0.0.1")
 
-	// First FIE: near address is set.
-	if err := s.UpdateFromFIE(makeFIE(1, addr, nil)); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, ok := s.impactRecords[ipKey(addr)]; !ok {
-		t.Fatal("expected impact record for near address")
-	}
-
-	// Second FIE: probe timeout, NearInfo is nil — stale address must be cleared.
-	if err := s.UpdateFromFIE(makeFIE(1, nil, nil)); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, ok := s.impactRecords[ipKey(addr)]; ok {
-		t.Error("expected stale near address impact record to be removed on timeout")
-	}
-	if s.pdMap[1].issuanceProb != 1.0 {
-		t.Errorf("expected issuance prob 1.0 after timeout, got %v", s.pdMap[1].issuanceProb)
-	}
-}
-
-func TestUpdateFromFIE_TimeoutClearsFarAddress(t *testing.T) {
-	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
-	addr := net.ParseIP("10.0.0.2")
-
-	// First FIE: far address is set.
-	if err := s.UpdateFromFIE(makeFIE(1, nil, addr)); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, ok := s.impactRecords[ipKey(addr)]; !ok {
-		t.Fatal("expected impact record for far address")
+	tests := []struct {
+		name     string
+		addr     net.IP
+		firstFIE *api.ForwardingInfoElement
+	}{
+		{
+			name: "near address",
+			addr: net.ParseIP("10.0.0.1"),
+			firstFIE: makeFIE(
+				1,
+				net.ParseIP("10.0.0.1"),
+				nil,
+			),
+		},
+		{
+			name: "far address",
+			addr: net.ParseIP("10.0.0.2"),
+			firstFIE: makeFIE(
+				1,
+				nil,
+				net.ParseIP("10.0.0.2"),
+			),
+		},
 	}
 
-	// Second FIE: probe timeout, FarInfo is nil — stale address must be cleared.
-	if err := s.UpdateFromFIE(makeFIE(1, nil, nil)); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if _, ok := s.impactRecords[ipKey(addr)]; ok {
-		t.Error("expected stale far address impact record to be removed on timeout")
-	}
-	if s.pdMap[1].issuanceProb != 1.0 {
-		t.Errorf("expected issuance prob 1.0 after timeout, got %v", s.pdMap[1].issuanceProb)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+
+			// First FIE: address is set.
+			if err := s.UpdateFromFIE(tt.firstFIE); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if _, ok := s.impactRecords[ipKey(tt.addr)]; !ok {
+				t.Fatal("expected impact record for address")
+			}
+
+			// Second FIE: probe timeout, both infos nil.
+			if err := s.UpdateFromFIE(makeFIE(1, nil, nil)); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if _, ok := s.impactRecords[ipKey(tt.addr)]; ok {
+				t.Error("expected stale address impact record to be removed on timeout")
+			}
+
+			if s.pdMap[1].issuanceProb != 1.0 {
+				t.Errorf(
+					"expected issuance prob 1.0 after timeout, got %v",
+					s.pdMap[1].issuanceProb,
+				)
+			}
+		})
 	}
 }
