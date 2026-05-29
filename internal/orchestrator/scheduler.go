@@ -67,7 +67,7 @@ type Scheduler struct {
 // path to the probing directives file.
 // Returns an error if the file cannot be read, issuanceRate is <= 0, or the
 // file contains no directives.
-func NewScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles int, logger *slog.Logger, metrics *Metrics, eventBuffer *structures.RingBuffer[SSEEvent]) (*Scheduler, error) {
+func NewScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles int, logger *slog.Logger, metrics *Metrics, eventBus EventBus) (*Scheduler, error) {
 	if issuanceRate <= 0.0 {
 		return nil, fmt.Errorf("invalid arguments: issuance rate cannot be zero or negative")
 	}
@@ -113,7 +113,7 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles in
 	return &Scheduler{
 		logger:         logger,
 		metrics:        metrics,
-		eventBuffer:    eventBuffer,
+		eventBuffer:    eventBus,
 		pdMap:          pdMap,
 		impactRecords:  make(map[string]*impactRecord),
 		issuancePeriod: time.Duration(float64(time.Second) / issuanceRate),

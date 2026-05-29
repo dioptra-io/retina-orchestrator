@@ -111,7 +111,7 @@ func TestNewScheduler_NilLogger(t *testing.T) {
 
 func TestNewScheduler_NilMetrics(t *testing.T) {
 	t.Parallel()
-	_, err := NewScheduler(0, 1.0, "valid/path.jsonl", testLogger(), nil, nil)
+	_, err := NewScheduler(0, 1.0, "valid/path.jsonl", 0, testLogger(), nil, nil)
 	if err == nil {
 		t.Fatal("expected error for nil metrics, got nil")
 	}

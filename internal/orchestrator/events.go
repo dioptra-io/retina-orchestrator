@@ -6,6 +6,8 @@ package orchestrator
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
 )
 
 // SSEEventType represents the type of SSE event.
@@ -80,3 +82,8 @@ func (e *SSEEvent) MarshalJSON() ([]byte, error) {
 
 	return json.Marshal(raw)
 }
+
+// EventBus is a buffer where the events are emitted. These are not used for
+// internal coordination but to be consumed by the clients connected to the sse
+// endpoint.
+type EventBus *structures.RingBuffer[SSEEvent]
