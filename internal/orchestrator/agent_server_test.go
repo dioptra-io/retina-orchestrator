@@ -14,10 +14,12 @@ import (
 // Remaining coverage gaps are unreachable without refactoring *net.TCPConn to
 // an interface, as syscall-level errors cannot be injected on a real connection:
 //   - newAgentStream: SetKeepAlive, SetKeepAlivePeriod, SetReadBuffer, SetWriteBuffer
-//   - listenAndServe: non-TCP type assertion, newAgentStream error continue,
-//     second shutdown race after listener setup
 //   - handshake: send error after auth recv — kernel buffers the write on loopback
-//     even when the client has already closed
+//     even when the client has already closed. SetDeadline error after successful
+//     auth — both require syscall-level injection unavailable on loopback.
+//   - listenAndServe: non-TCP type assertion, newAgentStream error continue,
+//     second shutdown race after listener setup — all require syscall-level
+//     error injection on *net.TCPConn.
 
 // -- helpers ------------------------------------------------------------------
 

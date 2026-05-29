@@ -161,7 +161,7 @@ func TestAPIServer_Close_Timeout(t *testing.T) {
 	startListening(t, s)
 
 	go func() {
-		resp, err := http.Get("http://" + addr + "/stream")
+		resp, err := http.Get("http://" + addr + "/api/v1/stream")
 		if err == nil {
 			_ = resp.Body.Close()
 		}
@@ -184,7 +184,7 @@ func TestHandleStream_SendFIE(t *testing.T) {
 	})
 	ts := startHandler(t, s)
 
-	resp, err := http.Get(ts.URL + "/stream")
+	resp, err := http.Get(ts.URL + "/api/v1/stream")
 	if err != nil {
 		t.Fatalf("cannot connect to /stream: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestHandleStream_DeferRemovesClient(t *testing.T) {
 	ts := startHandler(t, s)
 
 	go func() {
-		resp, err := http.Get(ts.URL + "/stream")
+		resp, err := http.Get(ts.URL + "/api/v1/stream")
 		if err == nil {
 			_ = resp.Body.Close()
 		}

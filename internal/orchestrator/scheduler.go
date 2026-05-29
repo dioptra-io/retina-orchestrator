@@ -17,7 +17,6 @@ import (
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 // pdState holds the scheduling state for a single ProbingDirective, including
@@ -79,7 +78,7 @@ func NewScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles in
 		logger = slog.Default()
 	}
 	if metrics == nil {
-		metrics = NewMetrics(prometheus.DefaultRegisterer)
+		return nil, fmt.Errorf("metrics cannot be nil")
 	}
 
 	pds, err := readPDs(pdFile)
@@ -201,9 +200,11 @@ func (s *Scheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
 	oldNearAddress, oldFarAddress := pd.lastHitNearAddress, pd.lastHitFarAddress
 
 	// Last hit addresses can be nil (e.g. on probe timeout).
+	pd.lastHitNearAddress = nil
 	if fie.NearInfo != nil {
 		pd.lastHitNearAddress = fie.NearInfo.ReplyAddress
 	}
+	pd.lastHitFarAddress = nil
 	if fie.FarInfo != nil {
 		pd.lastHitFarAddress = fie.FarInfo.ReplyAddress
 	}
@@ -218,11 +219,15 @@ func (s *Scheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
 	}
 
 	numNearImpacts, numFarImpacts := 0, 0
-	if rec, ok := s.impactRecords[ipKey(pd.lastHitNearAddress)]; ok {
-		numNearImpacts = len(rec.pds)
+	if pd.lastHitNearAddress != nil {
+		if rec, ok := s.impactRecords[ipKey(pd.lastHitNearAddress)]; ok {
+			numNearImpacts = len(rec.pds)
+		}
 	}
-	if rec, ok := s.impactRecords[ipKey(pd.lastHitFarAddress)]; ok {
-		numFarImpacts = len(rec.pds)
+	if pd.lastHitFarAddress != nil {
+		if rec, ok := s.impactRecords[ipKey(pd.lastHitFarAddress)]; ok {
+			numFarImpacts = len(rec.pds)
+		}
 	}
 
 	maxImpacts := max(numNearImpacts, numFarImpacts)

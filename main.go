@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 // @title			IP Routes Live API
-// @version		1.0
+// @version		1.0.0
 // @description	Streams forwarding info elements from connected Retina agents.
 // @host			iprl.dioptra.io
-// @BasePath		/
+// @BasePath		/api/v1
 package main
 
 import (
@@ -135,7 +135,7 @@ func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr
 }
 
 // newLogger creates a JSON logger writing to stdout at the given level.
-// Falls back to info if the level string is unrecognised.
+// Falls back to info if the level string is unrecognized.
 func newLogger(level string) *slog.Logger {
 	var l slog.Level
 	if err := l.UnmarshalText([]byte(level)); err != nil {
