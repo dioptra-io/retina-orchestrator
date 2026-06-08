@@ -1,0 +1,16 @@
+profile: coverage.out
+
+threshold:
+  package: 80
+  total: 90
+
+exclude:
+  paths:
+    - ^cmd/
+    - main\.go$
+    - ^docs/
+    - \.pb\.go$
+
+override:
+  - threshold: 10
+    path: ^internal/orchestrator/structures
