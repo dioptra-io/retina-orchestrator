@@ -1,0 +1,18 @@
+profile: coverage.out
+
+threshold:
+  package: 80
+  total: 90
+
+exclude:
+  paths:
+    - ^cmd/
+    - main\.go$
+    - ^docs/
+    - \.pb\.go$
+
+override:
+  # The 10% threshold is a -coverpkg=./... measurement artifact.
+  # The structures package is fully covered by its own unit tests.
+  - threshold: 10
+    path: ^internal/orchestrator/structures
