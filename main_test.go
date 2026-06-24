@@ -5,7 +5,7 @@
 //
 // Intentionally uncovered:
 //   - main(): thin wrapper around run() with os.Exit; standard practice.
-//   - run(): requires full orchestrator startup; covered by integration tests.
+//   - run(): requires full orchestrator startup.
 //   - startMetricsServer(): goroutine error log after Serve failure —
 //     requires closing the listener mid-serve, which is inherently racy.
 //   - envOrDefault*: os.Exit(1) on invalid input is untestable without

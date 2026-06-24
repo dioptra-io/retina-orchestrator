@@ -42,20 +42,35 @@ func makePD(id uint64) *api.ProbingDirective {
 	return &api.ProbingDirective{ProbingDirectiveID: id}
 }
 
-func makeFIE(id uint64, near, far net.IP) *api.ForwardingInfoElement {
-	fie := &api.ForwardingInfoElement{ProbingDirectiveID: id}
-	if near != nil {
-		fie.NearInfo = &api.Info{ReplyAddress: near}
+// makeFIEFull creates a FIE with both near and far replies — considered yielding.
+func makeFIEFull(id uint64, near, far net.IP) *api.ForwardingInfoElement {
+	return &api.ForwardingInfoElement{
+		ProbingDirectiveID: id,
+		NearInfo:           &api.Info{ReplyAddress: near},
+		FarInfo:            &api.Info{ReplyAddress: far},
 	}
-	if far != nil {
-		fie.FarInfo = &api.Info{ReplyAddress: far}
+}
+
+// makeFIETimeout creates a FIE with no replies — considered a miss.
+func makeFIETimeout(id uint64) *api.ForwardingInfoElement {
+	return &api.ForwardingInfoElement{ProbingDirectiveID: id}
+}
+
+func newTestSchedulerConfig(t *testing.T, pds []*api.ProbingDirective) *SchedulerConfig {
+	t.Helper()
+	return &SchedulerConfig{
+		Seed:                       42,
+		IssuanceRate:               1000.0,
+		PDPath:                     writeSchedulerPDFile(t, pds),
+		ActiveSetSize:              len(pds),
+		ConsecutiveMissesThreshold: 100, // high threshold so tests don't trigger replacement unexpectedly
+		MaxEvictions:               3,
 	}
-	return fie
 }
 
 func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
 	t.Helper()
-	s, err := NewScheduler(42, 1000.0, writeSchedulerPDFile(t, pds), testLogger(), testMetrics())
+	s, err := NewScheduler(newTestSchedulerConfig(t, pds), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,7 +82,10 @@ func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
 func TestNewScheduler_InvalidRate(t *testing.T) {
 	t.Parallel()
 	for _, rate := range []float64{0, -1} {
-		_, err := NewScheduler(0, rate, "irrelevant", nil, testMetrics())
+		_, err := NewScheduler(&SchedulerConfig{
+			Seed: 0, IssuanceRate: rate, PDPath: "irrelevant",
+			ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+		}, nil, testMetrics())
 		if err == nil {
 			t.Errorf("rate %v: expected error, got nil", rate)
 		}
@@ -76,7 +94,10 @@ func TestNewScheduler_InvalidRate(t *testing.T) {
 
 func TestNewScheduler_MissingFile(t *testing.T) {
 	t.Parallel()
-	_, err := NewScheduler(0, 1.0, "/nonexistent/path.jsonl", testLogger(), testMetrics())
+	_, err := NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0, PDPath: "/nonexistent/path.jsonl",
+		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+	}, testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
@@ -84,7 +105,10 @@ func TestNewScheduler_MissingFile(t *testing.T) {
 
 func TestNewScheduler_EmptyFile(t *testing.T) {
 	t.Parallel()
-	_, err := NewScheduler(0, 1.0, writeSchedulerPDFile(t, nil), testLogger(), testMetrics())
+	_, err := NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0, PDPath: writeSchedulerPDFile(t, nil),
+		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+	}, testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected error for empty directive file, got nil")
 	}
@@ -100,7 +124,10 @@ func TestNewScheduler_Valid(t *testing.T) {
 
 func TestNewScheduler_NilLogger(t *testing.T) {
 	t.Parallel()
-	s, err := NewScheduler(0, 1.0, writeSchedulerPDFile(t, []*api.ProbingDirective{makePD(1)}), nil, testMetrics())
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0, PDPath: writeSchedulerPDFile(t, []*api.ProbingDirective{makePD(1)}),
+		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+	}, nil, testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error with nil logger: %v", err)
 	}
@@ -111,7 +138,10 @@ func TestNewScheduler_NilLogger(t *testing.T) {
 
 func TestNewScheduler_NilMetrics(t *testing.T) {
 	t.Parallel()
-	_, err := NewScheduler(0, 1.0, "valid/path.jsonl", testLogger(), nil)
+	_, err := NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0, PDPath: "valid/path.jsonl",
+		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+	}, testLogger(), nil)
 	if err == nil {
 		t.Fatal("expected error for nil metrics, got nil")
 	}
@@ -131,7 +161,10 @@ func TestReadPDs_InvalidJSON(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("cannot close temp file: %v", err)
 	}
-	_, err = NewScheduler(0, 1.0, f.Name(), testLogger(), testMetrics())
+	_, err = NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0, PDPath: f.Name(),
+		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+	}, testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected unmarshal error for invalid JSON, got nil")
 	}
@@ -151,7 +184,10 @@ func TestReadPDs_ScannerError(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("cannot close temp file: %v", err)
 	}
-	_, err = NewScheduler(0, 1.0, f.Name(), testLogger(), testMetrics())
+	_, err = NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0, PDPath: f.Name(),
+		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+	}, testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected scanner error for oversized line, got nil")
 	}
@@ -194,7 +230,8 @@ func TestRecordImpact_NilAddressAfterNonNil(t *testing.T) {
 	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
 	addr := net.ParseIP("10.0.0.1")
 
-	if err := s.UpdateFromFIE(makeFIE(1, addr, nil)); err != nil {
+	// Use a full FIE to avoid incrementing consecutiveMisses.
+	if err := s.UpdateFromFIE(makeFIEFull(1, addr, net.ParseIP("10.0.0.2"))); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// NearInfo present but ReplyAddress nil: triggers recordImpact(nil, pd),
@@ -202,6 +239,7 @@ func TestRecordImpact_NilAddressAfterNonNil(t *testing.T) {
 	fie := &api.ForwardingInfoElement{
 		ProbingDirectiveID: 1,
 		NearInfo:           &api.Info{ReplyAddress: nil},
+		FarInfo:            &api.Info{ReplyAddress: net.ParseIP("10.0.0.2")},
 	}
 	if err := s.UpdateFromFIE(fie); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -216,15 +254,16 @@ func TestRecordImpact_NilAddressAfterNonNil(t *testing.T) {
 func TestUpdateFromFIE_UnknownID(t *testing.T) {
 	t.Parallel()
 	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
-	if err := s.UpdateFromFIE(makeFIE(99, nil, nil)); err == nil {
-		t.Fatal("expected error for unknown directive ID, got nil")
+	// Unknown PD ID is treated as a stale FIE from a replaced directive — not an error.
+	if err := s.UpdateFromFIE(makeFIETimeout(99)); err != nil {
+		t.Fatalf("expected nil for unknown directive ID, got: %v", err)
 	}
 }
 
 func TestUpdateFromFIE_NilNearAndFar(t *testing.T) {
 	t.Parallel()
 	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
-	if err := s.UpdateFromFIE(makeFIE(1, nil, nil)); err != nil {
+	if err := s.UpdateFromFIE(makeFIETimeout(1)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if s.pdMap[1].issuanceProb != 1.0 {
@@ -238,7 +277,8 @@ func TestUpdateFromFIE_NilNearAndFar(t *testing.T) {
 func TestUpdateFromFIE_SingleDirectiveSingleAddress(t *testing.T) {
 	t.Parallel()
 	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
-	if err := s.UpdateFromFIE(makeFIE(1, net.ParseIP("10.0.0.1"), nil)); err != nil {
+	// Use full FIE so the directive is considered yielding.
+	if err := s.UpdateFromFIE(makeFIEFull(1, net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.2"))); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Only this directive impacts the address: probability stays 1.0.
@@ -249,42 +289,19 @@ func TestUpdateFromFIE_SingleDirectiveSingleAddress(t *testing.T) {
 
 func TestUpdateFromFIE_AddressImpactsProb(t *testing.T) {
 	t.Parallel()
+	// Test near address sharing; far address follows the same logic symmetrically.
+	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1), makePD(2)})
+	addr := net.ParseIP("10.0.0.1")
 
-	tests := []struct {
-		name string
-		fie1 func(net.IP) *api.ForwardingInfoElement
-		fie2 func(net.IP) *api.ForwardingInfoElement
-	}{
-		{
-			name: "near address",
-			fie1: func(addr net.IP) *api.ForwardingInfoElement { return makeFIE(1, addr, nil) },
-			fie2: func(addr net.IP) *api.ForwardingInfoElement { return makeFIE(2, addr, nil) },
-		},
-		{
-			name: "far address",
-			fie1: func(addr net.IP) *api.ForwardingInfoElement { return makeFIE(1, nil, addr) },
-			fie2: func(addr net.IP) *api.ForwardingInfoElement { return makeFIE(2, nil, addr) },
-		},
+	if err := s.UpdateFromFIE(makeFIEFull(1, addr, net.ParseIP("10.0.1.1"))); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			s := newTestScheduler(t, []*api.ProbingDirective{makePD(1), makePD(2)})
-			addr := net.ParseIP("10.0.0.1")
-
-			if err := s.UpdateFromFIE(tt.fie1(addr)); err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if err := s.UpdateFromFIE(tt.fie2(addr)); err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			// Two directives share addr: maxImpacts=2, prob=0.5.
-			if s.pdMap[2].issuanceProb != 0.5 {
-				t.Errorf("expected issuance prob 0.5, got %v", s.pdMap[2].issuanceProb)
-			}
-		})
+	if err := s.UpdateFromFIE(makeFIEFull(2, addr, net.ParseIP("10.0.1.2"))); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Two directives share addr: maxImpacts=2, prob=0.5.
+	if s.pdMap[2].issuanceProb != 0.5 {
+		t.Errorf("expected issuance prob 0.5, got %v", s.pdMap[2].issuanceProb)
 	}
 }
 
@@ -293,11 +310,12 @@ func TestUpdateFromFIE_AddressChange(t *testing.T) {
 	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
 	addr1 := net.ParseIP("10.0.0.1")
 	addr2 := net.ParseIP("10.0.0.2")
+	far := net.ParseIP("10.0.0.3")
 
-	if err := s.UpdateFromFIE(makeFIE(1, addr1, nil)); err != nil {
+	if err := s.UpdateFromFIE(makeFIEFull(1, addr1, far)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := s.UpdateFromFIE(makeFIE(1, addr2, nil)); err != nil {
+	if err := s.UpdateFromFIE(makeFIEFull(1, addr2, far)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if _, ok := s.impactRecords[ipKey(addr1)]; ok {
@@ -310,23 +328,20 @@ func TestUpdateFromFIE_AddressChange(t *testing.T) {
 
 func TestUpdateFromFIE_MaxOfNearAndFarImpacts(t *testing.T) {
 	t.Parallel()
-	// pd1 hits nearAddr (1 impact) and farAddr (3 impacts via pd1..pd3):
-	// maxImpacts=3, so pd1's prob=1/3.
 	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1), makePD(2), makePD(3)})
 	nearAddr := net.ParseIP("10.0.0.1")
 	farAddr := net.ParseIP("10.0.0.2")
 
-	if err := s.UpdateFromFIE(makeFIE(1, nearAddr, farAddr)); err != nil {
+	if err := s.UpdateFromFIE(makeFIEFull(1, nearAddr, farAddr)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := s.UpdateFromFIE(makeFIE(2, nil, farAddr)); err != nil {
+	if err := s.UpdateFromFIE(makeFIEFull(2, net.ParseIP("10.0.0.3"), farAddr)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if err := s.UpdateFromFIE(makeFIE(3, nil, farAddr)); err != nil {
+	if err := s.UpdateFromFIE(makeFIEFull(3, net.ParseIP("10.0.0.4"), farAddr)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Re-update pd1 so its probability is recalculated with full impact knowledge.
-	if err := s.UpdateFromFIE(makeFIE(1, nearAddr, farAddr)); err != nil {
+	if err := s.UpdateFromFIE(makeFIEFull(1, nearAddr, farAddr)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	const want = 1.0 / 3.0
@@ -335,7 +350,141 @@ func TestUpdateFromFIE_MaxOfNearAndFarImpacts(t *testing.T) {
 	}
 }
 
-// -- NextPD -------------------------------------------------------------------
+func TestUpdateFromFIE_ConsecutiveMissesTriggersReplacement(t *testing.T) {
+	t.Parallel()
+	// Active set: pd1. Unused pool: pd2 (same agent).
+	pds := []*api.ProbingDirective{
+		{ProbingDirectiveID: 1, AgentID: "agent-a"},
+		{ProbingDirectiveID: 2, AgentID: "agent-a"},
+	}
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       42,
+		IssuanceRate:               1000.0,
+		PDPath:                     writeSchedulerPDFile(t, pds),
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Send ConsecutiveMissesThreshold nil FIEs to trigger replacement.
+	// The last call removes pd1 from pdMap; errors are expected after that.
+	for range s.config.ConsecutiveMissesThreshold {
+		_ = s.UpdateFromFIE(makeFIETimeout(1))
+	}
+
+	// pd1 should be gone from active set, pd2 should be there.
+	if _, ok := s.pdMap[1]; ok {
+		t.Error("expected pd1 to be replaced out of active set")
+	}
+	if _, ok := s.pdMap[2]; !ok {
+		t.Error("expected pd2 to be drawn into active set")
+	}
+}
+
+func TestReplacePD_PermanentEviction(t *testing.T) {
+	t.Parallel()
+	// Active set: pd1. Unused pool: pd2, pd3 (same agent).
+	// MaxEvictions=1: a PD is permanently evicted after one recycling.
+	pds := []*api.ProbingDirective{
+		{ProbingDirectiveID: 1, AgentID: "agent-a"},
+		{ProbingDirectiveID: 2, AgentID: "agent-a"},
+		{ProbingDirectiveID: 3, AgentID: "agent-a"},
+	}
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       42,
+		IssuanceRate:               1000.0,
+		PDPath:                     writeSchedulerPDFile(t, pds),
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               1,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	triggerReplacement := func() {
+		var activeID uint64
+		for id := range s.pdMap {
+			activeID = id
+		}
+		for range s.config.ConsecutiveMissesThreshold {
+			_ = s.UpdateFromFIE(makeFIETimeout(activeID))
+		}
+	}
+
+	// With MaxEvictions=1 and 3 PDs, each PD gets recycled once in the first
+	// three rounds (evictionCount becomes 1). On the fourth round, the active
+	// PD already has evictionCount=1 >= MaxEvictions and is permanently evicted.
+	triggerReplacement()
+	triggerReplacement()
+	triggerReplacement()
+	triggerReplacement()
+
+	// PDsEvictedTotal should have incremented.
+	if len(s.unusedByAgent["agent-a"]) >= 3 {
+		t.Errorf("expected unused pool to shrink due to permanent eviction, got %d entries", len(s.unusedByAgent["agent-a"]))
+	}
+}
+
+func TestReplacePD_PoolExhausted(t *testing.T) {
+	t.Parallel()
+	// Active set: pd1 only, no unused pool.
+	pds := []*api.ProbingDirective{
+		{ProbingDirectiveID: 1, AgentID: "agent-a"},
+	}
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       42,
+		IssuanceRate:               1000.0,
+		PDPath:                     writeSchedulerPDFile(t, pds),
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Trigger replacement — unused pool is empty, replacePD returns nil.
+	for range s.config.ConsecutiveMissesThreshold {
+		_ = s.UpdateFromFIE(makeFIETimeout(1))
+	}
+	// pd1 moved to unused pool, active set is empty — NextPD returns nil.
+	s.issuancePeriod = 0
+	pd := s.NextPD()
+	if pd != nil {
+		t.Errorf("expected nil from NextPD when pool exhausted, got pd %d", pd.ProbingDirectiveID)
+	}
+}
+
+func TestNextPD_PoolExhaustedOnBernoulli(t *testing.T) {
+	t.Parallel()
+	// Single PD, no unused pool — Bernoulli failure with nothing to replace from.
+	pds := []*api.ProbingDirective{
+		{ProbingDirectiveID: 1, AgentID: "agent-a"},
+	}
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       42,
+		IssuanceRate:               1000.0,
+		PDPath:                     writeSchedulerPDFile(t, pds),
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 100,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Force Bernoulli failure — unused pool is empty so replacePD returns nil.
+	s.pdMap[1].issuanceProb = 0.0
+	s.issuancePeriod = 0
+	pd := s.NextPD()
+	if pd != nil {
+		t.Errorf("expected nil when pool exhausted on Bernoulli failure, got pd %d", pd.ProbingDirectiveID)
+	}
+}
 
 func TestNextPD_ReturnsDirective(t *testing.T) {
 	t.Parallel()
@@ -345,33 +494,38 @@ func TestNextPD_ReturnsDirective(t *testing.T) {
 	}
 }
 
-func TestNextPD_SkipsDirective(t *testing.T) {
+func TestNextPD_ReplacesOnLowProbability(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+	// Active set: pd1. Unused pool: pd2 (same agent).
+	pds := []*api.ProbingDirective{
+		{ProbingDirectiveID: 1, AgentID: "agent-a"},
+		{ProbingDirectiveID: 2, AgentID: "agent-a"},
+	}
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       42,
+		IssuanceRate:               1000.0,
+		PDPath:                     writeSchedulerPDFile(t, pds),
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Force issuance prob to 0 to guarantee Bernoulli failure and replacement.
 	s.pdMap[1].issuanceProb = 0.0
-	if pd := s.NextPD(); pd != nil {
-		t.Fatal("expected nil directive when issuance probability is 0")
+	pd := s.NextPD()
+	// Should return the replacement (pd2), not nil.
+	if pd == nil || pd.ProbingDirectiveID != 2 {
+		t.Errorf("expected replacement pd2, got %v", pd)
 	}
 }
 
-// TestNextPD_CycleDurationObserved covers the branch inside NextPD that
-// records CycleDurationSeconds. The branch requires:
-//  1. A cycle transition (oldCycle != newCycle), which sets lastCycleBegin.
-//  2. A *second* cycle transition, at which point lastCycleBegin is non-zero
-//     and the Observe call is reached.
-//
-// With a single PD the randomizer completes a full cycle on every call, so
-// three calls are sufficient: call 1 ends cycle 0 (sets lastCycleBegin), call
-// 2 ends cycle 1 (hits the Observe branch).
 func TestNextPD_CycleDurationObserved(t *testing.T) {
 	t.Parallel()
 	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
-
-	// Force issuancePeriod to zero so NextPD does not sleep.
 	s.issuancePeriod = 0
-
-	// Three calls on a single-element scheduler guarantee two cycle
-	// transitions, which is enough to hit the Observe branch.
 	for range 3 {
 		s.NextPD()
 	}
@@ -381,16 +535,29 @@ func TestUpdateFromFIE_TimeoutClearsStaleAddress(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		fie  func(net.IP) *api.ForwardingInfoElement
+		name     string
+		firstFIE func(net.IP) *api.ForwardingInfoElement
+		resetFIE func(net.IP) *api.ForwardingInfoElement
 	}{
 		{
 			name: "near address",
-			fie:  func(addr net.IP) *api.ForwardingInfoElement { return makeFIE(1, addr, nil) },
+			// Full FIE to establish near address without counting as miss.
+			firstFIE: func(addr net.IP) *api.ForwardingInfoElement {
+				return makeFIEFull(1, addr, net.ParseIP("10.0.0.99"))
+			},
+			// FIE with nil near clears the stale near address.
+			resetFIE: func(addr net.IP) *api.ForwardingInfoElement {
+				return makeFIEFull(1, nil, net.ParseIP("10.0.0.99"))
+			},
 		},
 		{
 			name: "far address",
-			fie:  func(addr net.IP) *api.ForwardingInfoElement { return makeFIE(1, nil, addr) },
+			firstFIE: func(addr net.IP) *api.ForwardingInfoElement {
+				return makeFIEFull(1, net.ParseIP("10.0.0.99"), addr)
+			},
+			resetFIE: func(addr net.IP) *api.ForwardingInfoElement {
+				return makeFIEFull(1, net.ParseIP("10.0.0.99"), nil)
+			},
 		},
 	}
 
@@ -401,23 +568,23 @@ func TestUpdateFromFIE_TimeoutClearsStaleAddress(t *testing.T) {
 			s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
 			addr := net.ParseIP("10.0.0.1")
 
-			// First FIE: address is set.
-			if err := s.UpdateFromFIE(tt.fie(addr)); err != nil {
+			if err := s.UpdateFromFIE(tt.firstFIE(addr)); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if _, ok := s.impactRecords[ipKey(addr)]; !ok {
 				t.Fatalf("expected impact record for %s", tt.name)
 			}
 
-			// Second FIE: probe timeout, both fields nil — stale address must be cleared.
-			if err := s.UpdateFromFIE(makeFIE(1, nil, nil)); err != nil {
+			if err := s.UpdateFromFIE(tt.resetFIE(addr)); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if _, ok := s.impactRecords[ipKey(addr)]; ok {
-				t.Errorf("expected stale %s impact record to be removed on timeout", tt.name)
+				t.Errorf("expected stale %s impact record to be removed", tt.name)
 			}
-			if s.pdMap[1].issuanceProb != 1.0 {
-				t.Errorf("expected issuance prob 1.0 after timeout, got %v", s.pdMap[1].issuanceProb)
+			if pd, ok := s.pdMap[1]; ok {
+				if pd.issuanceProb != 1.0 {
+					t.Errorf("expected issuance prob 1.0 after address cleared, got %v", pd.issuanceProb)
+				}
 			}
 		})
 	}

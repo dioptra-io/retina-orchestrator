@@ -53,16 +53,19 @@ func writePDFile(t *testing.T) string {
 func validConfig(t *testing.T) *Config {
 	t.Helper()
 	return &Config{
-		AgentAddress:      "127.0.0.1:0",
-		AgentBufferLength: 8192,
-		PDQueueSize:       100,
-		RingBufferSize:    100,
-		APIAddress:        "127.0.0.1:0",
-		PDPath:            writePDFile(t),
-		Seed:              0,
-		IssuanceRate:      1.0,
-		ImpactThreshold:   1.0,
-		Secret:            "secret",
+		AgentAddress:               "127.0.0.1:0",
+		AgentBufferLength:          8192,
+		PDQueueSize:                100,
+		RingBufferSize:             100,
+		APIAddress:                 "127.0.0.1:0",
+		PDPath:                     writePDFile(t),
+		Seed:                       0,
+		IssuanceRate:               1.0,
+		ImpactThreshold:            1.0,
+		Secret:                     "secret",
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
 	}
 }
 
@@ -141,6 +144,9 @@ func TestConfig_Validate_Errors(t *testing.T) {
 		{"zero ImpactThreshold", func(c *Config) { c.ImpactThreshold = 0 }},
 		{"negative ImpactThreshold", func(c *Config) { c.ImpactThreshold = -1 }},
 		{"invalid FIEFilterPolicy", func(c *Config) { c.FIEFilterPolicy = "invalid" }},
+		{"zero ActiveSetSize", func(c *Config) { c.ActiveSetSize = 0 }},
+		{"zero ConsecutiveMissesThreshold", func(c *Config) { c.ConsecutiveMissesThreshold = 0 }},
+		{"zero MaxEvictions", func(c *Config) { c.MaxEvictions = 0 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -244,11 +250,6 @@ func TestRunScheduler_SkipsNilPD(t *testing.T) {
 	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Set all PD issuance probabilities to 0 so NextPD always returns nil.
-	for _, pd := range o.scheduler.pdMap {
-		pd.issuanceProb = 0.0
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
