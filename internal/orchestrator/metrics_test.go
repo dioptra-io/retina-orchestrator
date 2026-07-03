@@ -23,6 +23,7 @@ func TestNewMetrics_WithRegistry(t *testing.T) {
 	m := NewMetrics(reg)
 	if m == nil {
 		t.Fatal("expected non-nil Metrics")
+		return
 	}
 
 	// NOTE: If a new metric is added to Metrics, add a corresponding nil check here.
