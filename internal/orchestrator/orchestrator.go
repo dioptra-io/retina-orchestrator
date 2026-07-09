@@ -93,7 +93,7 @@ type orch struct {
 	config          *Config
 	logger          *slog.Logger
 	metrics         *Metrics
-	scheduler       *Scheduler
+	scheduler       Scheduler
 	agentServer     *agentServer
 	apiServer       *apiServer
 	pdQueue         *structures.Queue[api.ProbingDirective]
