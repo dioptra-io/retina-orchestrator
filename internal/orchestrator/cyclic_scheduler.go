@@ -63,11 +63,11 @@ type CyclicScheduler struct {
 	issuedThisCycle int
 }
 
-// NewScheduler creates a new Scheduler from the given seed, issuance rate, and
+// NewCyclicScheduler creates a new Scheduler from the given seed, issuance rate, and
 // path to the probing directives file.
 // Returns an error if the file cannot be read, issuanceRate is <= 0, or the
 // file contains no directives.
-func NewScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles int, logger *slog.Logger, metrics *Metrics, eventBus EventBus) (*CyclicScheduler, error) {
+func NewCyclicScheduler(seed uint64, issuanceRate float64, pdFile string, maxCycles int, logger *slog.Logger, metrics *Metrics, eventBus EventBus) (*CyclicScheduler, error) {
 	if issuanceRate <= 0.0 {
 		return nil, fmt.Errorf("invalid arguments: issuance rate cannot be zero or negative")
 	}

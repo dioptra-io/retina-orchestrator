@@ -48,6 +48,12 @@ type Config struct {
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
+
+	PoissonWheelSpan     time.Duration
+	PoissonSlotPeriod    time.Duration
+	PoissonFIEChanSize   int
+	StartingIssuanceRate float64
+	LearningRate         float64
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -129,9 +135,19 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.eventRingBuffer = eventBuffer
 
-	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, config.MaxCycles, logger.With("component", "scheduler"), metrics, eventBuffer)
+	// The retina reseach instance uses the PoissonScheduler.
+	scheduler, err := NewPoissonScheduler(
+		config.Seed,
+		config.PDPath,
+		config.PoissonWheelSpan,
+		config.PoissonSlotPeriod,
+		config.PoissonFIEChanSize,
+		config.StartingIssuanceRate,
+		config.LearningRate,
+		logger,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("error on creating scheduler: %w", err)
+		return nil, fmt.Errorf("error on creating poisson scheduler: %w", err)
 	}
 	o.scheduler = scheduler
 
