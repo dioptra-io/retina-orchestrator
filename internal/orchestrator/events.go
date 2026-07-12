@@ -14,12 +14,14 @@ import (
 type SSEEventType string
 
 const (
-	SSEEventOperatorStarted   SSEEventType = "OperatorStarted"
-	SSEEventOperatorStopped   SSEEventType = "OperatorStopped"
-	SSEEventAgentConnected    SSEEventType = "AgentConnected"
-	SSEEventAgentDisconnected SSEEventType = "AgentDisconnected"
-	SSEEventCycleStarted      SSEEventType = "CycleStarted"
-	SSEEventCycleFinished     SSEEventType = "CycleFinished"
+	SSEEventOperatorStarted         SSEEventType = "OperatorStarted"
+	SSEEventOperatorStopped         SSEEventType = "OperatorStopped"
+	SSEEventAgentConnected          SSEEventType = "AgentConnected"
+	SSEEventAgentDisconnected       SSEEventType = "AgentDisconnected"
+	SSEEventCycleStarted            SSEEventType = "CycleStarted"
+	SSEEventCycleFinished           SSEEventType = "CycleFinished"
+	SSEEventRateAdjusted            SSEEventType = "RateAdjusted"
+	SSEEventPoissonSchedulerStarted SSEEventType = "PoissonSchedulerStarted"
 )
 
 // SSEEvent is a server-sent event with a type, data, and timestamp.
@@ -55,6 +57,19 @@ type CycleStartedData struct {
 type CycleFinishedData struct {
 	Cycle  int `json:"cycle"`
 	Issued int `json:"issued"`
+}
+
+// RateAdjustedData is emitted when the issuance rate of a PD is changed in the
+// poisson scheduler.
+type RateAdjustedData struct {
+	ProbingDirectiveID uint64  `json:"probing_directive_id"`
+	PreviousRate       float64 `json:"previous_rate"`
+	CurrentRate        float64 `json:"current_rate"`
+}
+
+type PoissonSchedulerStartedData struct {
+	Config
+	NumberOfPDs int `json:"number_of_pds"`
 }
 
 // MarshalJSON implements json.Marshaler for SSEEvent.

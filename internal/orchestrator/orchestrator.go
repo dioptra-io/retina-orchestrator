@@ -149,6 +149,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		config.MinIssuanceRate,
 		config.MaxIssuanceRate,
 		logger,
+		eventBuffer,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating poisson scheduler: %w", err)
@@ -223,6 +224,19 @@ func (o *orch) Run(parentCtx context.Context) error {
 	})
 
 	return err
+}
+
+func (o *orch) emitConfigEvent() {
+	if ps, ok := o.scheduler.(*PoissonScheduler); ok {
+		o.publishEvent(SSEEvent{
+			Type:      SSEEventPoissonSchedulerStarted,
+			Timestamp: time.Now(),
+			Data: PoissonSchedulerStartedData{
+				Config:      *o.config,
+				NumberOfPDs: len(ps.pdSet),
+			},
+		})
+	}
 }
 
 func (o *orch) runScheduler(ctx context.Context) error {
@@ -334,6 +348,10 @@ func (o *orch) sseStreamHandler(s *sseClient) {
 		o.metrics.SSEDisconnectionsTotal.WithLabelValues(closeReason).Inc()
 		o.logger.Debug("SSE stream closed", slog.String("reason", closeReason))
 	}()
+
+	// This is a bad fix, but the idea is to send the config every time there is
+	// a new connection.
+	o.emitConfigEvent()
 
 	for {
 		event, _, err := consumer.Pop(s.context())

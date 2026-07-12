@@ -28,7 +28,8 @@ type PoissonScheduler struct {
 	MinIssuanceRate float64
 	MaxIssuanceRate float64
 
-	logger *slog.Logger
+	logger   *slog.Logger
+	eventBus *structures.RingBuffer[SSEEvent]
 
 	ipImpactRecords map[string]*poissonSchedulerRPImpactRecord //nolint:unused // will be used in the responsible probing implementation
 
@@ -123,7 +124,9 @@ func NewPoissonScheduler(
 	learningRate,
 	minIssuanceRate,
 	maxIssuanceRate float64,
-	logger *slog.Logger) (*PoissonScheduler, error) {
+	logger *slog.Logger,
+	eventBus EventBus,
+) (*PoissonScheduler, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -154,6 +157,7 @@ func NewPoissonScheduler(
 
 	sched := &PoissonScheduler{
 		logger:          logger,
+		eventBus:        eventBus,
 		LearningRate:    learningRate,
 		MinIssuanceRate: minIssuanceRate,
 		MaxIssuanceRate: maxIssuanceRate,
@@ -174,28 +178,7 @@ func NewPoissonScheduler(
 		rand:         rand.New(rand.NewSource(int64(seed))), //nolint:gosec // G404: math/rand is fine, not used for security
 	}
 
-	for _, pd := range pdSet {
-		node := &poissonSchedulerNode{
-			pdid:           pd.ProbingDirectiveID,
-			next:           nil,
-			issueCounter:   1,
-			issuancePeriod: structures.AtomicFloat64{},
-			scheduler:      sched,
-		}
-		node.issuancePeriod.Store(1.0 / startingIssuanceRate)
-		// Here the all of the PDs are scheduled to the next moment which is not
-		// ideal so in the future iterations this needs a better approach.
-		nodeSet[pd.ProbingDirectiveID] = node
-		if e, ok := sched.slots[0][0]; ok {
-			e.push(node)
-		} else {
-			sched.slots[0][0] = &poissonSchedulerEntry{
-				head: node,
-				tail: node,
-				size: 1,
-			}
-		}
-	}
+	sched.initNodes(startingIssuanceRate)
 	return sched, nil
 }
 
@@ -274,6 +257,28 @@ func (w *PoissonScheduler) NextPD() (*api.ProbingDirective, error) {
 func (w *PoissonScheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
 	w.fieChan <- fie
 	return nil
+}
+
+// initNodes creates a scheduler node per PD, all scheduled into the first
+// slot of the wheel. Scheduling everything at slot (0,0) is not ideal and
+// should be spread out in a future iteration.
+func (w *PoissonScheduler) initNodes(startingIssuanceRate float64) {
+	for _, pd := range w.pdSet {
+		node := &poissonSchedulerNode{
+			pdid:           pd.ProbingDirectiveID,
+			issueCounter:   1,
+			issuancePeriod: structures.AtomicFloat64{},
+			scheduler:      w,
+		}
+		node.issuancePeriod.Store(1.0 / startingIssuanceRate)
+		w.nodeSet[pd.ProbingDirectiveID] = node
+
+		if e, ok := w.slots[0][0]; ok {
+			e.push(node)
+		} else {
+			w.slots[0][0] = &poissonSchedulerEntry{head: node, tail: node, size: 1}
+		}
+	}
 }
 
 // updateCounters computes the time passed since the startTime and updates the
@@ -468,14 +473,25 @@ func (n *poissonSchedulerNode) updateIssuanceRate() {
 	}
 
 	if unique == 1 {
-		period := n.issuancePeriod.Load() * (1 + n.scheduler.LearningRate)
-		if 1.0/period < n.scheduler.MinIssuanceRate {
-			period = 1.0 / n.scheduler.MinIssuanceRate
+		oldPeriod := n.issuancePeriod.Load()
+		newPeriod := oldPeriod * (1 + n.scheduler.LearningRate)
+		if 1.0/newPeriod < n.scheduler.MinIssuanceRate {
+			newPeriod = 1.0 / n.scheduler.MinIssuanceRate
 		}
-		if 1.0/period > n.scheduler.MaxIssuanceRate {
-			period = 1.0 / n.scheduler.MaxIssuanceRate
+		if 1.0/newPeriod > n.scheduler.MaxIssuanceRate {
+			newPeriod = 1.0 / n.scheduler.MaxIssuanceRate
 		}
-		n.issuancePeriod.Store(period)
+		n.issuancePeriod.Store(newPeriod)
+
+		n.scheduler.eventBus.Push(&SSEEvent{
+			Type:      SSEEventRateAdjusted,
+			Timestamp: time.Now(),
+			Data: &RateAdjustedData{
+				ProbingDirectiveID: n.pdid,
+				PreviousRate:       1.0 / oldPeriod,
+				CurrentRate:        1.0 / newPeriod,
+			},
+		})
 	}
 }
 
