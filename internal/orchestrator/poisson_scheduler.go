@@ -24,7 +24,9 @@ const (
 // [here](https://gist.github.com/ubombar/b09929674d19e6440ad0310cf43568e7).
 type PoissonScheduler struct {
 	// Config variables
-	LearningRate float64
+	LearningRate    float64
+	MinIssuanceRate float64
+	MaxIssuanceRate float64
 
 	logger *slog.Logger
 
@@ -61,6 +63,7 @@ func readPDMap(filepath string) (map[uint64]*api.ProbingDirective, error) {
 	}()
 
 	results := make(map[uint64]*api.ProbingDirective)
+	// bufio has a 64Kb line limit which a single PD is not expected to reach.
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		var obj api.ProbingDirective
@@ -77,6 +80,39 @@ func readPDMap(filepath string) (map[uint64]*api.ProbingDirective, error) {
 	return results, nil
 }
 
+// validatePoissonSchedulerConfig checks the scheduler configuration and
+// returns an error describing the first invalid parameter found.
+func validatePoissonSchedulerConfig(
+	wheelSpan,
+	slotPeriod time.Duration,
+	startingIssuanceRate,
+	learningRate,
+	minIssuanceRate,
+	maxIssuanceRate float64) error {
+	if slotPeriod.Milliseconds() <= 0 {
+		return fmt.Errorf("slot period cannot be smaller than a millisecond: %v", slotPeriod)
+	}
+	if wheelSpan < slotPeriod {
+		return fmt.Errorf("wheel span (%v) cannot be smaller than the slot period (%v)", wheelSpan, slotPeriod)
+	}
+	if minIssuanceRate <= 0.0 {
+		return fmt.Errorf("minIssuanceRate cannot be zero or less: %v", minIssuanceRate)
+	}
+	if maxIssuanceRate > 6.0 {
+		return fmt.Errorf("maxIssuanceRate cannot be more than 5 times a second: %v", maxIssuanceRate)
+	}
+	if maxIssuanceRate < minIssuanceRate {
+		return fmt.Errorf("maxIssuanceRate (%v) cannot be smaller than minIssuanceRate (%v)", maxIssuanceRate, minIssuanceRate)
+	}
+	if startingIssuanceRate < minIssuanceRate || startingIssuanceRate > maxIssuanceRate {
+		return fmt.Errorf("startingIssuanceRate is not within the range: %v", startingIssuanceRate)
+	}
+	if learningRate < 0 || learningRate >= 1 {
+		return fmt.Errorf("learningRate must be in [0, 1): %v", learningRate)
+	}
+	return nil
+}
+
 func NewPoissonScheduler(
 	seed uint64,
 	pdFile string,
@@ -84,10 +120,18 @@ func NewPoissonScheduler(
 	slotPeriod time.Duration,
 	fieChanSize int,
 	startingIssuanceRate,
-	learningRate float64,
+	learningRate,
+	minIssuanceRate,
+	maxIssuanceRate float64,
 	logger *slog.Logger) (*PoissonScheduler, error) {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if err := validatePoissonSchedulerConfig(
+		wheelSpan, slotPeriod,
+		startingIssuanceRate, learningRate,
+		minIssuanceRate, maxIssuanceRate); err != nil {
+		return nil, err
 	}
 
 	pdSet, err := readPDMap(pdFile)
@@ -97,13 +141,11 @@ func NewPoissonScheduler(
 	if len(pdSet) == 0 {
 		return nil, fmt.Errorf("invalid arguments: pds length cannot be zero")
 	}
-
 	logger.Info("Scheduler loaded directives",
 		slog.Int("count", len(pdSet)),
 		slog.String("file", pdFile))
-
 	n := uint64(len(pdSet))
-	numSlots := uint64(math.Ceil((wheelSpan / slotPeriod).Seconds()))
+	numSlots := uint64(math.Ceil(wheelSpan.Seconds() / slotPeriod.Seconds()))
 	slots := make([]map[uint64]*poissonSchedulerEntry, numSlots)
 	for i := range numSlots {
 		slots[i] = make(map[uint64]*poissonSchedulerEntry, 1)
@@ -113,6 +155,8 @@ func NewPoissonScheduler(
 	sched := &PoissonScheduler{
 		logger:          logger,
 		LearningRate:    learningRate,
+		MinIssuanceRate: minIssuanceRate,
+		MaxIssuanceRate: maxIssuanceRate,
 		ipImpactRecords: make(map[string]*poissonSchedulerRPImpactRecord),
 		slots:           slots,
 		carry: poissonSchedulerEntry{
@@ -130,19 +174,18 @@ func NewPoissonScheduler(
 		rand:         rand.New(rand.NewSource(int64(seed))), //nolint:gosec // G404: math/rand is fine, not used for security
 	}
 
-	for i := range n {
+	for _, pd := range pdSet {
 		node := &poissonSchedulerNode{
-			pdid:         i,
-			next:         nil,
-			issueCounter: 1,
-			issuanceRate: structures.AtomicFloat64{},
-			scheduler:    sched,
+			pdid:           pd.ProbingDirectiveID,
+			next:           nil,
+			issueCounter:   1,
+			issuancePeriod: structures.AtomicFloat64{},
+			scheduler:      sched,
 		}
-		node.issuanceRate.Store(startingIssuanceRate)
-
+		node.issuancePeriod.Store(1.0 / startingIssuanceRate)
 		// Here the all of the PDs are scheduled to the next moment which is not
 		// ideal so in the future iterations this needs a better approach.
-		nodeSet[i] = node
+		nodeSet[pd.ProbingDirectiveID] = node
 		if e, ok := sched.slots[0][0]; ok {
 			e.push(node)
 		} else {
@@ -153,7 +196,6 @@ func NewPoissonScheduler(
 			}
 		}
 	}
-
 	return sched, nil
 }
 
@@ -170,11 +212,16 @@ func (w *PoissonScheduler) NextPD() (*api.ProbingDirective, error) {
 	}
 
 	// The reason we can do this is because the expected number of FIEs are
-	// smaller than the sent PDs.
-	select {
-	case fie := <-w.fieChan:
-		w.updateFIE(fie)
-	default:
+	// smaller than the sent PDs. We want to consume all the incoming FIE
+	// updates before issuing any PDs.
+	exit := false
+	for !exit {
+		select {
+		case fie := <-w.fieChan:
+			w.updateFIE(fie)
+		default:
+			exit = true
+		}
 	}
 
 	var n *poissonSchedulerNode
@@ -212,6 +259,7 @@ func (w *PoissonScheduler) NextPD() (*api.ProbingDirective, error) {
 		// there are no elements then it would block forever, which should never
 		// happen.
 		nextSlotTime := w.nextSlotTime(curCycle, curSlot)
+		// We do a bustwait because sleep is not realiable for short waiting times.
 		for time.Now().Before(nextSlotTime) {
 		}
 	}
@@ -223,11 +271,6 @@ func (w *PoissonScheduler) NextPD() (*api.ProbingDirective, error) {
 	return w.pdSet[n.pdid], nil
 }
 
-// UpdateFromFIE finds the PoissonSchedulerNode, locks it and adds the FIE to
-// the PD's history, and updates the issuance rate.
-//
-// Note that this method can ve called from a different goroutine, it is thread
-// safe.
 func (w *PoissonScheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
 	w.fieChan <- fie
 	return nil
@@ -276,8 +319,8 @@ func (w *PoissonScheduler) reschedule(n *poissonSchedulerNode) {
 	}
 
 	// Load atomically to prevent race.
-	issuanceRate := n.issuanceRate.Load()
-	delaySeconds := -math.Log(u) / issuanceRate
+	issuancePeriod := n.issuancePeriod.Load()
+	delaySeconds := -math.Log(u) * issuancePeriod
 
 	slotOffset := uint64(math.Ceil(delaySeconds / w.slotPeriod.Seconds()))
 	if slotOffset == 0 {
@@ -336,6 +379,7 @@ func (w *PoissonScheduler) carryOver(cycle, slot uint64) {
 		return
 	}
 	if slotEntry.size == 0 {
+		delete(w.slots[slot], cycle)
 		return
 	}
 
@@ -401,10 +445,10 @@ type poissonSchedulerNode struct {
 	next      *poissonSchedulerNode
 	// issueCounter is incremented every time this PD is issued.
 	issueCounter int
-	// issuanceRate denotes the mean issuance rate of this PD. For our purposes,
+	// issuancePeriod denotes the mean issuance period of this PD. For our purposes,
 	// the sampling is done using exponential sampling, meaning PDs follow a
 	// Poisson process.
-	issuanceRate structures.AtomicFloat64
+	issuancePeriod structures.AtomicFloat64
 	// this is the hsitory of the FIE for that PD.
 	fieHistory         [FIEHistorySize]string
 	fieHistoryPointer  int
@@ -412,16 +456,26 @@ type poissonSchedulerNode struct {
 	lastHitFarAddress  net.IP
 }
 
-// updateIssuanceRate recomputes the issuance rate and updates the issuance rate
-// of the PD connected to this node.
-//
-// The current simple implementation is to reduce the issuance rate of very
-// stable PDs.
+// updateIssuanceRate recomputes the issuance period of the PD connected to
+// this node. The current simple implementation is to lengthen the period of
+// (i.e. slow down) very stable PDs. Adjustments only start once a full window
+// of FIEHistorySize observations has been collected.
 func (n *poissonSchedulerNode) updateIssuanceRate() {
-	switch n.numUniqueFIEs() {
-	case 1:
-		n.issuanceRate.Store(n.issuanceRate.Load() * (1 - n.scheduler.LearningRate))
-	default:
+	unique, total := n.numUniqueFIEs()
+	if total < FIEHistorySize {
+		// Not enough observations yet to judge stability.
+		return
+	}
+
+	if unique == 1 {
+		period := n.issuancePeriod.Load() * (1 + n.scheduler.LearningRate)
+		if 1.0/period < n.scheduler.MinIssuanceRate {
+			period = 1.0 / n.scheduler.MinIssuanceRate
+		}
+		if 1.0/period > n.scheduler.MaxIssuanceRate {
+			period = 1.0 / n.scheduler.MaxIssuanceRate
+		}
+		n.issuancePeriod.Store(period)
 	}
 }
 
@@ -430,17 +484,19 @@ func (n *poissonSchedulerNode) insertToFIEHistory(fie *api.ForwardingInfoElement
 	n.fieHistoryPointer = (n.fieHistoryPointer + 1) % FIEHistorySize
 }
 
-func (n *poissonSchedulerNode) numUniqueFIEs() int {
-	if n.fieHistory[0] == "" {
-		return 0
-	}
-	numUnique := 1
-	for _, e := range n.fieHistory[1:] {
-		if e == "" && n.fieHistory[0] == e {
-			numUnique += 1
+// numUniqueFIEs returns the number of unique FIE hashes in the history and the
+// total number of observed (non-empty) entries. Uniqueness is only meaningful
+// relative to total: e.g. unique==1 with total==6 means a full, stable history,
+// while unique==1 with total==1 just means we've only seen one FIE so far.
+func (n *poissonSchedulerNode) numUniqueFIEs() (unique, total int) {
+	seen := make(map[string]struct{}, FIEHistorySize)
+	for _, e := range n.fieHistory {
+		if e != "" {
+			seen[e] = struct{}{}
+			total++
 		}
 	}
-	return numUnique
+	return len(seen), total
 }
 
 // pdState holds the scheduling state for a single ProbingDirective, including

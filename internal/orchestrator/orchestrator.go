@@ -53,6 +53,8 @@ type Config struct {
 	PoissonSlotPeriod    time.Duration
 	PoissonFIEChanSize   int
 	StartingIssuanceRate float64
+	MinIssuanceRate      float64
+	MaxIssuanceRate      float64
 	LearningRate         float64
 }
 
@@ -144,6 +146,8 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		config.PoissonFIEChanSize,
 		config.StartingIssuanceRate,
 		config.LearningRate,
+		config.MinIssuanceRate,
+		config.MaxIssuanceRate,
 		logger,
 	)
 	if err != nil {

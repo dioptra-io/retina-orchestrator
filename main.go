@@ -59,6 +59,8 @@ func run() error {
 		poissonFIEChanSize   = flag.Int("poisson-fie-chan-size", envOrDefaultInt("RETINA_POISSON_FIE_CHAN_SIZE", 100), "Buffer size of the Poisson scheduler's FIE channel")
 		startingIssuanceRate = flag.Float64("starting-issuance-rate", envOrDefaultFloat64("RETINA_STARTING_ISSUANCE_RATE", 1.0), "Initial issuance rate before the learning algorithm adjusts it (PDs per second)")
 		learningRate         = flag.Float64("learning-rate", envOrDefaultFloat64("RETINA_LEARNING_RATE", 0.1), "Learning rate for the adaptive issuance rate algorithm")
+		minIssuanceRate      = flag.Float64("min-issuance-rate", envOrDefaultFloat64("RETINA_MIN_ISSUANCE_RATE", 1.0/(12.0*60.0*60.0)), "Minimum issuance rate for the adaptive issuance rate algorithm")
+		maxIssuanceRate      = flag.Float64("max-issuance-rate", envOrDefaultFloat64("RETINA_MAX_ISSUANCE_RATE", 5.0), "Maximum issuance rate for the adaptive issuance rate algorithm")
 	)
 	flag.Parse()
 
@@ -96,6 +98,8 @@ func run() error {
 		PoissonSlotPeriod:    *poissonSlotPeriod,
 		PoissonFIEChanSize:   *poissonFIEChanSize,
 		StartingIssuanceRate: *startingIssuanceRate,
+		MinIssuanceRate:      *minIssuanceRate,
+		MaxIssuanceRate:      *maxIssuanceRate,
 		LearningRate:         *learningRate,
 	}, logger, metrics)
 	if err != nil {
