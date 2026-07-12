@@ -5,7 +5,7 @@
 // @version		1.0
 // @description	Streams forwarding info elements from connected Retina agents.
 // @host			iprl.dioptra.io
-// @BasePath		/
+// @BasePath		/api/v1
 package main
 
 import (
@@ -54,6 +54,13 @@ func run() error {
 		fieFilterPolicy      = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", "any"), "FIE filtering policy: any, one, or both")
 		logLevel             = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 		metricsAddr          = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
+		poissonWheelSpan     = flag.Duration("poisson-wheel-span", envOrDefaultDuration("RETINA_POISSON_WHEEL_SPAN", time.Hour), "Total time span covered by the Poisson scheduler's timing wheel")
+		poissonSlotPeriod    = flag.Duration("poisson-slot-period", envOrDefaultDuration("RETINA_POISSON_SLOT_PERIOD", 200*time.Millisecond), "Duration of a single slot in the Poisson scheduler's timing wheel")
+		poissonFIEChanSize   = flag.Int("poisson-fie-chan-size", envOrDefaultInt("RETINA_POISSON_FIE_CHAN_SIZE", 100), "Buffer size of the Poisson scheduler's FIE channel")
+		startingIssuanceRate = flag.Float64("starting-issuance-rate", envOrDefaultFloat64("RETINA_STARTING_ISSUANCE_RATE", 1.0), "Initial issuance rate before the learning algorithm adjusts it (PDs per second)")
+		learningRate         = flag.Float64("learning-rate", envOrDefaultFloat64("RETINA_LEARNING_RATE", 0.1), "Learning rate for the adaptive issuance rate algorithm")
+		minIssuanceRate      = flag.Float64("min-issuance-rate", envOrDefaultFloat64("RETINA_MIN_ISSUANCE_RATE", 1.0/(12.0*60.0*60.0)), "Minimum issuance rate for the adaptive issuance rate algorithm")
+		maxIssuanceRate      = flag.Float64("max-issuance-rate", envOrDefaultFloat64("RETINA_MAX_ISSUANCE_RATE", 5.0), "Maximum issuance rate for the adaptive issuance rate algorithm")
 	)
 	flag.Parse()
 
@@ -87,6 +94,13 @@ func run() error {
 		Seed:                 *seed,
 		FIEFilterPolicy:      *fieFilterPolicy,
 		Secret:               secret,
+		PoissonWheelSpan:     *poissonWheelSpan,
+		PoissonSlotPeriod:    *poissonSlotPeriod,
+		PoissonFIEChanSize:   *poissonFIEChanSize,
+		StartingIssuanceRate: *startingIssuanceRate,
+		MinIssuanceRate:      *minIssuanceRate,
+		MaxIssuanceRate:      *maxIssuanceRate,
+		LearningRate:         *learningRate,
 	}, logger, metrics)
 	if err != nil {
 		return err
@@ -135,7 +149,7 @@ func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr
 }
 
 // newLogger creates a JSON logger writing to stdout at the given level.
-// Falls back to info if the level string is unrecognised.
+// Falls back to info if the level string is unrecognized.
 func newLogger(level string) *slog.Logger {
 	var l slog.Level
 	if err := l.UnmarshalText([]byte(level)); err != nil {

@@ -6,18 +6,22 @@ package orchestrator
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
 )
 
 // SSEEventType represents the type of SSE event.
 type SSEEventType string
 
 const (
-	SSEEventOperatorStarted   SSEEventType = "OperatorStarted"
-	SSEEventOperatorStopped   SSEEventType = "OperatorStopped"
-	SSEEventAgentConnected    SSEEventType = "AgentConnected"
-	SSEEventAgentDisconnected SSEEventType = "AgentDisconnected"
-	SSEEventCycleStarted      SSEEventType = "CycleStarted"
-	SSEEventCycleFinished     SSEEventType = "CycleFinished"
+	SSEEventOperatorStarted         SSEEventType = "OperatorStarted"
+	SSEEventOperatorStopped         SSEEventType = "OperatorStopped"
+	SSEEventAgentConnected          SSEEventType = "AgentConnected"
+	SSEEventAgentDisconnected       SSEEventType = "AgentDisconnected"
+	SSEEventCycleStarted            SSEEventType = "CycleStarted"
+	SSEEventCycleFinished           SSEEventType = "CycleFinished"
+	SSEEventRateAdjusted            SSEEventType = "RateAdjusted"
+	SSEEventPoissonSchedulerStarted SSEEventType = "PoissonSchedulerStarted"
 )
 
 // SSEEvent is a server-sent event with a type, data, and timestamp.
@@ -55,6 +59,19 @@ type CycleFinishedData struct {
 	Issued int `json:"issued"`
 }
 
+// RateAdjustedData is emitted when the issuance rate of a PD is changed in the
+// poisson scheduler.
+type RateAdjustedData struct {
+	ProbingDirectiveID uint64  `json:"probing_directive_id"`
+	PreviousRate       float64 `json:"previous_rate"`
+	CurrentRate        float64 `json:"current_rate"`
+}
+
+type PoissonSchedulerStartedData struct {
+	Config
+	NumberOfPDs int `json:"number_of_pds"`
+}
+
 // MarshalJSON implements json.Marshaler for SSEEvent.
 func (e *SSEEvent) MarshalJSON() ([]byte, error) {
 	type rawSSEEvent struct {
@@ -80,3 +97,8 @@ func (e *SSEEvent) MarshalJSON() ([]byte, error) {
 
 	return json.Marshal(raw)
 }
+
+// EventBus is a buffer where the events are emitted. These are not used for
+// internal coordination but to be consumed by the clients connected to the sse
+// endpoint.
+type EventBus *structures.RingBuffer[SSEEvent]

@@ -16,7 +16,6 @@ import (
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
-	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -49,6 +48,14 @@ type Config struct {
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
+
+	PoissonWheelSpan     time.Duration
+	PoissonSlotPeriod    time.Duration
+	PoissonFIEChanSize   int
+	StartingIssuanceRate float64
+	MinIssuanceRate      float64
+	MaxIssuanceRate      float64
+	LearningRate         float64
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -57,17 +64,26 @@ func (c *Config) Validate() error {
 	if c.AgentAddress == "" {
 		return fmt.Errorf("AgentAddress cannot be empty")
 	}
+	if c.AgentBufferLength < 8192 {
+		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
+	}
 	if c.PDQueueSize <= 0 {
 		return fmt.Errorf("PDQueueSize must be greater than zero: got %d", c.PDQueueSize)
 	}
 	if c.RingBufferSize <= 0 {
 		return fmt.Errorf("RingBufferSize must be greater than zero: got %d", c.RingBufferSize)
 	}
-	if c.AgentBufferLength < 8192 {
-		return fmt.Errorf("AgentBufferLength is too small: got %d, minimum 8192", c.AgentBufferLength)
-	}
 	if c.APIAddress == "" {
 		return fmt.Errorf("APIAddress cannot be empty")
+	}
+	if c.APIReadHeaderTimeout == 0 {
+		c.APIReadHeaderTimeout = 5 * time.Second
+	}
+	if c.FIEFilterPolicy == "" {
+		c.FIEFilterPolicy = "both"
+	}
+	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
+		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
 	}
 	if c.PDPath == "" {
 		return fmt.Errorf("PDPath cannot be empty")
@@ -78,16 +94,6 @@ func (c *Config) Validate() error {
 	if c.ImpactThreshold <= 0 {
 		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
 	}
-	if c.FIEFilterPolicy == "" {
-		c.FIEFilterPolicy = "both"
-	}
-	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
-		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
-	}
-	if c.APIReadHeaderTimeout == 0 {
-		c.APIReadHeaderTimeout = 5 * time.Second
-	}
-
 	return nil
 }
 
@@ -95,7 +101,7 @@ type orch struct {
 	config          *Config
 	logger          *slog.Logger
 	metrics         *Metrics
-	scheduler       *Scheduler
+	scheduler       Scheduler
 	agentServer     *agentServer
 	apiServer       *apiServer
 	pdQueue         *structures.Queue[api.ProbingDirective]
@@ -115,7 +121,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		logger = slog.Default()
 	}
 	if metrics == nil {
-		metrics = NewMetrics(prometheus.DefaultRegisterer)
+		return nil, fmt.Errorf("metrics cannot be nil")
 	}
 
 	o := &orch{
@@ -131,9 +137,22 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.eventRingBuffer = eventBuffer
 
-	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, config.MaxCycles, logger.With("component", "scheduler"), metrics, eventBuffer)
+	// The retina reseach instance uses the PoissonScheduler.
+	scheduler, err := NewPoissonScheduler(
+		config.Seed,
+		config.PDPath,
+		config.PoissonWheelSpan,
+		config.PoissonSlotPeriod,
+		config.PoissonFIEChanSize,
+		config.StartingIssuanceRate,
+		config.LearningRate,
+		config.MinIssuanceRate,
+		config.MaxIssuanceRate,
+		logger,
+		eventBuffer,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("error on creating scheduler: %w", err)
+		return nil, fmt.Errorf("error on creating poisson scheduler: %w", err)
 	}
 	o.scheduler = scheduler
 
@@ -205,6 +224,19 @@ func (o *orch) Run(parentCtx context.Context) error {
 	})
 
 	return err
+}
+
+func (o *orch) emitConfigEvent() {
+	if ps, ok := o.scheduler.(*PoissonScheduler); ok {
+		o.publishEvent(SSEEvent{
+			Type:      SSEEventPoissonSchedulerStarted,
+			Timestamp: time.Now(),
+			Data: PoissonSchedulerStartedData{
+				Config:      *o.config,
+				NumberOfPDs: len(ps.pdSet),
+			},
+		})
+	}
 }
 
 func (o *orch) runScheduler(ctx context.Context) error {
@@ -316,6 +348,10 @@ func (o *orch) sseStreamHandler(s *sseClient) {
 		o.metrics.SSEDisconnectionsTotal.WithLabelValues(closeReason).Inc()
 		o.logger.Debug("SSE stream closed", slog.String("reason", closeReason))
 	}()
+
+	// This is a bad fix, but the idea is to send the config every time there is
+	// a new connection.
+	o.emitConfigEvent()
 
 	for {
 		event, _, err := consumer.Pop(s.context())
