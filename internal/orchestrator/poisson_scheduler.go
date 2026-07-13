@@ -507,6 +507,7 @@ func (n *poissonSchedulerNode) updateIssuanceRate() {
 		},
 	})
 }
+
 func (n *poissonSchedulerNode) insertToFIEHistory(fie *api.ForwardingInfoElement) {
 	n.fieHistory[n.fieHistoryPointer] = hashFIE(fie)
 	n.fieHistoryPointer = (n.fieHistoryPointer + 1) % FIEHistorySize
