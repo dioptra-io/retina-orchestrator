@@ -472,29 +472,41 @@ func (n *poissonSchedulerNode) updateIssuanceRate() {
 		return
 	}
 
+	oldPeriod := n.issuancePeriod.Load()
+	var newPeriod float64
+
 	if unique == 1 {
-		oldPeriod := n.issuancePeriod.Load()
-		newPeriod := oldPeriod * (1 + n.scheduler.LearningRate)
-		if 1.0/newPeriod < n.scheduler.MinIssuanceRate {
-			newPeriod = 1.0 / n.scheduler.MinIssuanceRate
-		}
-		if 1.0/newPeriod > n.scheduler.MaxIssuanceRate {
-			newPeriod = 1.0 / n.scheduler.MaxIssuanceRate
-		}
-		n.issuancePeriod.Store(newPeriod)
-
-		n.scheduler.eventBus.Push(&SSEEvent{
-			Type:      SSEEventRateAdjusted,
-			Timestamp: time.Now(),
-			Data: &RateAdjustedData{
-				ProbingDirectiveID: n.pdid,
-				PreviousRate:       1.0 / oldPeriod,
-				CurrentRate:        1.0 / newPeriod,
-			},
-		})
+		// Stable window: slow down.
+		newPeriod = oldPeriod * (1 + n.scheduler.LearningRate)
+	} else {
+		// Unstable window: speed up.
+		newPeriod = oldPeriod / (1 + n.scheduler.LearningRate)
 	}
-}
 
+	// Clamp to [MinIssuanceRate, MaxIssuanceRate].
+	if 1.0/newPeriod < n.scheduler.MinIssuanceRate {
+		newPeriod = 1.0 / n.scheduler.MinIssuanceRate
+	}
+	if 1.0/newPeriod > n.scheduler.MaxIssuanceRate {
+		newPeriod = 1.0 / n.scheduler.MaxIssuanceRate
+	}
+
+	if newPeriod == oldPeriod {
+		// Already at the clamp boundary; nothing changed, no event.
+		return
+	}
+
+	n.issuancePeriod.Store(newPeriod)
+	n.scheduler.eventBus.Push(&SSEEvent{
+		Type:      SSEEventRateAdjusted,
+		Timestamp: time.Now(),
+		Data: &RateAdjustedData{
+			ProbingDirectiveID: n.pdid,
+			PreviousRate:       1.0 / oldPeriod,
+			CurrentRate:        1.0 / newPeriod,
+		},
+	})
+}
 func (n *poissonSchedulerNode) insertToFIEHistory(fie *api.ForwardingInfoElement) {
 	n.fieHistory[n.fieHistoryPointer] = hashFIE(fie)
 	n.fieHistoryPointer = (n.fieHistoryPointer + 1) % FIEHistorySize
