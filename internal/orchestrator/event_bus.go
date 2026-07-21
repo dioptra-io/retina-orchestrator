@@ -4,101 +4,65 @@
 package orchestrator
 
 import (
-	"encoding/json"
+	"reflect"
+	"sync"
 	"time"
 
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
 )
 
-// SSEEventType represents the type of SSE event.
-type SSEEventType string
-
-const (
-	SSEEventOperatorStarted         SSEEventType = "OperatorStarted"
-	SSEEventOperatorStopped         SSEEventType = "OperatorStopped"
-	SSEEventAgentConnected          SSEEventType = "AgentConnected"
-	SSEEventAgentDisconnected       SSEEventType = "AgentDisconnected"
-	SSEEventCycleStarted            SSEEventType = "CycleStarted"
-	SSEEventCycleFinished           SSEEventType = "CycleFinished"
-	SSEEventRateAdjusted            SSEEventType = "RateAdjusted"
-	SSEEventPoissonSchedulerStarted SSEEventType = "PoissonSchedulerStarted"
-)
-
-// SSEEvent is a server-sent event with a type, data, and timestamp.
-type SSEEvent struct {
-	Type      SSEEventType `json:"type"`
-	Timestamp time.Time    `json:"timestamp"`
-	Data      any          `json:"data,omitempty"`
+// RetinaEvent is the base of every event. Embed it by value in each
+// concrete event type.
+type RetinaEvent struct {
+	Type      string    `json:"type"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
-// OperatorStartedData is the payload for OperatorStarted events.
-type OperatorStartedData struct{}
-
-// OperatorStoppedData is the payload for OperatorStopped events.
-type OperatorStoppedData struct{}
-
-// AgentConnectedData is the payload for AgentConnected events.
-type AgentConnectedData struct {
-	AgentID string `json:"agent_id"`
+// stamp fills the metadata. Written once, inherited by every embedder;
+// being unexported, it also seals Event to this package.
+func (e *RetinaEvent) stamp(typ string) {
+	e.Type = typ
+	e.Timestamp = time.Now()
 }
 
-// AgentDisconnectedData is the payload for AgentDisconnected events.
-type AgentDisconnectedData struct {
-	AgentID string `json:"agent_id"`
-	Reason  string `json:"reason"`
+// Event is anything embedding RetinaEvent.
+type Event interface{ stamp(string) }
+
+type PeriodAdjusted struct {
+	RetinaEvent
+	ProbingDirectiveID uint64        `json:"probing_directive_id"`
+	PreviousPeriod     time.Duration `json:"previous_period"`
+	NewPeriod          time.Duration `json:"new_period"`
+	Rule               string        `json:"rule"`
 }
 
-// CycleStartedData is the payload for CycleStarted events.
-type CycleStartedData struct {
-	Cycle int `json:"cycle"`
+type SchedulerLate struct {
+	RetinaEvent
+	ProbingDirectiveID uint64    `json:"probing_directive_id"`
+	ScheduledTime      time.Time `json:"scheduled_time"`
+	ActualTime         time.Time `json:"actual_time"`
 }
 
-// CycleFinishedData is the payload for CycleFinished events.
-type CycleFinishedData struct {
-	Cycle  int `json:"cycle"`
-	Issued int `json:"issued"`
+type EventBus struct {
+	ring *structures.RingBuffer[Event]
 }
 
-// RateAdjustedData is emitted when the issuance rate of a PD is changed in the
-// poisson scheduler.
-type RateAdjustedData struct {
-	ProbingDirectiveID uint64  `json:"probing_directive_id"`
-	PreviousRate       float64 `json:"previous_rate"`
-	CurrentRate        float64 `json:"current_rate"`
+func (b *EventBus) Push(e Event) {
+	e.stamp(typeName(e))
+	// b.ring.Push(e)
 }
 
-type PoissonSchedulerStartedData struct {
-	Config
-	NumberOfPDs int `json:"number_of_pds"`
-}
+var typeNames sync.Map // reflect.Type -> string
 
-// MarshalJSON implements json.Marshaler for SSEEvent.
-func (e *SSEEvent) MarshalJSON() ([]byte, error) {
-	type rawSSEEvent struct {
-		Type      SSEEventType `json:"type"`
-		Timestamp time.Time    `json:"timestamp"`
-		Data      any          `json:"data,omitempty"`
+func typeName(e any) string {
+	t := reflect.TypeOf(e)
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
 	}
-
-	raw := rawSSEEvent{
-		Type:      e.Type,
-		Timestamp: e.Timestamp,
-		Data:      e.Data,
+	if v, ok := typeNames.Load(t); ok {
+		return v.(string)
 	}
-
-	// Serialize data separately to control the output
-	if e.Data != nil {
-		dataBytes, err := json.Marshal(e.Data)
-		if err != nil {
-			return nil, err
-		}
-		raw.Data = json.RawMessage(dataBytes)
-	}
-
-	return json.Marshal(raw)
+	name := t.Name()
+	typeNames.Store(t, name)
+	return name
 }
-
-// EventBus is a buffer where the events are emitted. These are not used for
-// internal coordination but to be consumed by the clients connected to the sse
-// endpoint.
-type EventBus *structures.RingBuffer[SSEEvent]

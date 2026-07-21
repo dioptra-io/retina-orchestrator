@@ -18,7 +18,6 @@ import (
 
 	"github.com/dioptra-io/retina-commons/api/v1"
 	_ "github.com/dioptra-io/retina-orchestrator/docs"
-	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
 )
 
 // SequencedFIE is a ForwardingInfoElement with a sequence number for ordered delivery to HTTP clients.
@@ -38,8 +37,7 @@ type apiServerConfig struct {
 	fieHandler        fieHandleFunc
 	sseHandler        sseHandleFunc
 	// eventBuffer is the ring buffer for SSE events.
-	eventBuffer *structures.RingBuffer[SSEEvent]
-	logger      *slog.Logger
+	logger *slog.Logger
 }
 
 type apiServer struct {
@@ -62,15 +60,6 @@ func newAPIServer(config *apiServerConfig) (*apiServer, error) {
 		config:  config,
 		logger:  config.logger,
 		clients: make(map[*fieClient]struct{}),
-	}
-
-	// Create default event buffer if not provided
-	if config.eventBuffer == nil && config.sseHandler != nil {
-		rb, err := structures.NewRingBuffer[SSEEvent](256)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create default event buffer: %w", err)
-		}
-		config.eventBuffer = rb
 	}
 
 	mux := http.NewServeMux()
@@ -223,20 +212,6 @@ func (w *sseResponseWriter) Close() error {
 type sseClient struct {
 	ctx    context.Context
 	writer io.WriteCloser
-}
-
-func (s *sseClient) sendEvent(event *SSEEvent) error {
-	data, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("failed to marshal event: %w", err)
-	}
-
-	_, err = s.writer.Write(append(data, '\n'))
-	if err != nil {
-		return fmt.Errorf("failed to write event: %w", err)
-	}
-	s.writer.(*sseResponseWriter).flusher.Flush()
-	return nil
 }
 
 func (s *sseClient) context() context.Context {
