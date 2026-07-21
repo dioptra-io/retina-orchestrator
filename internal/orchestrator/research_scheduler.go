@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"sync/atomic"
 	"time"
 
 	api "github.com/dioptra-io/retina-commons/api/v1"
@@ -102,7 +103,7 @@ type ResearchSchedulerConfig struct {
 
 // fillZeroValueDefaults populates the zero value fields of ResearchSchedulerConfig with
 // default values specified in the DSD section §6.
-func (c *ResearchSchedulerConfig) fillZeroValueDefaults() {
+func (c *ResearchSchedulerConfig) fillZeroValueDefaults() { //nolint:gocyclo
 	if c.LearningRate == 0 {
 		c.LearningRate = 0.1
 	}
@@ -158,7 +159,7 @@ func (c *ResearchSchedulerConfig) fillZeroValueDefaults() {
 
 // validate checks the configuration and returns an error describing the
 // first invalid parameter found.
-func (c *ResearchSchedulerConfig) validate() error {
+func (c *ResearchSchedulerConfig) validate() error { //nolint:gocyclo
 	if c.LearningRate <= 0 || c.LearningRate >= 1 {
 		return fmt.Errorf("learning rate (α) must be in (0, 1): %v", c.LearningRate)
 	}
@@ -332,11 +333,14 @@ type ResearchScheduler struct {
 	// on their most recent issuance.
 	impacts map[string]map[uint64]struct{}
 
+	nextID atomic.Uint64
+
 	// insertCh and fieCh are the internal channels of §5.1.
 	insertCh     chan *api.ProbingDirective
 	updateCh     chan *api.ForwardingInfoElement
 	statusTicker *time.Ticker
 	ctx          context.Context
+	cancel       context.CancelFunc
 
 	// bucketNext is the token bucket state for admission pacing (§5.6): the
 	// earliest time the next admitted PD may be first-issued.
@@ -365,6 +369,8 @@ func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebu
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	s := &ResearchScheduler{
 		cfg:                cfg,
 		logger:             logger,
@@ -375,7 +381,8 @@ func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebu
 		insertCh:           make(chan *api.ProbingDirective, cfg.InsertChannelSize),
 		updateCh:           make(chan *api.ForwardingInfoElement, cfg.UpdateChannelSize),
 		statusTicker:       time.NewTicker(cfg.StatusInterval),
-		ctx:                context.Background(),
+		ctx:                ctx,
+		cancel:             cancel,
 		lastStatusEmission: time.Now(),
 		ebus:               ebus,
 	}
@@ -396,7 +403,16 @@ func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebu
 // ---------------------------------------------------------------------------
 
 func (s *ResearchScheduler) Insert(req *api.ProbingDirective) (uint64, error) {
-	return 0, nil
+	// ID starts from 0.
+	id := s.nextID.Add(1) - 1
+	req.ProbingDirectiveID = id
+
+	select {
+	case s.insertCh <- req:
+		return id, nil
+	case <-s.ctx.Done():
+		return 0, s.ctx.Err()
+	}
 }
 
 func (s *ResearchScheduler) Next() (*api.ProbingDirective, error) {
@@ -417,21 +433,14 @@ func (s *ResearchScheduler) Next() (*api.ProbingDirective, error) {
 				return nil, err
 			}
 
-			// If a new PD is scheduled before our root, eliminate it and go
-			// back.
+			// If a new PD is scheduled before our root, go back.
 			if root != s.queue[0] {
 				continue
 			}
 		}
 
-		// Close or overdue: busy-wait the final sub-tolerance stretch for
-		// precision. If already overdue this loop doesn't execute.
-		for time.Now().Before(root.nextIssuance) {
-		}
-
-		// TODO: the rest is not very important for now.
-		// Due. Pop, check lateness, learn, sample, reschedule, issue.
 		rec := heap.Pop(&s.queue).(*pdRecord)
+		target := rec.nextIssuance // capture BEFORE compute reschedules it
 		now := time.Now()
 
 		if now.Sub(rec.nextIssuance) > s.cfg.LatenessTolerance {
@@ -442,20 +451,28 @@ func (s *ResearchScheduler) Next() (*api.ProbingDirective, error) {
 			})
 		}
 
-		s.learn(rec, now)
-		rec.lastIssuedAt = now
-		rec.nextIssuance = now.Add(s.sampleInterIssuance(rec.issuancePeriod))
+		s.compute(rec, now)
 		heap.Push(&s.queue, rec)
+
+		for time.Now().Before(target) {
+		}
+
 		return rec.pd, nil
 	}
 }
 
 func (s *ResearchScheduler) Update(fie *api.ForwardingInfoElement) error {
-	return nil
+	select {
+	case s.updateCh <- fie:
+		return nil
+	case <-s.ctx.Done():
+		return s.ctx.Err()
+	}
 }
 
 func (s *ResearchScheduler) Close() error {
 	s.statusTicker.Stop()
+	s.cancel()
 	return nil
 }
 
@@ -467,7 +484,7 @@ func (s *ResearchScheduler) Close() error {
 // before the scheduler picks the next PD to issue (§5.1). Returns nil only
 // with a non-empty queue (so the caller can read s.queue[0]); returns an error
 // only on shutdown.
-func (s *ResearchScheduler) drain() error {
+func (s *ResearchScheduler) drain() error { //nolint:gocyclo
 	// Per-issuance quotas: bound how many inserts and FIEs are applied per
 	// call so neither can starve issuance. A spent quota drops its channel
 	// from the select; unapplied items stay queued for the next pass.
@@ -545,7 +562,7 @@ func (s *ResearchScheduler) drain() error {
 // time.After can over-sleep past d on a shared core and miss the issuance
 // instant. Returns when d is reached, when an insert makes another PD the head
 // (preemption), or on shutdown.
-func (s *ResearchScheduler) wait(d time.Time) error {
+func (s *ResearchScheduler) wait(d time.Time) error { //nolint:gocyclo
 	oldRoot := s.queue[0]
 	tolerance := s.cfg.WaitTolerance // e.g. 1ms on GCP shared cores
 
@@ -606,14 +623,297 @@ func (s *ResearchScheduler) wait(d time.Time) error {
 	}
 }
 
-func (s *ResearchScheduler) emitStatus() {
-	// TODO
-}
+// ---------------------------------------------------------------------------
+// insert (§4.3, §5.6)
+// ---------------------------------------------------------------------------
 
-func (s *ResearchScheduler) update(fie *api.ForwardingInfoElement) {
-	// TODO
-}
-
+// insert admits one PD into the schedule. Called only from the scheduler
+// goroutine during the channel drain. The PD's identifier was already
+// assigned by the public Insert method; here we build its record, pace its
+// first issuance via the token bucket, and push it onto the queue.
+//
+// Duplicate detection is unnecessary: identifiers are assigned by an atomic
+// counter in Insert, so every admitted PD is unique by construction (this
+// diverges from DSD §4.3's duplicate check / PDRejected event; see errata).
 func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
-	// TODO
+	now := time.Now()
+
+	// Token bucket with rate r₀ and capacity one token (§5.6): the first
+	// issuance time is the later of now and the bucket's next-available
+	// time, which then advances by 1/r₀.
+	first := s.bucketNext
+	if now.After(first) {
+		first = now
+	}
+	s.bucketNext = first.Add(time.Duration(float64(time.Second) / s.cfg.AdmissionRate))
+
+	rec := &pdRecord{
+		pdid:           pd.ProbingDirectiveID,
+		pd:             pd,
+		issuancePeriod: s.cfg.StartingIssuancePeriod.Seconds(), // μᵢ = Μ (§4.3)
+		nextIssuance:   first,
+		// Fixed-capacity FIE ring buffer, allocated once at admission (§5.4).
+		history: make([]fieObservation, s.cfg.FIEHistoryCapacity),
+	}
+	s.records[pd.ProbingDirectiveID] = rec
+	heap.Push(&s.queue, rec)
+	s.totalInsertions++
+
+	s.ebus.Emit(&PDInsertedEvent{
+		ProbingDirectiveID: pd.ProbingDirectiveID,
+		FirstIssuanceTime:  first,
+		CurrentPDCount:     len(s.records),
+	})
+}
+
+// THE REST NEEDS SOME ATTENTION.
+
+// ---------------------------------------------------------------------------
+// update (§5.3, §5.4)
+// ---------------------------------------------------------------------------
+
+// update applies one FIE to its PD's record: the address impact history is
+// updated first, then the observation is appended to the FIE history (§5.1).
+// Called only from the scheduler goroutine during the channel drain.
+//
+// An FIE for an unknown PD id is ignored (no panic): stray or late FIEs can
+// arrive around startup or cutover, and the drain's empty-queue branch relies
+// on this being safe.
+func (s *ResearchScheduler) update(fie *api.ForwardingInfoElement) {
+	rec, ok := s.records[fie.ProbingDirectiveID]
+	if !ok {
+		return
+	}
+
+	var near, far net.IP
+	if fie.NearInfo != nil {
+		near = fie.NearInfo.ReplyAddress
+	}
+	if fie.FarInfo != nil {
+		far = fie.FarInfo.ReplyAddress
+	}
+
+	// Address impact history (§5.3): applying an FIE for PD i replaces i's
+	// previous impacts. Remove i from its old addresses' sets, add it to the
+	// new non-null addresses, then overwrite the record's impacted pair.
+	s.removeImpact(rec.lastNear, rec.pdid)
+	s.removeImpact(rec.lastFar, rec.pdid)
+	s.addImpact(near, rec.pdid)
+	s.addImpact(far, rec.pdid)
+	rec.lastNear = near
+	rec.lastFar = far
+
+	// FIE history append (§5.4), immediately after the impact update.
+	rec.appendFIE(fieObservation{near: near, far: far})
+}
+
+// addImpact adds pdid to the impact set of addr. Null addresses are never
+// inserted (§5.3).
+func (s *ResearchScheduler) addImpact(addr net.IP, pdid uint64) {
+	if addr == nil {
+		return
+	}
+	key := addr.String()
+	set, ok := s.impacts[key]
+	if !ok {
+		set = make(map[uint64]struct{}, 1)
+		s.impacts[key] = set
+	}
+	set[pdid] = struct{}{}
+}
+
+// removeImpact removes pdid from the impact set of addr; sets that become
+// empty are deleted to bound the map's size (§5.3).
+func (s *ResearchScheduler) removeImpact(addr net.IP, pdid uint64) {
+	if addr == nil {
+		return
+	}
+	key := addr.String()
+	set, ok := s.impacts[key]
+	if !ok {
+		return
+	}
+	delete(set, pdid)
+	if len(set) == 0 {
+		delete(s.impacts, key)
+	}
+}
+
+// impactSetSize returns |𝒜ₐ| for the given address; a null address has no
+// impact set (§3.2).
+func (s *ResearchScheduler) impactSetSize(addr net.IP) int {
+	if addr == nil {
+		return 0
+	}
+	return len(s.impacts[addr.String()])
+}
+
+// ---------------------------------------------------------------------------
+// compute — learning + reschedule (§4.2, §4.1)
+// ---------------------------------------------------------------------------
+
+// compute applies the learning rules to the just-popped PD and reschedules
+// it. It runs just before issuance, on the record being issued at time t.
+//
+// Rule order (§4.2): the responsible-probing floor is computed first, the
+// staleness rule is applied, and the floor is enforced last so that the
+// hard impact constraint holds at the end of the step regardless of what
+// staleness wanted (this is the precedence fix; see errata on §4.2). A
+// single step emits at most one PeriodAdjusted, attributed to the binding
+// rule. Finally a new inter-issuance time is sampled and nextIssuance and
+// lastIssuedAt are set.
+func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) {
+	old := rec.issuancePeriod
+	candidate := old
+	rule := PeriodAdjustmentRuleNone
+
+	// --- Responsible probing floor (§4.2.1) ---
+	// Projected impact counter c̃ᵢ under the assumption that this issuance
+	// impacts the same addresses as the previous one. Only meaningful once
+	// the PD has been issued and has a recorded impact.
+	floor := 0.0
+	if !rec.lastIssuedAt.IsZero() {
+		projected := s.impactSetSize(rec.lastNear) + s.impactSetSize(rec.lastFar)
+		if projected > 0 {
+			elapsed := t.Sub(rec.lastIssuedAt).Seconds() // Bᵢ(t)
+			if elapsed > 0 && float64(projected)/elapsed > s.cfg.ImpactThreshold {
+				floor = float64(projected) / s.cfg.ImpactThreshold // c̃ᵢ / Λ
+			}
+		}
+	}
+
+	// --- Staleness (§4.2.2) ---
+	// Applied only once the FIE history is full; then every issuance either
+	// slows down (stable) or speeds up (unstable).
+	if rec.histFill == len(rec.history) {
+		if rec.historyStable() {
+			candidate = old * (1 + s.cfg.LearningRate)
+			rule = PeriodAdjustmentRuleStalenessSlowDown
+		} else {
+			candidate = old / (1 + s.cfg.LearningRate)
+			rule = PeriodAdjustmentRuleStalenessSpeedUp
+		}
+	}
+
+	// --- Enforce the responsible-probing floor last (§4.2.1 precedence) ---
+	if candidate < floor {
+		candidate = floor
+		rule = PeriodAdjustmentRuleResponsibleProbing
+	}
+
+	// --- Clamp to [μmin, μmax] (§3.4) ---
+	if min := s.cfg.MinIssuancePeriod.Seconds(); candidate < min {
+		candidate = min
+		rule = PeriodAdjustmentRuleClamp
+	}
+	if max := s.cfg.MaxIssuancePeriod.Seconds(); candidate > max {
+		candidate = max
+		rule = PeriodAdjustmentRuleClamp
+	}
+
+	// Emit only on an actual change.
+	if candidate != old {
+		rec.issuancePeriod = candidate
+		s.ebus.Emit(&PeriodAdjustedEvent{
+			ProbingDirectiveID: rec.pdid,
+			PreviousPeriod:     secondsToDuration(old),
+			NewPeriod:          secondsToDuration(candidate),
+			Rule:               rule,
+		})
+	}
+
+	// --- Sample X and reschedule (§4.1) ---
+	x := s.sampleInterIssuance(rec.issuancePeriod)
+	rec.lastIssuedAt = t
+	rec.nextIssuance = t.Add(x)
+	s.totalIssuances++
+}
+
+// sampleInterIssuance samples X ~ Uniform((1 − β)·μ, (1 + β)·μ) (§4.1). The
+// bounded support guarantees a minimum spacing of (1 − β)·μ between issuances.
+func (s *ResearchScheduler) sampleInterIssuance(periodSeconds float64) time.Duration {
+	beta := s.cfg.SamplingWidth
+	x := periodSeconds * (1 - beta + 2*beta*s.rand.Float64())
+	return secondsToDuration(x)
+}
+
+func secondsToDuration(sec float64) time.Duration {
+	return time.Duration(sec * float64(time.Second))
+}
+
+// ---------------------------------------------------------------------------
+// emitStatus (§5.5)
+// ---------------------------------------------------------------------------
+
+// emitStatus computes and emits the CurrentStatus aggregate snapshot (§5.5).
+// The O(N) scan runs once per Tstatus and is negligible relative to the
+// per-issuance work.
+func (s *ResearchScheduler) emitStatus() {
+	now := time.Now()
+
+	var (
+		sumRate    float64
+		sumPeriod  float64
+		minPeriod  = math.Inf(1)
+		maxPeriod  = math.Inf(-1)
+		clampedMin int
+		clampedMax int
+		fullHist   int
+	)
+	minBound := s.cfg.MinIssuancePeriod.Seconds()
+	maxBound := s.cfg.MaxIssuancePeriod.Seconds()
+	for _, rec := range s.records {
+		p := rec.issuancePeriod
+		sumRate += 1 / p
+		sumPeriod += p
+		if p < minPeriod {
+			minPeriod = p
+		}
+		if p > maxPeriod {
+			maxPeriod = p
+		}
+		if p == minBound {
+			clampedMin++
+		}
+		if p == maxBound {
+			clampedMax++
+		}
+		if rec.histFill == len(rec.history) {
+			fullHist++
+		}
+	}
+
+	n := len(s.records)
+	var meanP, minP, maxP time.Duration
+	if n > 0 {
+		meanP = secondsToDuration(sumPeriod / float64(n))
+		minP = secondsToDuration(minPeriod)
+		maxP = secondsToDuration(maxPeriod)
+	}
+
+	interval := now.Sub(s.lastStatusEmission).Seconds()
+	var realized float64
+	if interval > 0 {
+		realized = float64(s.totalIssuances-s.issuancesAtLastStatus) / interval
+	}
+	s.issuancesAtLastStatus = s.totalIssuances
+	s.lastStatusEmission = now
+
+	s.ebus.Emit(&CurrentStatusEvent{
+		CurrentPDCount:            n,
+		CumulativeInsertions:      s.totalInsertions,
+		CumulativeIssuances:       s.totalIssuances,
+		AggregateRequestedRate:    sumRate,
+		RealizedRate:              realized,
+		DistinctImpactedAddrs:     len(s.impacts),
+		PeriodMin:                 minP,
+		PeriodMax:                 maxP,
+		PeriodMean:                meanP,
+		PDsClampedAtMin:           clampedMin,
+		PDsClampedAtMax:           clampedMax,
+		PDsWithFullHistory:        fullHist,
+		UpdateChannelOccupancy:    len(s.updateCh),
+		InsertChannelOccupancy:    len(s.insertCh),
+		CumulativeLateOccurrences: s.totalLate,
+	})
 }
