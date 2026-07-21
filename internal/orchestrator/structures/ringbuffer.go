@@ -10,8 +10,7 @@ import (
 	"sync/atomic"
 )
 
-// All methods on ringConsumer must be called from the same goroutine.
-type ringConsumer[T any] struct {
+type RingConsumer[T any] struct {
 	rb           *RingBuffer[T]
 	tail         uint64
 	seq          uint64
@@ -21,7 +20,7 @@ type ringConsumer[T any] struct {
 // Pop returns the next element and a monotonically increasing sequence number
 // that reflects any skipped elements, allowing clients to detect gaps in the
 // FIE stream. Blocks until an element is available or the context is canceled.
-func (rbc *ringConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
+func (rbc *RingConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
 	// Safe because Pop and Close must be called from the same goroutine.
 	if rbc.rb == nil {
 		return nil, 0, fmt.Errorf("consumer already closed")
@@ -58,7 +57,7 @@ func (rbc *ringConsumer[T]) Pop(ctx context.Context) (*T, uint64, error) {
 // Close releases the consumer. After Close, the consumer's tail is no longer
 // tracked by Push, so slow consumer skipping will not apply to it.
 // Calling Close multiple times is a no-op.
-func (rbc *ringConsumer[T]) Close() {
+func (rbc *RingConsumer[T]) Close() {
 	if rbc.rb == nil {
 		return
 	}
@@ -75,7 +74,7 @@ func (rbc *ringConsumer[T]) Close() {
 // Skipped returns the number of elements that were overwritten before
 // this consumer could read them, indicating the consumer is falling
 // behind the producer.
-func (rbc *ringConsumer[T]) Skipped() uint64 {
+func (rbc *RingConsumer[T]) Skipped() uint64 {
 	return rbc.totalSkipped.Load()
 }
 
@@ -91,7 +90,7 @@ type RingBuffer[T any] struct {
 	head      uint64
 	buffer    []*T
 	capacity  uint64
-	consumers map[*ringConsumer[T]]struct{}
+	consumers map[*RingConsumer[T]]struct{}
 }
 
 // NewRingBuffer creates a new RingBuffer with the given capacity.
@@ -104,18 +103,18 @@ func NewRingBuffer[T any](capacity int) (*RingBuffer[T], error) {
 		mutex:     mu,
 		buffer:    make([]*T, capacity),
 		capacity:  uint64(capacity),
-		consumers: make(map[*ringConsumer[T]]struct{}),
+		consumers: make(map[*RingConsumer[T]]struct{}),
 		cond:      sync.NewCond(mu),
 	}, nil
 }
 
 // NewConsumer creates a new consumer starting at the current head position.
 // The consumer will only receive elements pushed after its creation.
-func (rb *RingBuffer[T]) NewConsumer() *ringConsumer[T] {
+func (rb *RingBuffer[T]) NewConsumer() *RingConsumer[T] {
 	rb.mutex.Lock()
 	defer rb.mutex.Unlock()
 
-	cons := &ringConsumer[T]{
+	cons := &RingConsumer[T]{
 		tail: rb.head,
 		rb:   rb,
 	}

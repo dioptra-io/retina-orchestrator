@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -136,7 +135,7 @@ func (s *apiServer) handleStream(w http.ResponseWriter, r *http.Request) {
 // @Description	Opens a long-lived SSE stream of system events.
 // @Tags			sse
 // @Produce		text/event-stream
-// @Success		200	{object}	SSEEvent
+// @Success		200	{object}	RetinaEvent
 // @Failure		500	{string}	string	"internal server error"
 // @Router			/sse [get]
 func (s *apiServer) handleSSE(w http.ResponseWriter, r *http.Request) {
@@ -151,16 +150,16 @@ func (s *apiServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Wrap ResponseWriter to implement io.WriteCloser
-	ww := &sseResponseWriter{ResponseWriter: w, flusher: flusher}
-
 	client := &sseClient{
-		ctx:    r.Context(),
-		writer: ww,
+		ctx:     r.Context(),
+		flusher: flusher,
+		encoder: json.NewEncoder(w),
 	}
-	s.logger.Debug("SSE client connected", slog.String("remote_addr", r.RemoteAddr))
+	s.logger.Debug("Client connected", slog.String("remote_addr", r.RemoteAddr))
+	defer func() {
+		s.logger.Debug("Client disconnected", slog.String("remote_addr", r.RemoteAddr))
+	}()
 
-	// No client tracking for SSE yet - just call handler
 	s.config.sseHandler(client)
 }
 
@@ -194,26 +193,21 @@ func (s *fieClient) context() context.Context {
 	return s.ctx
 }
 
-// sseResponseWriter wraps http.ResponseWriter to implement io.WriteCloser.
-type sseResponseWriter struct {
-	http.ResponseWriter
-	flusher http.Flusher
-}
-
-func (w *sseResponseWriter) Write(b []byte) (int, error) {
-	return w.ResponseWriter.Write(b)
-}
-
-func (w *sseResponseWriter) Close() error {
-	return nil
-}
-
 // sseClient is a client for SSE streaming.
 type sseClient struct {
-	ctx    context.Context
-	writer io.WriteCloser
+	ctx     context.Context
+	flusher http.Flusher
+	encoder *json.Encoder
 }
 
 func (s *sseClient) context() context.Context {
 	return s.ctx
+}
+
+func (s *sseClient) sendEvent(event RetinaEvent) error {
+	if err := s.encoder.Encode(event); err != nil {
+		return fmt.Errorf("failed to send FIE: %w", err)
+	}
+	s.flusher.Flush()
+	return nil
 }

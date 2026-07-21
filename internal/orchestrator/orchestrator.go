@@ -56,6 +56,8 @@ type Config struct {
 	MinIssuanceRate      float64
 	MaxIssuanceRate      float64
 	LearningRate         float64
+
+	EventBusSize int
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -97,7 +99,7 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-type orch struct {
+type Orchestrator struct {
 	config        *Config
 	logger        *slog.Logger
 	metrics       *Metrics
@@ -106,13 +108,15 @@ type orch struct {
 	apiServer     *apiServer
 	pdQueue       *structures.Queue[api.ProbingDirective]
 	fieRingBuffer *structures.RingBuffer[api.ForwardingInfoElement]
+	ebus          *EventBus
 }
 
-// NewOrch creates a new orchestrator from the given configuration. Returns an
-// error if the configuration is invalid or any component creation fails.
+// NewOrchestrator creates a new orchestrator from the given configuration.
+// Returns an error if the configuration is invalid or any component creation
+// fails.
 //
 //nolint:funlen
-func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, error) {
+func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Orchestrator, error) {
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -123,7 +127,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		return nil, fmt.Errorf("metrics cannot be nil")
 	}
 
-	o := &orch{
+	o := &Orchestrator{
 		config:  config,
 		logger:  logger,
 		metrics: metrics,
@@ -153,10 +157,23 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.fieRingBuffer = ringBuffer
 
+	ebus, err := NewEventBus(config.EventBusSize)
+	if err != nil {
+		return nil, fmt.Errorf("error on creating event bus: %w", err)
+	}
+	o.ebus = ebus
+
+	sched, err := NewResearchScheduler(&ResearchSchedulerConfig{}, logger, ebus)
+	if err != nil {
+		return nil, fmt.Errorf("error on creating research scheduler: %w", err)
+	}
+	o.scheduler = sched
+
 	apiServer, err := newAPIServer(&apiServerConfig{
 		address:           config.APIAddress,
 		readHeaderTimeout: config.APIReadHeaderTimeout,
 		fieHandler:        o.fieStreamHandler,
+		sseHandler:        o.sseHandler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error on creating API server: %w", err)
@@ -166,7 +183,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	return o, nil
 }
 
-func (o *orch) Run(parentCtx context.Context) error {
+func (o *Orchestrator) Run(parentCtx context.Context) error {
 	group, ctx := errgroup.WithContext(parentCtx)
 	group.Go(func() error {
 		return o.runAPIServer(ctx)
@@ -183,7 +200,7 @@ func (o *orch) Run(parentCtx context.Context) error {
 	return err
 }
 
-func (o *orch) runScheduler(ctx context.Context) error {
+func (o *Orchestrator) runScheduler(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -209,7 +226,7 @@ func (o *orch) runScheduler(ctx context.Context) error {
 	}
 }
 
-func (o *orch) runAPIServer(ctx context.Context) error {
+func (o *Orchestrator) runAPIServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
 		return o.apiServer.listenAndServe()
@@ -224,7 +241,7 @@ func (o *orch) runAPIServer(ctx context.Context) error {
 	return nil
 }
 
-func (o *orch) runAgentServer(ctx context.Context) error {
+func (o *Orchestrator) runAgentServer(ctx context.Context) error {
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
 		return o.agentServer.listenAndServe()
@@ -239,7 +256,7 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 	return nil
 }
 
-func (o *orch) fieStreamHandler(s *fieClient) {
+func (o *Orchestrator) fieStreamHandler(s *fieClient) {
 	var closeReason string
 	consumer := o.fieRingBuffer.NewConsumer()
 	o.metrics.StreamClientsConnected.Inc()
@@ -280,8 +297,40 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 	}
 }
 
+func (o *Orchestrator) sseHandler(s *sseClient) {
+	var closeReason string
+	consumer := o.ebus.NewConsumer()
+	defer func() {
+		consumer.Close()
+		o.logger.Debug("SSE stream closed", slog.String("reason", closeReason))
+	}()
+
+	prevSeq := uint64(0)
+	for {
+		eventEnvelope, seq, err := consumer.Pop(s.context())
+		if err != nil {
+			return
+		}
+		if prevSeq != seq {
+			o.logger.Warn("One or more events are skipped on SSE handler",
+				slog.Uint64("current_seq", seq),
+				slog.Uint64("previous_seq", prevSeq))
+		}
+		prevSeq++ // increment to keep up with the seq.
+
+		// Send the event to the sseClient.
+		if err := s.sendEvent(eventEnvelope.RetinaEvent); err != nil {
+			closeReason = "internal_error"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				closeReason = "shutdown_or_disconnect"
+			}
+			return
+		}
+	}
+}
+
 //nolint:funlen
-func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
+func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 	consumer, err := o.pdQueue.NewConsumer(status.agentID)
 	if err != nil {
 		o.logger.Warn("Agent already connected, rejecting", "agent_id", status.agentID)
@@ -357,7 +406,7 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 	}
 }
 
-func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
+func (o *Orchestrator) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
 	if auth.Secret == o.config.Secret {
 		return api.AuthResponse{
 			Authenticated: true,
@@ -373,7 +422,7 @@ func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
 
 // filterFIE reports whether a FIE should be streamed based on the policy.
 // Returns true if the FIE is allowed.
-func (o *orch) filterFIE(fie *api.ForwardingInfoElement) (bool, error) {
+func (o *Orchestrator) filterFIE(fie *api.ForwardingInfoElement) (bool, error) {
 	switch o.config.FIEFilterPolicy {
 	case "any": // allow all FIEs
 		return true, nil

@@ -80,7 +80,7 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	orch, err := orchestrator.NewOrch(&orchestrator.Config{
+	orch, err := orchestrator.NewOrchestrator(&orchestrator.Config{
 		AgentAddress:         *agentAddr,
 		PDQueueSize:          *pdQueueSize,
 		RingBufferSize:       *ringBufferSize,
@@ -101,6 +101,7 @@ func run() error {
 		MinIssuanceRate:      *minIssuanceRate,
 		MaxIssuanceRate:      *maxIssuanceRate,
 		LearningRate:         *learningRate,
+		EventBusSize:         1024 * 1024,
 	}, logger, metrics)
 	if err != nil {
 		return err

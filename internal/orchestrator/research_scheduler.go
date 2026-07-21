@@ -15,6 +15,8 @@
 package orchestrator
 
 import (
+	"container/heap"
+	"context"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -65,11 +67,6 @@ type ResearchSchedulerConfig struct {
 	// Zero means "use MinIssuancePeriod" (the DSD default Μ = μmin).
 	StartingIssuancePeriod time.Duration
 
-	// MaxBusyWait is Tbusy, governing the hybrid sleep strategy (§5.1.1).
-	// Affects only timing precision, not scheduling semantics.
-	// Default: 100ms.
-	MaxBusyWait time.Duration
-
 	// StatusInterval is Tstatus, the CurrentStatus emission interval
 	// (§5.5). Default: 1 minute.
 	StatusInterval time.Duration
@@ -79,11 +76,33 @@ type ResearchSchedulerConfig struct {
 	// full; this backpressure is accepted. Defaults: 1024 each.
 	InsertChannelSize int
 	UpdateChannelSize int
+
+	// LatenessTolerance is the slack below which an issuance is not considered
+	// late; it absorbs clock-read granularity around the busy-wait exit.
+	LatenessTolerance time.Duration
+
+	// BusyTolerance is Tbusy, governing the hybrid sleep strategy (§5.1.1).
+	// Affects only timing precision, not scheduling semantics.
+	// Default: 100micros.
+	BusyTolerance time.Duration
+
+	WaitTolerance time.Duration
+
+	// InitialQueueSize is the default size of the queue variable.
+	InitialQueueSize int
+
+	// MaxUpdateDrainPerIssuance is the number of FIE updates we can do per
+	// issuance call.
+	MaxUpdateDrainPerIssuance int
+
+	// MaxInsertDrainPerIssuance is the number of FIE updates we can do per
+	// issuance call.
+	MaxInsertDrainPerIssuance int
 }
 
-// withDefaults returns a copy of the config with zero values replaced by the
-// DSD §6 defaults.
-func (c ResearchSchedulerConfig) withDefaults() ResearchSchedulerConfig {
+// fillZeroValueDefaults populates the zero value fields of ResearchSchedulerConfig with
+// default values specified in the DSD section §6.
+func (c *ResearchSchedulerConfig) fillZeroValueDefaults() {
 	if c.LearningRate == 0 {
 		c.LearningRate = 0.1
 	}
@@ -108,8 +127,8 @@ func (c ResearchSchedulerConfig) withDefaults() ResearchSchedulerConfig {
 	if c.StartingIssuancePeriod == 0 {
 		c.StartingIssuancePeriod = c.MinIssuancePeriod // Μ = μmin
 	}
-	if c.MaxBusyWait == 0 {
-		c.MaxBusyWait = 100 * time.Millisecond
+	if c.BusyTolerance == 0 {
+		c.BusyTolerance = 500 * time.Microsecond
 	}
 	if c.StatusInterval == 0 {
 		c.StatusInterval = time.Minute
@@ -120,12 +139,26 @@ func (c ResearchSchedulerConfig) withDefaults() ResearchSchedulerConfig {
 	if c.UpdateChannelSize == 0 {
 		c.UpdateChannelSize = 1024
 	}
-	return c
+	if c.LatenessTolerance == 0 {
+		c.LatenessTolerance = time.Millisecond
+	}
+	if c.InitialQueueSize == 0 {
+		c.InitialQueueSize = 100_000
+	}
+	if c.MaxUpdateDrainPerIssuance == 0 {
+		c.MaxUpdateDrainPerIssuance = 5
+	}
+	if c.MaxInsertDrainPerIssuance == 0 {
+		c.MaxInsertDrainPerIssuance = 5
+	}
+	if c.WaitTolerance == 0 {
+		c.WaitTolerance = time.Millisecond
+	}
 }
 
 // validate checks the configuration and returns an error describing the
 // first invalid parameter found.
-func (c ResearchSchedulerConfig) validate() error {
+func (c *ResearchSchedulerConfig) validate() error {
 	if c.LearningRate <= 0 || c.LearningRate >= 1 {
 		return fmt.Errorf("learning rate (α) must be in (0, 1): %v", c.LearningRate)
 	}
@@ -152,11 +185,23 @@ func (c ResearchSchedulerConfig) validate() error {
 	if c.AdmissionRate <= 0 {
 		return fmt.Errorf("admission rate (r₀) must be positive: %v", c.AdmissionRate)
 	}
-	if c.MaxBusyWait <= 0 {
-		return fmt.Errorf("maximum busy-wait duration (Tbusy) must be positive: %v", c.MaxBusyWait)
+	if c.BusyTolerance <= 0 {
+		return fmt.Errorf("maximum busy-wait duration (Tbusy) must be positive: %v", c.BusyTolerance)
 	}
 	if c.StatusInterval <= 0 {
 		return fmt.Errorf("status interval (Tstatus) must be positive: %v", c.StatusInterval)
+	}
+	if c.LatenessTolerance <= 0 {
+		return fmt.Errorf("lateness tolerance must be positive: %v", c.LatenessTolerance)
+	}
+	if c.InitialQueueSize <= 0 {
+		return fmt.Errorf("initial queue size must be positive: %v", c.InitialQueueSize)
+	}
+	if c.MaxUpdateDrainPerIssuance <= 0 {
+		return fmt.Errorf("max update drain per issuance must be positive: %v", c.MaxUpdateDrainPerIssuance)
+	}
+	if c.MaxInsertDrainPerIssuance <= 0 {
+		return fmt.Errorf("max insert drain per issuance must be positive: %v", c.MaxInsertDrainPerIssuance)
 	}
 	return nil
 }
@@ -168,20 +213,20 @@ func (c ResearchSchedulerConfig) validate() error {
 // fieObservation stores the near and far addresses of one FIE — the only
 // information the equivalence check requires (§5.4). A nil IP represents a
 // null address, which is a legitimate observation (§4.2.2).
-type fieObservation struct {
+type fieObservation struct { //nolint:unused
 	near net.IP
 	far  net.IP
 }
 
 // equivalent implements FIE equivalence (§4.2.2): near addresses equal and
 // far addresses equal, with null treated as a value.
-func (o fieObservation) equivalent(other fieObservation) bool {
+func (o fieObservation) equivalent(other fieObservation) bool { //nolint:unused
 	return ipEqual(o.near, other.near) && ipEqual(o.far, other.far)
 }
 
 // ipEqual compares two possibly-nil addresses; two nulls are equal, a null
 // is unequal to any non-null address.
-func ipEqual(a, b net.IP) bool {
+func ipEqual(a, b net.IP) bool { //nolint:unused
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
@@ -190,12 +235,12 @@ func ipEqual(a, b net.IP) bool {
 
 // pdRecord holds the scheduling state of a single PD.
 type pdRecord struct {
-	pdid uint64
-	pd   *api.ProbingDirective
+	pdid uint64                //nolint:unused
+	pd   *api.ProbingDirective //nolint:unused
 
 	// issuancePeriod is μᵢ in seconds (§3.1). It is the requested period;
 	// the realized period μ̂ᵢ may deviate (§4.1, §7.2).
-	issuancePeriod float64
+	issuancePeriod float64 //nolint:unused
 
 	// nextIssuance is the scheduled issuance time; the heap is ordered by
 	// this field.
@@ -203,24 +248,24 @@ type pdRecord struct {
 
 	// lastIssuedAt is the time of the previous issuance; zero if the PD has
 	// never been issued. Used to compute Bᵢ(t) (§3.2).
-	lastIssuedAt time.Time
+	lastIssuedAt time.Time //nolint:unused
 
 	// history is the FIE history 𝑭ᵢ as a fixed-capacity ring buffer of m
 	// entries (§5.4), allocated once at admission.
-	history   []fieObservation
-	histWrite int // write index
-	histFill  int // fill count n
+	history   []fieObservation //nolint:unused
+	histWrite int              //nolint:unused
+	histFill  int              //nolint:unused
 
 	// lastNear/lastFar are the addresses impacted by the most recently
 	// observed execution, as recorded in the address impact history (§5.3).
 	// nil means null (no impact on that side).
-	lastNear net.IP
-	lastFar  net.IP
+	lastNear net.IP //nolint:unused
+	lastFar  net.IP //nolint:unused
 }
 
 // appendFIE appends one observation to the ring buffer, evicting the oldest
 // implicitly once full (§5.4).
-func (r *pdRecord) appendFIE(o fieObservation) {
+func (r *pdRecord) appendFIE(o fieObservation) { //nolint:unused
 	r.history[r.histWrite] = o
 	r.histWrite = (r.histWrite + 1) % len(r.history)
 	if r.histFill < len(r.history) {
@@ -231,7 +276,7 @@ func (r *pdRecord) appendFIE(o fieObservation) {
 // historyStable reports whether all m entries are pairwise equivalent.
 // Equivalence is transitive, so comparing entries 2..m against entry 1
 // suffices (§5.4). Must only be called when the history is full.
-func (r *pdRecord) historyStable() bool {
+func (r *pdRecord) historyStable() bool { //nolint:unused
 	ref := r.history[0]
 	for i := 1; i < len(r.history); i++ {
 		if !r.history[i].equivalent(ref) {
@@ -266,20 +311,16 @@ func (h *pdHeap) Pop() any {
 // ResearchScheduler
 // ---------------------------------------------------------------------------
 
-// latenessTolerance is the slack below which an issuance is not considered
-// late; it absorbs clock-read granularity around the busy-wait exit.
-const latenessTolerance = time.Millisecond
-
 // ResearchScheduler is the implementation of the Scheduler interface as
 // specified in the Retina Research Instance Scheduler DSD v1.2.
 //
 // All state mutation happens inside Next, preserving the single-threaded
 // execution model (§5.1). Insert and Update only push onto channels.
 type ResearchScheduler struct {
-	cfg    ResearchSchedulerConfig
+	cfg    *ResearchSchedulerConfig
 	logger *slog.Logger
 	rand   *rand.Rand
-	ebus   *EventBus
+	ebus   *EventBus //nolint:unused
 
 	// records maps PD identifier to its record; queue is the priority
 	// queue of §5.2 over the same records.
@@ -292,20 +333,20 @@ type ResearchScheduler struct {
 	impacts map[string]map[uint64]struct{}
 
 	// insertCh and fieCh are the internal channels of §5.1.
-	insertCh chan *api.ProbingDirective
-	updateCh chan *api.ForwardingInfoElement
+	insertCh     chan *api.ProbingDirective
+	updateCh     chan *api.ForwardingInfoElement
+	statusTicker *time.Ticker
+	ctx          context.Context
 
 	// bucketNext is the token bucket state for admission pacing (§5.6): the
 	// earliest time the next admitted PD may be first-issued.
-	bucketNext time.Time
-
-	statusTicker *time.Ticker
+	bucketNext time.Time //nolint:unused
 
 	// Counters for CurrentStatus (§5.5).
-	totalInsertions       uint64
-	totalIssuances        uint64
-	totalLate             uint64
-	issuancesAtLastStatus uint64
+	totalInsertions       uint64 //nolint:unused
+	totalIssuances        uint64 //nolint:unused
+	totalLate             uint64 //nolint:unused
+	issuancesAtLastStatus uint64 //nolint:unused
 	lastStatusEmission    time.Time
 }
 
@@ -315,11 +356,11 @@ var _ Scheduler = (*ResearchScheduler)(nil)
 // The scheduler starts empty (§4.3); PDs are admitted at runtime via Insert.
 // Loading an initial PD set is the caller's responsibility: read the file
 // and Insert in a loop — startup is just a burst of insertions.
-func NewResearchScheduler(cfg ResearchSchedulerConfig, logger *slog.Logger, ebus *EventBus) (*ResearchScheduler, error) {
+func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebus *EventBus) (*ResearchScheduler, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	cfg = cfg.withDefaults()
+	cfg.fillZeroValueDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -329,15 +370,15 @@ func NewResearchScheduler(cfg ResearchSchedulerConfig, logger *slog.Logger, ebus
 		logger:             logger,
 		rand:               rand.New(rand.NewSource(int64(cfg.Seed))), //nolint:gosec // G404: not used for security
 		records:            make(map[uint64]*pdRecord),
-		queue:              make(pdHeap, 0),
+		queue:              make(pdHeap, 0, cfg.InitialQueueSize),
 		impacts:            make(map[string]map[uint64]struct{}),
 		insertCh:           make(chan *api.ProbingDirective, cfg.InsertChannelSize),
 		updateCh:           make(chan *api.ForwardingInfoElement, cfg.UpdateChannelSize),
 		statusTicker:       time.NewTicker(cfg.StatusInterval),
+		ctx:                context.Background(),
 		lastStatusEmission: time.Now(),
+		ebus:               ebus,
 	}
-
-	// s.emit(SSEEventSchedulerStarted, &SchedulerStartedData{Config: cfg})
 
 	s.logger.Info("Research scheduler initialized",
 		slog.Float64("alpha", cfg.LearningRate),
@@ -359,7 +400,54 @@ func (s *ResearchScheduler) Insert(req *api.ProbingDirective) (uint64, error) {
 }
 
 func (s *ResearchScheduler) Next() (*api.ProbingDirective, error) {
-	return nil, nil
+	// Drain the channels and ensure there are at least one element in the
+	// queue.
+	if err := s.drain(); err != nil {
+		return nil, err
+	}
+
+	for {
+		root := s.queue[0] // safe: drain guarantees non-empty on nil return
+		remaining := time.Until(root.nextIssuance)
+
+		// Far from due: interruptible wait for most of the gap, then loop to
+		// re-drain and re-check (a newly admitted PD may now be sooner).
+		if remaining > s.cfg.BusyTolerance {
+			if err := s.wait(root.nextIssuance.Add(-s.cfg.BusyTolerance)); err != nil {
+				return nil, err
+			}
+
+			// If a new PD is scheduled before our root, eliminate it and go
+			// back.
+			if root != s.queue[0] {
+				continue
+			}
+		}
+
+		// Close or overdue: busy-wait the final sub-tolerance stretch for
+		// precision. If already overdue this loop doesn't execute.
+		for time.Now().Before(root.nextIssuance) {
+		}
+
+		// TODO: the rest is not very important for now.
+		// Due. Pop, check lateness, learn, sample, reschedule, issue.
+		rec := heap.Pop(&s.queue).(*pdRecord)
+		now := time.Now()
+
+		if now.Sub(rec.nextIssuance) > s.cfg.LatenessTolerance {
+			s.ebus.Emit(&SchedulerLateEvent{
+				ProbingDirectiveID: rec.pdid,
+				ScheduledTime:      rec.nextIssuance,
+				ActualTime:         now,
+			})
+		}
+
+		s.learn(rec, now)
+		rec.lastIssuedAt = now
+		rec.nextIssuance = now.Add(s.sampleInterIssuance(rec.issuancePeriod))
+		heap.Push(&s.queue, rec)
+		return rec.pd, nil
+	}
 }
 
 func (s *ResearchScheduler) Update(fie *api.ForwardingInfoElement) error {
@@ -374,3 +462,158 @@ func (s *ResearchScheduler) Close() error {
 // ---------------------------------------------------------------------------
 // Private interface
 // ---------------------------------------------------------------------------
+
+// drain applies pending inserts and FIEs, emits status, and honors shutdown
+// before the scheduler picks the next PD to issue (§5.1). Returns nil only
+// with a non-empty queue (so the caller can read s.queue[0]); returns an error
+// only on shutdown.
+func (s *ResearchScheduler) drain() error {
+	// Per-issuance quotas: bound how many inserts and FIEs are applied per
+	// call so neither can starve issuance. A spent quota drops its channel
+	// from the select; unapplied items stay queued for the next pass.
+	remInserts := s.cfg.MaxInsertDrainPerIssuance
+	remUpdates := s.cfg.MaxUpdateDrainPerIssuance
+
+	for {
+		if s.queue.Len() == 0 {
+			// Nothing to issue: block for work, ignoring quotas (there is no
+			// issuance to starve). FIEs shouldn't occur here yet.
+			select {
+			case pd := <-s.insertCh:
+				s.insert(pd)
+			case fie := <-s.updateCh:
+				s.update(fie)
+			case <-s.statusTicker.C:
+				s.emitStatus()
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			}
+			continue
+		}
+
+		// Non-empty queue: drain within quota. Build the select from whichever
+		// channels still have budget.
+		switch {
+		case remInserts != 0 && remUpdates != 0:
+			select {
+			case pd := <-s.insertCh:
+				s.insert(pd)
+				remInserts--
+			case fie := <-s.updateCh:
+				s.update(fie)
+				remUpdates--
+			case <-s.statusTicker.C:
+				s.emitStatus()
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			default:
+				return nil
+			}
+		case remInserts != 0: // FIE quota spent
+			select {
+			case pd := <-s.insertCh:
+				s.insert(pd)
+				remInserts--
+			case <-s.statusTicker.C:
+				s.emitStatus()
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			default:
+				return nil
+			}
+		case remUpdates != 0: // insert quota spent
+			select {
+			case fie := <-s.updateCh:
+				s.update(fie)
+				remUpdates--
+			case <-s.statusTicker.C:
+				s.emitStatus()
+			case <-s.ctx.Done():
+				return s.ctx.Err()
+			default:
+				return nil
+			}
+		default: // both spent
+			return nil
+		}
+	}
+}
+
+// wait blocks until d, keeping the scheduler responsive to arrivals. Outside
+// the WaitTolerance window it sleeps with time.After (interruptible by
+// inserts, FIEs, and status ticks); within WaitTolerance it busy-waits, since
+// time.After can over-sleep past d on a shared core and miss the issuance
+// instant. Returns when d is reached, when an insert makes another PD the head
+// (preemption), or on shutdown.
+func (s *ResearchScheduler) wait(d time.Time) error {
+	oldRoot := s.queue[0]
+	tolerance := s.cfg.WaitTolerance // e.g. 1ms on GCP shared cores
+
+	for {
+		remaining := time.Until(d)
+
+		// Within the tolerance window: busy-wait, no time.After. Still poll the
+		// channels non-blockingly so arrivals are applied and preemption is
+		// detected, but never sleep here.
+		if remaining <= tolerance {
+			for time.Now().Before(d) {
+				select {
+				case pd := <-s.insertCh:
+					s.insert(pd)
+					if s.queue[0] != oldRoot {
+						return nil
+					}
+				case fie := <-s.updateCh:
+					s.update(fie)
+				case <-s.ctx.Done():
+					return s.ctx.Err()
+				default:
+					// spin: nothing pending, keep checking the clock
+				}
+			}
+			return nil // reached d, root still head
+		}
+
+		// Outside the tolerance window: sleep interruptibly until either an
+		// arrival or (remaining - tolerance) elapses, then loop to re-decide.
+		select {
+		case pd := <-s.insertCh:
+			s.insert(pd)
+			if s.queue[0] != oldRoot {
+				return nil
+			}
+			if time.Now().After(d) {
+				return nil
+			}
+		case fie := <-s.updateCh:
+			s.update(fie)
+			if time.Now().After(d) {
+				return nil
+			}
+		case <-s.statusTicker.C:
+			s.emitStatus()
+			if time.Now().After(d) {
+				return nil
+			}
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		case <-time.After(remaining - tolerance):
+			// woke ~tolerance before d; loop, next pass enters the busy-wait
+			if time.Now().After(d) {
+				return nil
+			}
+		}
+	}
+}
+
+func (s *ResearchScheduler) emitStatus() {
+	// TODO
+}
+
+func (s *ResearchScheduler) update(fie *api.ForwardingInfoElement) {
+	// TODO
+}
+
+func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
+	// TODO
+}
