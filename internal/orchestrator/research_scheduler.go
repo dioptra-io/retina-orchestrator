@@ -359,10 +359,8 @@ type ResearchScheduler struct {
 	records map[uint64]*pdRecord
 	queue   pdHeap
 
-	// impacts is the address impact history (§5.3): a map from IP address
-	// (string form) to the set of PD identifiers that impacted that address
-	// on their most recent issuance.
-	impacts map[addrKey]map[uint64]struct{}
+	// §4.2.1 revised: theoretical arrival time per address
+	addressTAT map[addrKey]time.Time
 
 	nextID atomic.Uint64
 
@@ -414,7 +412,7 @@ func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebu
 		rand:               rand.New(rand.NewSource(int64(cfg.Seed))), //nolint:gosec // G404: not used for security
 		records:            make(map[uint64]*pdRecord),
 		queue:              make(pdHeap, 0, cfg.InitialQueueSize),
-		impacts:            make(map[addrKey]map[uint64]struct{}),
+		addressTAT:         make(map[addrKey]time.Time),
 		insertCh:           make(chan *api.ProbingDirective, cfg.InsertChannelSize),
 		updateCh:           make(chan *api.ForwardingInfoElement, cfg.UpdateChannelSize),
 		statusTicker:       time.NewTicker(cfg.StatusInterval),
@@ -732,24 +730,17 @@ func (s *ResearchScheduler) update(fie *api.ForwardingInfoElement) {
 	if fie.FarInfo != nil {
 		far = fie.FarInfo.ReplyAddress
 	}
-
-	// Address impact history (§5.3): applying an FIE for PD i replaces i's
-	// previous impacts. Remove i from its old addresses' sets, add it to the
-	// new non-null addresses, then overwrite the record's impacted pair.
-	s.removeImpact(rec.lastNear, rec.pdid)
-	s.removeImpact(rec.lastFar, rec.pdid)
-	s.addImpact(near, rec.pdid)
-	s.addImpact(far, rec.pdid)
 	rec.lastNear = near
 	rec.lastFar = far
 
-	// FIE history append (§5.4), immediately after the impact update.
 	wasFullBefore := rec.histFill == len(rec.history)
 	rec.appendFIE(fieObservation{near: near, far: far})
 	if !wasFullBefore && rec.histFill == len(rec.history) {
 		s.pdsWithFullHistory++
 	}
 
+	// TODO: If we are getting the timestamps in seconds granularity, then this
+	// would be 0. Then the impact deflay would be zero ???
 	if fie.NearInfo != nil {
 		mid := fie.NearInfo.SentTimestamp.Add(fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp) / 2)
 		rec.impactDelay = mid.Sub(rec.lastIssuedAt).Seconds()
@@ -760,61 +751,30 @@ func (s *ResearchScheduler) update(fie *api.ForwardingInfoElement) {
 	}
 }
 
-// addImpact adds pdid to the impact set of addr. Null addresses are never
-// inserted (§5.3).
-func (s *ResearchScheduler) addImpact(addr net.IP, pdid uint64) {
+// reserveAndFloor advances addr's theoretical arrival time (TAT) to account
+// for this issuance's projected impact, landing at now+impactDelay, and
+// returns the minimum period the NEXT issuance must respect to keep this
+// address's combined impact rate at or below Λ (§4.2.1, revised: GCRA-style
+// rate limiting per address, shared across every PD that touches it).
+func (s *ResearchScheduler) reserveAndFloor(addr net.IP, now time.Time, impactDelay float64) float64 {
 	key, ok := toAddrKey(addr)
 	if !ok {
-		return // null or invalid address: never inserted (§5.3)
-	}
-	set, exists := s.impacts[key]
-	if !exists {
-		set = make(map[uint64]struct{}, 1)
-		s.impacts[key] = set
-	}
-	set[pdid] = struct{}{}
-}
-
-// removeImpact removes pdid from the impact set of addr; sets that become
-// empty are deleted to bound the map's size (§5.3).
-func (s *ResearchScheduler) removeImpact(addr net.IP, pdid uint64) {
-	key, ok := toAddrKey(addr)
-	if !ok {
-		return
-	}
-	set, exists := s.impacts[key]
-	if !exists {
-		return
-	}
-	delete(set, pdid)
-	if len(set) == 0 {
-		delete(s.impacts, key)
-	}
-}
-
-func (s *ResearchScheduler) projectedImpactRate(addr net.IP, rec *pdRecord, now time.Time) float64 {
-	key, ok := toAddrKey(addr)
-	if !ok {
-		return 0 // null or invalid address: no impact, no rate contribution
+		return 0 // null/invalid address: no shared resource, no floor
 	}
 
-	// PD i's own projected contribution at the projection instant.
-	rate := 1 / rec.impactDelay
-
-	for pdid := range s.impacts[key] {
-		other, exists := s.records[pdid]
-
-		// Ignore the non-existing ones and never issued ones (should not happen)
-		if !exists || other.lastIssuedAt.IsZero() {
-			continue
-		}
-
-		dTotal := now.Sub(other.lastIssuedAt).Seconds() + rec.impactDelay
-		if dTotal > 0 {
-			rate += 1 / dTotal
-		}
+	landing := now.Add(secondsToDuration(impactDelay))
+	tat := s.addressTAT[key] // zero value if never reserved: before `landing`
+	if tat.Before(landing) {
+		tat = landing
 	}
-	return rate
+	tat = tat.Add(secondsToDuration(1 / s.cfg.ImpactThreshold))
+	s.addressTAT[key] = tat // reserve: this issuance's slot is consumed
+
+	floor := tat.Sub(landing).Seconds()
+	if floor < 0 {
+		return 0
+	}
+	return floor
 }
 
 // compute applies the learning rules to the just-popped PD and reschedules
@@ -833,18 +793,13 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 	rule := PeriodAdjustmentRuleNone
 
 	// --- Responsible probing rpFloor (§4.2.1, revised) ---
-	rpFloor := 0.0
-	// This is very difficult and I cannot think of a good implementation at the
-	// time being. So I am just setting the responsible probing floor period as
-	// 0. I WILL DEAL WITH THIS LATER.
-	// if !rec.lastIssuedAt.IsZero() {
-	// 	totalProjectedRate := s.projectedImpactRate(rec.lastNear, rec, t) + s.projectedImpactRate(rec.lastFar, rec, t)
-	// 	if totalProjectedRate > s.cfg.ImpactThreshold {
-	// 		rpFloor = totalProjectedRate / s.cfg.ImpactThreshold * rec.impactDelay
-	// 		// scales the current period up in proportion to how far over Λ
-	// 		// the projected rate is; see note below.
-	// 	}
-	// }
+	// Reserve this issuance's projected impact on both addresses (assumed
+	// same as the previous issuance's, per §4.2.1) and take the tighter of
+	// the two resulting floors for the next issuance.
+	rpFloor := math.Max(
+		s.reserveAndFloor(rec.lastNear, t, rec.impactDelay),
+		s.reserveAndFloor(rec.lastFar, t, rec.impactDelay),
+	)
 
 	// --- Staleness (§4.2.2) ---
 	// Applied only once the FIE history is full; then every issuance either
@@ -949,7 +904,7 @@ func (s *ResearchScheduler) emitStatus() {
 		CumulativeIssuances:       s.totalIssuances,
 		AggregateRequestedRate:    s.sumRate,
 		RealizedRate:              realized,
-		DistinctImpactedAddrs:     len(s.impacts),
+		DistinctImpactedAddrs:     len(s.addressTAT),
 		PeriodMin:                 minP,
 		PeriodMax:                 maxP,
 		PDsClampedAtMin:           s.pdsClampedAtMin,

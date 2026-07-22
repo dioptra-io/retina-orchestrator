@@ -122,7 +122,6 @@ type CurrentStatusEvent struct {
 	DistinctImpactedAddrs     int           `json:"distinct_impacted_addrs"`
 	PeriodMin                 time.Duration `json:"period_min"`
 	PeriodMax                 time.Duration `json:"period_max"`
-	PeriodMean                time.Duration `json:"period_mean"`
 	PDsClampedAtMin           int           `json:"pds_clamped_at_min"`
 	PDsClampedAtMax           int           `json:"pds_clamped_at_max"`
 	PDsWithFullHistory        int           `json:"pds_with_full_history"`
