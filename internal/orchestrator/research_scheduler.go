@@ -19,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand"
 	"net"
 	"sync/atomic"
@@ -99,6 +100,10 @@ type ResearchSchedulerConfig struct {
 	// MaxInsertDrainPerIssuance is the number of FIE updates we can do per
 	// issuance call.
 	MaxInsertDrainPerIssuance int
+
+	// DefaultImpactDelay is the default delay estimated for a PD's issuance and
+	// it's impact on the address.
+	DefaultImpactDelay time.Duration
 }
 
 // fillZeroValueDefaults populates the zero value fields of ResearchSchedulerConfig with
@@ -155,6 +160,9 @@ func (c *ResearchSchedulerConfig) fillZeroValueDefaults() { //nolint:gocyclo
 	if c.WaitTolerance == 0 {
 		c.WaitTolerance = time.Millisecond
 	}
+	if c.DefaultImpactDelay == 0 {
+		c.DefaultImpactDelay = time.Second
+	}
 }
 
 // validate checks the configuration and returns an error describing the
@@ -204,6 +212,9 @@ func (c *ResearchSchedulerConfig) validate() error { //nolint:gocyclo
 	if c.MaxInsertDrainPerIssuance <= 0 {
 		return fmt.Errorf("max insert drain per issuance must be positive: %v", c.MaxInsertDrainPerIssuance)
 	}
+	if c.DefaultImpactDelay <= time.Millisecond*200 { // this is a rule of thumb
+		return fmt.Errorf("default impact delay must be greater than 200 ms: %v", c.DefaultImpactDelay)
+	}
 	return nil
 }
 
@@ -211,23 +222,40 @@ func (c *ResearchSchedulerConfig) validate() error { //nolint:gocyclo
 // PD record and FIE history buffer (§5.4)
 // ---------------------------------------------------------------------------
 
+// addrKey is the canonical, comparable representation of an IP address used
+// as a key in the address impact history (§5.3). Both IPv4 and IPv6
+// addresses are stored in their 16-byte form, so the same address always
+// maps to the same key regardless of which byte-length net.IP produced it.
+type addrKey [16]byte
+
+// toAddrKey converts addr to its canonical key. ok is false if addr is nil
+// or not a valid IP (in which case it is treated as a null address).
+func toAddrKey(addr net.IP) (key addrKey, ok bool) {
+	b := addr.To16()
+	if b == nil {
+		return addrKey{}, false
+	}
+	copy(key[:], b)
+	return key, true
+}
+
 // fieObservation stores the near and far addresses of one FIE — the only
 // information the equivalence check requires (§5.4). A nil IP represents a
 // null address, which is a legitimate observation (§4.2.2).
-type fieObservation struct { //nolint:unused
+type fieObservation struct {
 	near net.IP
 	far  net.IP
 }
 
 // equivalent implements FIE equivalence (§4.2.2): near addresses equal and
 // far addresses equal, with null treated as a value.
-func (o fieObservation) equivalent(other fieObservation) bool { //nolint:unused
+func (o fieObservation) equivalent(other fieObservation) bool {
 	return ipEqual(o.near, other.near) && ipEqual(o.far, other.far)
 }
 
 // ipEqual compares two possibly-nil addresses; two nulls are equal, a null
 // is unequal to any non-null address.
-func ipEqual(a, b net.IP) bool { //nolint:unused
+func ipEqual(a, b net.IP) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
@@ -236,12 +264,12 @@ func ipEqual(a, b net.IP) bool { //nolint:unused
 
 // pdRecord holds the scheduling state of a single PD.
 type pdRecord struct {
-	pdid uint64                //nolint:unused
-	pd   *api.ProbingDirective //nolint:unused
+	pdid uint64
+	pd   *api.ProbingDirective
 
 	// issuancePeriod is μᵢ in seconds (§3.1). It is the requested period;
 	// the realized period μ̂ᵢ may deviate (§4.1, §7.2).
-	issuancePeriod float64 //nolint:unused
+	issuancePeriod float64
 
 	// nextIssuance is the scheduled issuance time; the heap is ordered by
 	// this field.
@@ -249,24 +277,27 @@ type pdRecord struct {
 
 	// lastIssuedAt is the time of the previous issuance; zero if the PD has
 	// never been issued. Used to compute Bᵢ(t) (§3.2).
-	lastIssuedAt time.Time //nolint:unused
+	lastIssuedAt time.Time
 
 	// history is the FIE history 𝑭ᵢ as a fixed-capacity ring buffer of m
 	// entries (§5.4), allocated once at admission.
-	history   []fieObservation //nolint:unused
-	histWrite int              //nolint:unused
-	histFill  int              //nolint:unused
+	history   []fieObservation
+	histWrite int
+	histFill  int
 
 	// lastNear/lastFar are the addresses impacted by the most recently
 	// observed execution, as recorded in the address impact history (§5.3).
 	// nil means null (no impact on that side).
-	lastNear net.IP //nolint:unused
-	lastFar  net.IP //nolint:unused
+	lastNear net.IP
+	lastFar  net.IP
+
+	// impactDelay is the last impact delay known in seconds.
+	impactDelay float64
 }
 
 // appendFIE appends one observation to the ring buffer, evicting the oldest
 // implicitly once full (§5.4).
-func (r *pdRecord) appendFIE(o fieObservation) { //nolint:unused
+func (r *pdRecord) appendFIE(o fieObservation) {
 	r.history[r.histWrite] = o
 	r.histWrite = (r.histWrite + 1) % len(r.history)
 	if r.histFill < len(r.history) {
@@ -277,7 +308,7 @@ func (r *pdRecord) appendFIE(o fieObservation) { //nolint:unused
 // historyStable reports whether all m entries are pairwise equivalent.
 // Equivalence is transitive, so comparing entries 2..m against entry 1
 // suffices (§5.4). Must only be called when the history is full.
-func (r *pdRecord) historyStable() bool { //nolint:unused
+func (r *pdRecord) historyStable() bool {
 	ref := r.history[0]
 	for i := 1; i < len(r.history); i++ {
 		if !r.history[i].equivalent(ref) {
@@ -321,7 +352,7 @@ type ResearchScheduler struct {
 	cfg    *ResearchSchedulerConfig
 	logger *slog.Logger
 	rand   *rand.Rand
-	ebus   *EventBus //nolint:unused
+	ebus   *EventBus
 
 	// records maps PD identifier to its record; queue is the priority
 	// queue of §5.2 over the same records.
@@ -331,7 +362,7 @@ type ResearchScheduler struct {
 	// impacts is the address impact history (§5.3): a map from IP address
 	// (string form) to the set of PD identifiers that impacted that address
 	// on their most recent issuance.
-	impacts map[string]map[uint64]struct{}
+	impacts map[addrKey]map[uint64]struct{}
 
 	nextID atomic.Uint64
 
@@ -344,14 +375,20 @@ type ResearchScheduler struct {
 
 	// bucketNext is the token bucket state for admission pacing (§5.6): the
 	// earliest time the next admitted PD may be first-issued.
-	bucketNext time.Time //nolint:unused
+	bucketNext time.Time
 
 	// Counters for CurrentStatus (§5.5).
-	totalInsertions       uint64 //nolint:unused
-	totalIssuances        uint64 //nolint:unused
-	totalLate             uint64 //nolint:unused
-	issuancesAtLastStatus uint64 //nolint:unused
+	totalInsertions       uint64
+	totalIssuances        uint64
+	totalLate             uint64
+	issuancesAtLastStatus uint64
 	lastStatusEmission    time.Time
+	windowMinPeriod       float64
+	windowMaxPeriod       float64
+	sumRate               float64
+	pdsClampedAtMin       int
+	pdsClampedAtMax       int
+	pdsWithFullHistory    int
 }
 
 var _ Scheduler = (*ResearchScheduler)(nil)
@@ -377,7 +414,7 @@ func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebu
 		rand:               rand.New(rand.NewSource(int64(cfg.Seed))), //nolint:gosec // G404: not used for security
 		records:            make(map[uint64]*pdRecord),
 		queue:              make(pdHeap, 0, cfg.InitialQueueSize),
-		impacts:            make(map[string]map[uint64]struct{}),
+		impacts:            make(map[addrKey]map[uint64]struct{}),
 		insertCh:           make(chan *api.ProbingDirective, cfg.InsertChannelSize),
 		updateCh:           make(chan *api.ForwardingInfoElement, cfg.UpdateChannelSize),
 		statusTicker:       time.NewTicker(cfg.StatusInterval),
@@ -385,6 +422,8 @@ func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebu
 		cancel:             cancel,
 		lastStatusEmission: time.Now(),
 		ebus:               ebus,
+		windowMinPeriod:    math.Inf(1),
+		windowMaxPeriod:    math.Inf(-1),
 	}
 
 	s.logger.Info("Research scheduler initialized",
@@ -444,6 +483,7 @@ func (s *ResearchScheduler) Next() (*api.ProbingDirective, error) {
 		now := time.Now()
 
 		if now.Sub(rec.nextIssuance) > s.cfg.LatenessTolerance {
+			s.totalLate++
 			s.ebus.Emit(&SchedulerLateEvent{
 				ProbingDirectiveID: rec.pdid,
 				ScheduledTime:      rec.nextIssuance,
@@ -457,6 +497,7 @@ func (s *ResearchScheduler) Next() (*api.ProbingDirective, error) {
 		for time.Now().Before(target) {
 		}
 
+		s.totalIssuances++
 		return rec.pd, nil
 	}
 }
@@ -623,10 +664,6 @@ func (s *ResearchScheduler) wait(d time.Time) error { //nolint:gocyclo
 	}
 }
 
-// ---------------------------------------------------------------------------
-// insert (§4.3, §5.6)
-// ---------------------------------------------------------------------------
-
 // insert admits one PD into the schedule. Called only from the scheduler
 // goroutine during the channel drain. The PD's identifier was already
 // assigned by the public Insert method; here we build its record, pace its
@@ -652,12 +689,21 @@ func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
 		pd:             pd,
 		issuancePeriod: s.cfg.StartingIssuancePeriod.Seconds(), // μᵢ = Μ (§4.3)
 		nextIssuance:   first,
-		// Fixed-capacity FIE ring buffer, allocated once at admission (§5.4).
-		history: make([]fieObservation, s.cfg.FIEHistoryCapacity),
+		history:        make([]fieObservation, s.cfg.FIEHistoryCapacity), // Fixed-capacity FIE ring buffer, allocated once at admission (§5.4).
+		impactDelay:    s.cfg.DefaultImpactDelay.Seconds(),
 	}
 	s.records[pd.ProbingDirectiveID] = rec
 	heap.Push(&s.queue, rec)
 	s.totalInsertions++
+
+	rec.issuancePeriod = s.cfg.StartingIssuancePeriod.Seconds()
+	s.sumRate += 1 / rec.issuancePeriod
+	if rec.issuancePeriod == s.cfg.MinIssuancePeriod.Seconds() {
+		s.pdsClampedAtMin++
+	}
+	if rec.issuancePeriod == s.cfg.MaxIssuancePeriod.Seconds() {
+		s.pdsClampedAtMax++
+	}
 
 	s.ebus.Emit(&PDInsertedEvent{
 		ProbingDirectiveID: pd.ProbingDirectiveID,
@@ -665,12 +711,6 @@ func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
 		CurrentPDCount:     len(s.records),
 	})
 }
-
-// THE REST NEEDS SOME ATTENTION.
-
-// ---------------------------------------------------------------------------
-// update (§5.3, §5.4)
-// ---------------------------------------------------------------------------
 
 // update applies one FIE to its PD's record: the address impact history is
 // updated first, then the observation is appended to the FIE history (§5.1).
@@ -704,18 +744,31 @@ func (s *ResearchScheduler) update(fie *api.ForwardingInfoElement) {
 	rec.lastFar = far
 
 	// FIE history append (§5.4), immediately after the impact update.
+	wasFullBefore := rec.histFill == len(rec.history)
 	rec.appendFIE(fieObservation{near: near, far: far})
+	if !wasFullBefore && rec.histFill == len(rec.history) {
+		s.pdsWithFullHistory++
+	}
+
+	if fie.NearInfo != nil {
+		mid := fie.NearInfo.SentTimestamp.Add(fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp) / 2)
+		rec.impactDelay = mid.Sub(rec.lastIssuedAt).Seconds()
+	}
+	if fie.FarInfo != nil {
+		mid := fie.FarInfo.SentTimestamp.Add(fie.FarInfo.ReceivedTimestamp.Sub(fie.FarInfo.SentTimestamp) / 2)
+		rec.impactDelay = mid.Sub(rec.lastIssuedAt).Seconds()
+	}
 }
 
 // addImpact adds pdid to the impact set of addr. Null addresses are never
 // inserted (§5.3).
 func (s *ResearchScheduler) addImpact(addr net.IP, pdid uint64) {
-	if addr == nil {
-		return
-	}
-	key := addr.String()
-	set, ok := s.impacts[key]
+	key, ok := toAddrKey(addr)
 	if !ok {
+		return // null or invalid address: never inserted (§5.3)
+	}
+	set, exists := s.impacts[key]
+	if !exists {
 		set = make(map[uint64]struct{}, 1)
 		s.impacts[key] = set
 	}
@@ -725,12 +778,12 @@ func (s *ResearchScheduler) addImpact(addr net.IP, pdid uint64) {
 // removeImpact removes pdid from the impact set of addr; sets that become
 // empty are deleted to bound the map's size (§5.3).
 func (s *ResearchScheduler) removeImpact(addr net.IP, pdid uint64) {
-	if addr == nil {
+	key, ok := toAddrKey(addr)
+	if !ok {
 		return
 	}
-	key := addr.String()
-	set, ok := s.impacts[key]
-	if !ok {
+	set, exists := s.impacts[key]
+	if !exists {
 		return
 	}
 	delete(set, pdid)
@@ -739,18 +792,30 @@ func (s *ResearchScheduler) removeImpact(addr net.IP, pdid uint64) {
 	}
 }
 
-// impactSetSize returns |𝒜ₐ| for the given address; a null address has no
-// impact set (§3.2).
-func (s *ResearchScheduler) impactSetSize(addr net.IP) int {
-	if addr == nil {
-		return 0
+func (s *ResearchScheduler) projectedImpactRate(addr net.IP, rec *pdRecord, now time.Time) float64 {
+	key, ok := toAddrKey(addr)
+	if !ok {
+		return 0 // null or invalid address: no impact, no rate contribution
 	}
-	return len(s.impacts[addr.String()])
-}
 
-// ---------------------------------------------------------------------------
-// compute — learning + reschedule (§4.2, §4.1)
-// ---------------------------------------------------------------------------
+	// PD i's own projected contribution at the projection instant.
+	rate := 1 / rec.impactDelay
+
+	for pdid := range s.impacts[key] {
+		other, exists := s.records[pdid]
+
+		// Ignore the non-existing ones and never issued ones (should not happen)
+		if !exists || other.lastIssuedAt.IsZero() {
+			continue
+		}
+
+		dTotal := now.Sub(other.lastIssuedAt).Seconds() + rec.impactDelay
+		if dTotal > 0 {
+			rate += 1 / dTotal
+		}
+	}
+	return rate
+}
 
 // compute applies the learning rules to the just-popped PD and reschedules
 // it. It runs just before issuance, on the record being issued at time t.
@@ -762,25 +827,24 @@ func (s *ResearchScheduler) impactSetSize(addr net.IP) int {
 // single step emits at most one PeriodAdjusted, attributed to the binding
 // rule. Finally a new inter-issuance time is sampled and nextIssuance and
 // lastIssuedAt are set.
-func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) {
+func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyclo
 	old := rec.issuancePeriod
 	candidate := old
 	rule := PeriodAdjustmentRuleNone
 
-	// --- Responsible probing floor (§4.2.1) ---
-	// Projected impact counter c̃ᵢ under the assumption that this issuance
-	// impacts the same addresses as the previous one. Only meaningful once
-	// the PD has been issued and has a recorded impact.
-	floor := 0.0
-	if !rec.lastIssuedAt.IsZero() {
-		projected := s.impactSetSize(rec.lastNear) + s.impactSetSize(rec.lastFar)
-		if projected > 0 {
-			elapsed := t.Sub(rec.lastIssuedAt).Seconds() // Bᵢ(t)
-			if elapsed > 0 && float64(projected)/elapsed > s.cfg.ImpactThreshold {
-				floor = float64(projected) / s.cfg.ImpactThreshold // c̃ᵢ / Λ
-			}
-		}
-	}
+	// --- Responsible probing rpFloor (§4.2.1, revised) ---
+	rpFloor := 0.0
+	// This is very difficult and I cannot think of a good implementation at the
+	// time being. So I am just setting the responsible probing floor period as
+	// 0. I WILL DEAL WITH THIS LATER.
+	// if !rec.lastIssuedAt.IsZero() {
+	// 	totalProjectedRate := s.projectedImpactRate(rec.lastNear, rec, t) + s.projectedImpactRate(rec.lastFar, rec, t)
+	// 	if totalProjectedRate > s.cfg.ImpactThreshold {
+	// 		rpFloor = totalProjectedRate / s.cfg.ImpactThreshold * rec.impactDelay
+	// 		// scales the current period up in proportion to how far over Λ
+	// 		// the projected rate is; see note below.
+	// 	}
+	// }
 
 	// --- Staleness (§4.2.2) ---
 	// Applied only once the FIE history is full; then every issuance either
@@ -796,8 +860,8 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) {
 	}
 
 	// --- Enforce the responsible-probing floor last (§4.2.1 precedence) ---
-	if candidate < floor {
-		candidate = floor
+	if candidate < rpFloor {
+		candidate = rpFloor
 		rule = PeriodAdjustmentRuleResponsibleProbing
 	}
 
@@ -813,6 +877,24 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) {
 
 	// Emit only on an actual change.
 	if candidate != old {
+		// Rate sum: decomposable, update by delta.
+		s.sumRate += 1/candidate - 1/old
+
+		// Clamp membership counts: independent per-PD, adjust in/out.
+		minB, maxB := s.cfg.MinIssuancePeriod.Seconds(), s.cfg.MaxIssuancePeriod.Seconds()
+		if old == minB {
+			s.pdsClampedAtMin--
+		}
+		if old == maxB {
+			s.pdsClampedAtMax--
+		}
+		if candidate == minB {
+			s.pdsClampedAtMin++
+		}
+		if candidate == maxB {
+			s.pdsClampedAtMax++
+		}
+
 		rec.issuancePeriod = candidate
 		s.ebus.Emit(&PeriodAdjustedEvent{
 			ProbingDirectiveID: rec.pdid,
@@ -827,6 +909,14 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) {
 	rec.lastIssuedAt = t
 	rec.nextIssuance = t.Add(x)
 	s.totalIssuances++
+
+	// after rec.issuancePeriod is finalized:
+	if rec.issuancePeriod < s.windowMinPeriod {
+		s.windowMinPeriod = rec.issuancePeriod
+	}
+	if rec.issuancePeriod > s.windowMaxPeriod {
+		s.windowMaxPeriod = rec.issuancePeriod
+	}
 }
 
 // sampleInterIssuance samples X ~ Uniform((1 − β)·μ, (1 + β)·μ) (§4.1). The
@@ -837,83 +927,46 @@ func (s *ResearchScheduler) sampleInterIssuance(periodSeconds float64) time.Dura
 	return secondsToDuration(x)
 }
 
-func secondsToDuration(sec float64) time.Duration {
-	return time.Duration(sec * float64(time.Second))
-}
-
-// ---------------------------------------------------------------------------
-// emitStatus (§5.5)
-// ---------------------------------------------------------------------------
-
 // emitStatus computes and emits the CurrentStatus aggregate snapshot (§5.5).
-// The O(N) scan runs once per Tstatus and is negligible relative to the
-// per-issuance work.
 func (s *ResearchScheduler) emitStatus() {
 	now := time.Now()
-
-	var (
-		sumRate    float64
-		sumPeriod  float64
-		minPeriod  = math.Inf(1)
-		maxPeriod  = math.Inf(-1)
-		clampedMin int
-		clampedMax int
-		fullHist   int
-	)
-	minBound := s.cfg.MinIssuancePeriod.Seconds()
-	maxBound := s.cfg.MaxIssuancePeriod.Seconds()
-	for _, rec := range s.records {
-		p := rec.issuancePeriod
-		sumRate += 1 / p
-		sumPeriod += p
-		if p < minPeriod {
-			minPeriod = p
-		}
-		if p > maxPeriod {
-			maxPeriod = p
-		}
-		if p == minBound {
-			clampedMin++
-		}
-		if p == maxBound {
-			clampedMax++
-		}
-		if rec.histFill == len(rec.history) {
-			fullHist++
-		}
-	}
-
-	n := len(s.records)
-	var meanP, minP, maxP time.Duration
-	if n > 0 {
-		meanP = secondsToDuration(sumPeriod / float64(n))
-		minP = secondsToDuration(minPeriod)
-		maxP = secondsToDuration(maxPeriod)
-	}
 
 	interval := now.Sub(s.lastStatusEmission).Seconds()
 	var realized float64
 	if interval > 0 {
 		realized = float64(s.totalIssuances-s.issuancesAtLastStatus) / interval
 	}
-	s.issuancesAtLastStatus = s.totalIssuances
-	s.lastStatusEmission = now
+
+	var minP, maxP time.Duration
+	if !math.IsInf(s.windowMinPeriod, 1) { // window saw at least one issuance
+		minP = secondsToDuration(s.windowMinPeriod)
+		maxP = secondsToDuration(s.windowMaxPeriod)
+	}
 
 	s.ebus.Emit(&CurrentStatusEvent{
-		CurrentPDCount:            n,
+		CurrentPDCount:            len(s.records),
 		CumulativeInsertions:      s.totalInsertions,
 		CumulativeIssuances:       s.totalIssuances,
-		AggregateRequestedRate:    sumRate,
+		AggregateRequestedRate:    s.sumRate,
 		RealizedRate:              realized,
 		DistinctImpactedAddrs:     len(s.impacts),
 		PeriodMin:                 minP,
 		PeriodMax:                 maxP,
-		PeriodMean:                meanP,
-		PDsClampedAtMin:           clampedMin,
-		PDsClampedAtMax:           clampedMax,
-		PDsWithFullHistory:        fullHist,
+		PDsClampedAtMin:           s.pdsClampedAtMin,
+		PDsClampedAtMax:           s.pdsClampedAtMax,
+		PDsWithFullHistory:        s.pdsWithFullHistory,
 		UpdateChannelOccupancy:    len(s.updateCh),
 		InsertChannelOccupancy:    len(s.insertCh),
 		CumulativeLateOccurrences: s.totalLate,
 	})
+
+	// reset window
+	s.windowMinPeriod = math.Inf(1)
+	s.windowMaxPeriod = math.Inf(-1)
+	s.issuancesAtLastStatus = s.totalIssuances
+	s.lastStatusEmission = now
+}
+
+func secondsToDuration(sec float64) time.Duration {
+	return time.Duration(sec * float64(time.Second))
 }

@@ -46,33 +46,89 @@ type RetinaEvent interface {
 // Section 5 events — Scheduler decisions (DSD §5.5)
 // ---------------------------------------------------------------------------
 
-// PeriodAdjustedEvent is emitted on every change to a PD's issuance period, from
-// any rule: the staleness slow-down or speed-up (§4.2.2), the responsible
-// probing clamp (§4.2.1), or the μ_min/μ_max clamp (§3.4). A single learning
-// step emits at most one PeriodAdjustedEvent, attributed to the rule that
-// determined the final period.
-type PeriodAdjustedEvent struct {
-	RetinaBaseEvent
-	ProbingDirectiveID uint64        `json:"probing_directive_id"`
-	PreviousPeriod     time.Duration `json:"previous_period"`
-	NewPeriod          time.Duration `json:"new_period"`
-	Rule               string        `json:"rule"`
+// Every event embeds RetinaEvent and follows the naming convention of ending
+// in "Event". Payloads follow §5.5; per the DSD's note, exact field names and
+// types are not normative and the code is the source of truth.
+//
+// AgentConnected / AgentDisconnected (§5.5) are intentionally not defined
+// here: the Scheduler has no notion of agent liveness, so those events belong
+// to whichever component owns agent state and are emitted on the same bus.
+// PDRejected (§4.3) is intentionally omitted: identifiers are assigned by an
+// atomic counter in Insert, so duplicates are impossible and there is no
+// rejection path (see errata).
+
+// SchedulerStartedEvent is emitted once at initialization. Payload: the
+// configuration parameters in effect (§5.5).
+type SchedulerStartedEvent struct {
+	RetinaEvent
+	Config ResearchSchedulerConfig `json:"config"`
 }
 
-// SchedulerLateEvent is emitted when an overdue PD is issued past its scheduled
-// time (§4.1). The Scheduler does not attempt to recover the schedule;
-// overdue PDs are issued immediately in queue order, and this event is the
-// safety valve that surfaces the condition.
+// PDInsertedEvent is emitted when an insertion is applied and the PD is
+// admitted into the schedule (§4.3).
+type PDInsertedEvent struct {
+	RetinaEvent
+	ProbingDirectiveID uint64    `json:"probing_directive_id"`
+	FirstIssuanceTime  time.Time `json:"first_issuance_time"`
+	CurrentPDCount     int       `json:"current_pd_count"`
+}
+
+// PeriodAdjustmentRule identifies which rule produced a period change (§4.2,
+// §3.4). PeriodAdjustmentRuleNone is the zero value, used internally when no
+// rule changed the period (no event is emitted in that case).
+type PeriodAdjustmentRule string
+
+const (
+	PeriodAdjustmentRuleNone               PeriodAdjustmentRule = ""
+	PeriodAdjustmentRuleStalenessSlowDown  PeriodAdjustmentRule = "staleness_slow_down" // §4.2.2
+	PeriodAdjustmentRuleStalenessSpeedUp   PeriodAdjustmentRule = "staleness_speed_up"  // §4.2.2
+	PeriodAdjustmentRuleResponsibleProbing PeriodAdjustmentRule = "responsible_probing" // §4.2.1
+	PeriodAdjustmentRuleClamp              PeriodAdjustmentRule = "clamp"               // §3.4
+)
+
+// PeriodAdjustedEvent is emitted on every change to a PD's issuance period,
+// from any rule: staleness slow-down or speed-up (§4.2.2), the responsible
+// probing floor (§4.2.1), or the μ_min/μ_max clamp (§3.4). A single learning
+// step emits at most one such event, attributed to the binding rule.
+type PeriodAdjustedEvent struct {
+	RetinaEvent
+	ProbingDirectiveID uint64               `json:"probing_directive_id"`
+	PreviousPeriod     time.Duration        `json:"previous_period"`
+	NewPeriod          time.Duration        `json:"new_period"`
+	Rule               PeriodAdjustmentRule `json:"rule"`
+}
+
+// SchedulerLateEvent is emitted when an overdue PD is issued past its
+// scheduled time (§4.1). The Scheduler does not recover the schedule; overdue
+// PDs are issued immediately in queue order and this event surfaces the
+// condition.
 type SchedulerLateEvent struct {
-	RetinaBaseEvent
+	RetinaEvent
 	ProbingDirectiveID uint64    `json:"probing_directive_id"`
 	ScheduledTime      time.Time `json:"scheduled_time"`
 	ActualTime         time.Time `json:"actual_time"`
 }
 
+// CurrentStatusEvent is the periodic aggregate snapshot emitted every
+// Tstatus (§5.5), for monitoring and coarse-grained analysis without
+// reconstructing state from the per-PD event stream.
 type CurrentStatusEvent struct {
-	RetinaBaseEvent
-	// TODO
+	RetinaEvent
+	CurrentPDCount            int           `json:"current_pd_count"`
+	CumulativeInsertions      uint64        `json:"cumulative_insertions"`
+	CumulativeIssuances       uint64        `json:"cumulative_issuances"`
+	AggregateRequestedRate    float64       `json:"aggregate_requested_rate"` // Σ rᵢ = Σ 1/μᵢ, per second
+	RealizedRate              float64       `json:"realized_rate"`            // issuances over the last interval, per second
+	DistinctImpactedAddrs     int           `json:"distinct_impacted_addrs"`
+	PeriodMin                 time.Duration `json:"period_min"`
+	PeriodMax                 time.Duration `json:"period_max"`
+	PeriodMean                time.Duration `json:"period_mean"`
+	PDsClampedAtMin           int           `json:"pds_clamped_at_min"`
+	PDsClampedAtMax           int           `json:"pds_clamped_at_max"`
+	PDsWithFullHistory        int           `json:"pds_with_full_history"`
+	UpdateChannelOccupancy    int           `json:"update_channel_occupancy"`
+	InsertChannelOccupancy    int           `json:"insert_channel_occupancy"`
+	CumulativeLateOccurrences uint64        `json:"cumulative_late_occurrences"`
 }
 
 // ---------------------------------------------------------------------------
