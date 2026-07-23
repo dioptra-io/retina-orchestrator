@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"slices"
 	"time"
 
@@ -194,6 +195,10 @@ func (o *Orchestrator) Run(parentCtx context.Context) error {
 	group.Go(func() error {
 		return o.runScheduler(ctx)
 	})
+	group.Go(func() error {
+		<-ctx.Done()
+		return o.scheduler.Close()
+	})
 
 	err := group.Wait()
 
@@ -201,6 +206,30 @@ func (o *Orchestrator) Run(parentCtx context.Context) error {
 }
 
 func (o *Orchestrator) runScheduler(ctx context.Context) error {
+	// Read the PDs from the file and feed it to the scheduler.
+	go func() {
+		time.Sleep(time.Second * 5)
+		fmt.Println("insering PD")
+		for range 1 { // test this for 1 PDs.
+			_, _ = o.scheduler.Insert(&api.ProbingDirective{
+				ProbingDirectiveID: 0,
+				IPVersion:          api.IPv4,
+				Protocol:           api.ICMP,
+				AgentID:            "agent_1",
+				DestinationAddress: net.ParseIP("1.1.1.1"),
+				NearTTL:            5,
+				NextHeader: api.NextHeader{
+					ICMPNextHeader: &api.ICMPNextHeader{
+						FirstHalfWord:  0,
+						SecondHalfWord: 0,
+					},
+				},
+			})
+		}
+
+		fmt.Println("Added all of the PDs!")
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():

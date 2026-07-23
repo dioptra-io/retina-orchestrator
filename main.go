@@ -154,7 +154,9 @@ func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr
 func newLogger(level string) *slog.Logger {
 	var l slog.Level
 	if err := l.UnmarshalText([]byte(level)); err != nil {
-		l = slog.LevelInfo
+		// l = slog.LevelInfo
+		// TODO:
+		l = slog.LevelDebug
 	}
 	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: l,

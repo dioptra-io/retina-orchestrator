@@ -60,14 +60,14 @@ type RetinaEvent interface {
 // SchedulerStartedEvent is emitted once at initialization. Payload: the
 // configuration parameters in effect (§5.5).
 type SchedulerStartedEvent struct {
-	RetinaEvent
+	RetinaBaseEvent
 	Config ResearchSchedulerConfig `json:"config"`
 }
 
 // PDInsertedEvent is emitted when an insertion is applied and the PD is
 // admitted into the schedule (§4.3).
 type PDInsertedEvent struct {
-	RetinaEvent
+	RetinaBaseEvent
 	ProbingDirectiveID uint64    `json:"probing_directive_id"`
 	FirstIssuanceTime  time.Time `json:"first_issuance_time"`
 	CurrentPDCount     int       `json:"current_pd_count"`
@@ -91,7 +91,7 @@ const (
 // probing floor (§4.2.1), or the μ_min/μ_max clamp (§3.4). A single learning
 // step emits at most one such event, attributed to the binding rule.
 type PeriodAdjustedEvent struct {
-	RetinaEvent
+	RetinaBaseEvent
 	ProbingDirectiveID uint64               `json:"probing_directive_id"`
 	PreviousPeriod     time.Duration        `json:"previous_period"`
 	NewPeriod          time.Duration        `json:"new_period"`
@@ -103,7 +103,7 @@ type PeriodAdjustedEvent struct {
 // PDs are issued immediately in queue order and this event surfaces the
 // condition.
 type SchedulerLateEvent struct {
-	RetinaEvent
+	RetinaBaseEvent
 	ProbingDirectiveID uint64    `json:"probing_directive_id"`
 	ScheduledTime      time.Time `json:"scheduled_time"`
 	ActualTime         time.Time `json:"actual_time"`
@@ -113,21 +113,22 @@ type SchedulerLateEvent struct {
 // Tstatus (§5.5), for monitoring and coarse-grained analysis without
 // reconstructing state from the per-PD event stream.
 type CurrentStatusEvent struct {
-	RetinaEvent
-	CurrentPDCount            int           `json:"current_pd_count"`
-	CumulativeInsertions      uint64        `json:"cumulative_insertions"`
-	CumulativeIssuances       uint64        `json:"cumulative_issuances"`
-	AggregateRequestedRate    float64       `json:"aggregate_requested_rate"` // Σ rᵢ = Σ 1/μᵢ, per second
-	RealizedRate              float64       `json:"realized_rate"`            // issuances over the last interval, per second
-	DistinctImpactedAddrs     int           `json:"distinct_impacted_addrs"`
-	PeriodMin                 time.Duration `json:"period_min"`
-	PeriodMax                 time.Duration `json:"period_max"`
-	PDsClampedAtMin           int           `json:"pds_clamped_at_min"`
-	PDsClampedAtMax           int           `json:"pds_clamped_at_max"`
-	PDsWithFullHistory        int           `json:"pds_with_full_history"`
-	UpdateChannelOccupancy    int           `json:"update_channel_occupancy"`
-	InsertChannelOccupancy    int           `json:"insert_channel_occupancy"`
-	CumulativeLateOccurrences uint64        `json:"cumulative_late_occurrences"`
+	RetinaBaseEvent
+	CurrentPDCount            int     `json:"current_pd_count"`
+	CumulativeInsertions      uint64  `json:"cumulative_insertions"`
+	CumulativeIssuances       uint64  `json:"cumulative_issuances"`
+	AggregateRequestedRate    float64 `json:"aggregate_requested_rate"`   // Σ rᵢ = Σ 1/μᵢ, per second
+	AggregateRequestedPeriod  float64 `json:"aggregate_requested_period"` // 1 / Σ rᵢ
+	RealizedRate              float64 `json:"realized_rate"`              // issuances over the last interval, per second
+	DistinctImpactedAddrs     int     `json:"distinct_impacted_addrs"`
+	PeriodMin                 float64 `json:"period_min"`
+	PeriodMax                 float64 `json:"period_max"`
+	PDsClampedAtMin           int     `json:"pds_clamped_at_min"`
+	PDsClampedAtMax           int     `json:"pds_clamped_at_max"`
+	PDsWithFullHistory        int     `json:"pds_with_full_history"`
+	UpdateChannelOccupancy    int     `json:"update_channel_occupancy"`
+	InsertChannelOccupancy    int     `json:"insert_channel_occupancy"`
+	CumulativeLateOccurrences uint64  `json:"cumulative_late_occurrences"`
 }
 
 // ---------------------------------------------------------------------------

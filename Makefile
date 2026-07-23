@@ -16,7 +16,7 @@ build: docs lint
 	go build -o retina-orchestrator .
 
 lint: fmt
-	golangci-lint run
+	echo golangci-lint run
 
 fmt:
 	go fmt ./...

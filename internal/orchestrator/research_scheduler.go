@@ -40,7 +40,7 @@ type ResearchSchedulerConfig struct {
 	Seed uint64
 
 	// LearningRate is α, the multiplicative step of the period learning
-	// rule (§3.4). Must be in (0, 1). Default: 0.1.
+	// rule (§3.4). Must be in (0, 1). Default: 0.3.
 	LearningRate float64
 
 	// SamplingWidth is β, the half-width of the uniform inter-issuance
@@ -106,11 +106,11 @@ type ResearchSchedulerConfig struct {
 	DefaultImpactDelay time.Duration
 }
 
-// fillZeroValueDefaults populates the zero value fields of ResearchSchedulerConfig with
+// initialize populates the zero value fields of ResearchSchedulerConfig with
 // default values specified in the DSD section §6.
-func (c *ResearchSchedulerConfig) fillZeroValueDefaults() { //nolint:gocyclo
+func (c *ResearchSchedulerConfig) initialize() { //nolint:gocyclo
 	if c.LearningRate == 0 {
-		c.LearningRate = 0.1
+		c.LearningRate = 0.5
 	}
 	if c.SamplingWidth == 0 {
 		c.SamplingWidth = 0.1
@@ -137,7 +137,7 @@ func (c *ResearchSchedulerConfig) fillZeroValueDefaults() { //nolint:gocyclo
 		c.BusyTolerance = 500 * time.Microsecond
 	}
 	if c.StatusInterval == 0 {
-		c.StatusInterval = time.Minute
+		c.StatusInterval = time.Minute / 30
 	}
 	if c.InsertChannelSize == 0 {
 		c.InsertChannelSize = 1024
@@ -399,7 +399,7 @@ func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebu
 	if logger == nil {
 		logger = slog.Default()
 	}
-	cfg.fillZeroValueDefaults()
+	cfg.initialize()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -495,7 +495,6 @@ func (s *ResearchScheduler) Next() (*api.ProbingDirective, error) {
 		for time.Now().Before(target) {
 		}
 
-		s.totalIssuances++
 		return rec.pd, nil
 	}
 }
@@ -516,7 +515,7 @@ func (s *ResearchScheduler) Close() error {
 }
 
 // ---------------------------------------------------------------------------
-// Private interface
+// Private interfaces
 // ---------------------------------------------------------------------------
 
 // drain applies pending inserts and FIEs, emits status, and honors shutdown
@@ -788,18 +787,20 @@ func (s *ResearchScheduler) reserveAndFloor(addr net.IP, now time.Time, impactDe
 // rule. Finally a new inter-issuance time is sampled and nextIssuance and
 // lastIssuedAt are set.
 func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyclo
+	fmt.Printf("rec.issuancePeriod: %v\n", rec.issuancePeriod)
 	old := rec.issuancePeriod
 	candidate := old
 	rule := PeriodAdjustmentRuleNone
 
-	// --- Responsible probing rpFloor (§4.2.1, revised) ---
+	// --- Responsible probing rpFloorPeriod (§4.2.1, revised) ---
 	// Reserve this issuance's projected impact on both addresses (assumed
 	// same as the previous issuance's, per §4.2.1) and take the tighter of
 	// the two resulting floors for the next issuance.
-	rpFloor := math.Max(
+	rpFloorPeriod := math.Max(
 		s.reserveAndFloor(rec.lastNear, t, rec.impactDelay),
 		s.reserveAndFloor(rec.lastFar, t, rec.impactDelay),
 	)
+	// rpFloor = 0.0 // disable RP
 
 	// --- Staleness (§4.2.2) ---
 	// Applied only once the FIE history is full; then every issuance either
@@ -815,8 +816,8 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 	}
 
 	// --- Enforce the responsible-probing floor last (§4.2.1 precedence) ---
-	if candidate < rpFloor {
-		candidate = rpFloor
+	if candidate < rpFloorPeriod {
+		candidate = rpFloorPeriod
 		rule = PeriodAdjustmentRuleResponsibleProbing
 	}
 
@@ -903,10 +904,11 @@ func (s *ResearchScheduler) emitStatus() {
 		CumulativeInsertions:      s.totalInsertions,
 		CumulativeIssuances:       s.totalIssuances,
 		AggregateRequestedRate:    s.sumRate,
+		AggregateRequestedPeriod:  1 / s.sumRate, // possible division by zero.
 		RealizedRate:              realized,
 		DistinctImpactedAddrs:     len(s.addressTAT),
-		PeriodMin:                 minP,
-		PeriodMax:                 maxP,
+		PeriodMin:                 minP.Seconds(),
+		PeriodMax:                 maxP.Seconds(),
 		PDsClampedAtMin:           s.pdsClampedAtMin,
 		PDsClampedAtMax:           s.pdsClampedAtMax,
 		PDsWithFullHistory:        s.pdsWithFullHistory,
