@@ -1,0 +1,1 @@
+{"probing_directive_id":21,"ip_version":4,"protocol":1,"agent_id":"agent_1","destination_address":"162.4.184.3","near_ttl":21,"next_header":{"icmp_next_header":{"first_half_word":57641,"second_half_word":50480}}}
