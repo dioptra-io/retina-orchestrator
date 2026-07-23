@@ -29,8 +29,6 @@ import (
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator"
 )
 
-const defaultAgentBufferLength = 8192
-
 func main() {
 	if err := run(); err != nil {
 		slog.Error("Orchestrator error", "err", err)
@@ -40,27 +38,50 @@ func main() {
 
 //nolint:funlen
 func run() error {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		flag.VisitAll(func(f *flag.Flag) {
+			fmt.Fprintf(os.Stderr, "  --%s\n", f.Name)
+			fmt.Fprintf(os.Stderr, "    \t%s (default %v)\n", f.Usage, f.DefValue)
+		})
+	}
+
 	var (
 		apiAddr              = flag.String("api-addr", envOrDefault("RETINA_API_ADDR", "localhost:8080"), "Listening address for the HTTP API server")
 		agentAddr            = flag.String("agent-addr", envOrDefault("RETINA_AGENT_ADDR", "localhost:50050"), "Listening address for agent connections")
+		agentBufferLength    = flag.Int("agent-buffer-length", envOrDefaultInt("RETINA_AGENT_BUFFER_LENGTH", 8192), "Buffer length for per-agent PD channels")
 		pdQueueSize          = flag.Int("pd-queue-size", envOrDefaultInt("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
 		ringBufferSize       = flag.Int("ring-buffer-size", envOrDefaultInt("RETINA_RING_BUFFER_SIZE", 100), "The size of the ring buffer")
-		pdPath               = flag.String("pd-path", envOrDefault("RETINA_PD_PATH", ""), "Path to the probing directives file")
-		issuanceRate         = flag.Float64("issuance-rate", envOrDefaultFloat64("RETINA_ISSUANCE_RATE", 1.0), "Target global issuance rate of probing directives (PDs per second, approximate)")
-		impactThreshold      = flag.Float64("impact-threshold", envOrDefaultFloat64("RETINA_IMPACT_THRESHOLD", 1.0), "Maximum impact threshold per address for the responsible probing algorithm")
-		maxCycles            = flag.Int("max-cycles", envOrDefaultInt("RETINA_MAX_CYCLES", 0), "Maximum cycles the orchestrator is going to run, o for indefinite")
-		seed                 = flag.Uint64("seed", envOrDefaultUInt64("RETINA_SEED", 42), "Seed for the randomizer")
+		eventBusSize         = flag.Int("event-bus-size", envOrDefaultInt("RETINA_EVENT_BUS_SIZE", 1024*1024), "Size of the event bus")
 		apiReadHeaderTimeout = flag.Duration("api-read-header-timeout", envOrDefaultDuration("RETINA_API_READ_HEADER_TIMEOUT", 5*time.Second), "Timeout for reading HTTP request headers")
 		fieFilterPolicy      = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", "any"), "FIE filtering policy: any, one, or both")
 		logLevel             = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 		metricsAddr          = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
-		poissonWheelSpan     = flag.Duration("poisson-wheel-span", envOrDefaultDuration("RETINA_POISSON_WHEEL_SPAN", time.Hour), "Total time span covered by the Poisson scheduler's timing wheel")
-		poissonSlotPeriod    = flag.Duration("poisson-slot-period", envOrDefaultDuration("RETINA_POISSON_SLOT_PERIOD", 200*time.Millisecond), "Duration of a single slot in the Poisson scheduler's timing wheel")
-		poissonFIEChanSize   = flag.Int("poisson-fie-chan-size", envOrDefaultInt("RETINA_POISSON_FIE_CHAN_SIZE", 100), "Buffer size of the Poisson scheduler's FIE channel")
-		startingIssuanceRate = flag.Float64("starting-issuance-rate", envOrDefaultFloat64("RETINA_STARTING_ISSUANCE_RATE", 1.0), "Initial issuance rate before the learning algorithm adjusts it (PDs per second)")
-		learningRate         = flag.Float64("learning-rate", envOrDefaultFloat64("RETINA_LEARNING_RATE", 0.1), "Learning rate for the adaptive issuance rate algorithm")
-		minIssuanceRate      = flag.Float64("min-issuance-rate", envOrDefaultFloat64("RETINA_MIN_ISSUANCE_RATE", 1.0/(12.0*60.0*60.0)), "Minimum issuance rate for the adaptive issuance rate algorithm")
-		maxIssuanceRate      = flag.Float64("max-issuance-rate", envOrDefaultFloat64("RETINA_MAX_ISSUANCE_RATE", 5.0), "Maximum issuance rate for the adaptive issuance rate algorithm")
+
+		streamStartFromEarliest = flag.Bool("stream-start-from-earliest", envOrDefaultBool("RETINA_STREAM_START_FROM_EARLIEST", true), "If true, newly connected FIE stream clients start from the earliest FIE still in the ring buffer instead of only future ones")
+
+		// --- ResearchSchedulerConfig (rr- prefix) ---
+		rrSeed                      = flag.Uint64("rr-seed", envOrDefaultUInt64("RETINA_RR_SEED", 42), "Seed for the research scheduler's internal RNG")
+		rrLearningRate              = flag.Float64("rr-learning-rate", envOrDefaultFloat64("RETINA_RR_LEARNING_RATE", 0.1), "Learning rate (α) for the research scheduler's period adjustment")
+		rrSamplingWidth             = flag.Float64("rr-sampling-width", envOrDefaultFloat64("RETINA_RR_SAMPLING_WIDTH", 0.1), "Sampling width (β) for uniform inter-issuance sampling")
+		rrImpactThreshold           = flag.Float64("rr-impact-threshold", envOrDefaultFloat64("RETINA_RR_IMPACT_THRESHOLD", 1.0), "Impact threshold (Λ) for the research scheduler's responsible probing")
+		rrFIEHistoryCapacity        = flag.Int("rr-fie-history-capacity", envOrDefaultInt("RETINA_RR_FIE_HISTORY_CAPACITY", 6), "Number of FIEs retained per PD for the staleness rule")
+		rrMinIssuancePeriod         = flag.Duration("rr-min-issuance-period", envOrDefaultDuration("RETINA_RR_MIN_ISSUANCE_PERIOD", 500*time.Millisecond), "Minimum issuance period (μmin)")
+		rrMaxIssuancePeriod         = flag.Duration("rr-max-issuance-period", envOrDefaultDuration("RETINA_RR_MAX_ISSUANCE_PERIOD", 12*time.Hour), "Maximum issuance period (μmax)")
+		rrAdmissionRate             = flag.Float64("rr-admission-rate", envOrDefaultFloat64("RETINA_RR_ADMISSION_RATE", 1000), "Admission rate (r₀) for pacing newly inserted PDs' first issuance")
+		rrStartingIssuancePeriod    = flag.Duration("rr-starting-issuance-period", envOrDefaultDuration("RETINA_RR_STARTING_ISSUANCE_PERIOD", time.Second*10), "Starting issuance period (Μ) assigned at admission")
+		rrStatusInterval            = flag.Duration("rr-status-interval", envOrDefaultDuration("RETINA_RR_STATUS_INTERVAL", time.Minute), "Interval between CurrentStatus event emissions")
+		rrInsertChannelSize         = flag.Int("rr-insert-channel-size", envOrDefaultInt("RETINA_RR_INSERT_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's insert channel")
+		rrUpdateChannelSize         = flag.Int("rr-update-channel-size", envOrDefaultInt("RETINA_RR_UPDATE_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's FIE update channel")
+		rrLatenessTolerance         = flag.Duration("rr-lateness-tolerance", envOrDefaultDuration("RETINA_RR_LATENESS_TOLERANCE", time.Millisecond), "Slack below which an issuance is not considered late")
+		rrBusyTolerance             = flag.Duration("rr-busy-tolerance", envOrDefaultDuration("RETINA_RR_BUSY_TOLERANCE", 500*time.Microsecond), "Commitment-window width for the hybrid sleep strategy (Tbusy)")
+		rrWaitTolerance             = flag.Duration("rr-wait-tolerance", envOrDefaultDuration("RETINA_RR_WAIT_TOLERANCE", time.Millisecond), "Busy-wait margin to absorb time.After over-sleep")
+		rrInitialQueueSize          = flag.Int("rr-initial-queue-size", envOrDefaultInt("RETINA_RR_INITIAL_QUEUE_SIZE", 100_000), "Initial capacity reserved for the scheduling heap")
+		rrMaxUpdateDrainPerIssuance = flag.Int("rr-max-update-drain-per-issuance", envOrDefaultInt("RETINA_RR_MAX_UPDATE_DRAIN_PER_ISSUANCE", 5), "Maximum FIE updates drained per issuance call")
+		rrMaxInsertDrainPerIssuance = flag.Int("rr-max-insert-drain-per-issuance", envOrDefaultInt("RETINA_RR_MAX_INSERT_DRAIN_PER_ISSUANCE", 5), "Maximum inserts drained per issuance call")
+		rrDefaultImpactDelay        = flag.Duration("rr-default-impact-delay", envOrDefaultDuration("RETINA_RR_DEFAULT_IMPACT_DELAY", time.Second), "Default estimated delay between a PD's issuance and its impact on an address")
+		rrDisableResponsibleProbing = flag.Bool("rr-disable-responsible-probing", envOrDefaultBool("RETINA_RR_DISABLE_RESPONSIBLE_PROBING", false), "Disable the responsible probing constraint (testing only)")
+		rrDisableStaleness          = flag.Bool("rr-disable-staleness", envOrDefaultBool("RETINA_RR_DISABLE_STALENESS", false), "Disable the staleness-based period adjustment (testing only)")
 	)
 	flag.Parse()
 
@@ -80,40 +101,57 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	orch, err := orchestrator.NewOrch(&orchestrator.Config{
-		AgentAddress:         *agentAddr,
-		PDQueueSize:          *pdQueueSize,
-		RingBufferSize:       *ringBufferSize,
-		AgentBufferLength:    defaultAgentBufferLength,
-		APIAddress:           *apiAddr,
-		APIReadHeaderTimeout: *apiReadHeaderTimeout,
-		PDPath:               *pdPath,
-		IssuanceRate:         *issuanceRate,
-		ImpactThreshold:      *impactThreshold,
-		MaxCycles:            *maxCycles,
-		Seed:                 *seed,
-		FIEFilterPolicy:      *fieFilterPolicy,
-		Secret:               secret,
-		PoissonWheelSpan:     *poissonWheelSpan,
-		PoissonSlotPeriod:    *poissonSlotPeriod,
-		PoissonFIEChanSize:   *poissonFIEChanSize,
-		StartingIssuanceRate: *startingIssuanceRate,
-		MinIssuanceRate:      *minIssuanceRate,
-		MaxIssuanceRate:      *maxIssuanceRate,
-		LearningRate:         *learningRate,
+	orch, err := orchestrator.NewOrchestrator(&orchestrator.Config{
+		AgentAddress:            *agentAddr,
+		PDQueueSize:             *pdQueueSize,
+		RingBufferSize:          *ringBufferSize,
+		AgentBufferLength:       *agentBufferLength,
+		APIAddress:              *apiAddr,
+		APIReadHeaderTimeout:    *apiReadHeaderTimeout,
+		FIEFilterPolicy:         *fieFilterPolicy,
+		Secret:                  secret,
+		EventBusSize:            *eventBusSize,
+		StreamStartFromEarliest: *streamStartFromEarliest,
+		ResearchSchedulerConfig: &orchestrator.ResearchSchedulerConfig{
+			Seed:                      *rrSeed,
+			LearningRate:              *rrLearningRate,
+			SamplingWidth:             *rrSamplingWidth,
+			ImpactThreshold:           *rrImpactThreshold,
+			FIEHistoryCapacity:        *rrFIEHistoryCapacity,
+			MinIssuancePeriod:         *rrMinIssuancePeriod,
+			MaxIssuancePeriod:         *rrMaxIssuancePeriod,
+			AdmissionRate:             *rrAdmissionRate,
+			StartingIssuancePeriod:    *rrStartingIssuancePeriod,
+			StatusInterval:            *rrStatusInterval,
+			InsertChannelSize:         *rrInsertChannelSize,
+			UpdateChannelSize:         *rrUpdateChannelSize,
+			LatenessTolerance:         *rrLatenessTolerance,
+			BusyTolerance:             *rrBusyTolerance,
+			WaitTolerance:             *rrWaitTolerance,
+			InitialQueueSize:          *rrInitialQueueSize,
+			MaxUpdateDrainPerIssuance: *rrMaxUpdateDrainPerIssuance,
+			MaxInsertDrainPerIssuance: *rrMaxInsertDrainPerIssuance,
+			DefaultImpactDelay:        *rrDefaultImpactDelay,
+			DisableResponsibleProbing: *rrDisableResponsibleProbing,
+			DisableStaleness:          *rrDisableStaleness,
+		},
 	}, logger, metrics)
 	if err != nil {
 		return err
 	}
 
 	logger.Info("Starting orchestrator",
-		"api_addr", *apiAddr,
-		"agent_addr", *agentAddr,
-		"pd_path", *pdPath,
-		"issuance_rate", *issuanceRate,
-		"impact_threshold", *impactThreshold,
-		"log_level", *logLevel,
-		"metrics_addr", *metricsAddr,
+		slog.String("api_addr", *apiAddr),
+		slog.String("agent_addr", *agentAddr),
+		slog.String("log_level", *logLevel),
+		slog.String("metrics_addr", *metricsAddr),
+		slog.Bool("stream_start_from_earliest", *streamStartFromEarliest),
+		slog.Float64("rr_impact_threshold", *rrImpactThreshold),
+		slog.Float64("rr_min_issuance_period_seconds", rrMinIssuancePeriod.Seconds()),
+		slog.Float64("rr_max_issuance_period_seconds", rrMaxIssuancePeriod.Seconds()),
+		slog.Float64("rr_admission_rate", *rrAdmissionRate),
+		slog.Bool("rr_disable_responsible_probing", *rrDisableResponsibleProbing),
+		slog.Bool("rr_disable_staleness", *rrDisableStaleness),
 	)
 
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {
@@ -220,6 +258,18 @@ func envOrDefaultDuration(key string, def time.Duration) time.Duration {
 			os.Exit(1)
 		}
 		return d
+	}
+	return def
+}
+
+func envOrDefaultBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			slog.Error("Invalid environment variable", slog.String("key", key), slog.String("value", v)) //nolint:gosec // G706: value is from env var, rejected as invalid, slog.String sanitizes output
+			os.Exit(1)
+		}
+		return b
 	}
 	return def
 }
