@@ -28,6 +28,7 @@ type SequencedFIE struct {
 type fieHandleFunc func(s *fieClient)
 type sseHandleFunc func(s *sseClient)
 type insertHanleFunc func(*api.ProbingDirective) (uint64, error)
+type insertHanleAfterFunc func([]*api.ProbingDirective)
 
 type apiServerConfig struct {
 	// address is the TCP listening address in the form "host:port".
@@ -37,6 +38,7 @@ type apiServerConfig struct {
 	fieHandler        fieHandleFunc
 	sseHandler        sseHandleFunc
 	insertHandler     insertHanleFunc
+	insertAfterHanler insertHanleAfterFunc
 
 	// eventBuffer is the ring buffer for SSE events.
 	logger *slog.Logger
@@ -56,6 +58,9 @@ func newAPIServer(config *apiServerConfig) (*apiServer, error) {
 	}
 	if config.insertHandler == nil {
 		return nil, fmt.Errorf("insertHandler cannot be nil")
+	}
+	if config.insertAfterHanler == nil {
+		return nil, fmt.Errorf("insertAfterHanler cannot be nil")
 	}
 	if config.sseHandler == nil {
 		return nil, fmt.Errorf("sseHandler cannot be nil")
@@ -230,6 +235,7 @@ func (s *apiServer) handleBulkInsert(w http.ResponseWriter, r *http.Request) {
 		}
 		ids = append(ids, id)
 	}
+	s.config.insertAfterHanler(req.ProbingDirectives)
 
 	s.logger.Info("Inserted new PDs into the scheduler",
 		slog.Int("num_inserted", len(req.ProbingDirectives)))

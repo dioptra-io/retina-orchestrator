@@ -36,3 +36,8 @@ docs/swagger.json
 docs/swagger.yaml
 
 retina-orchestrator
+
+# Generated datasets
+test/pds_1M.jsonl
+test/pds_100k.jsonl
+data/
