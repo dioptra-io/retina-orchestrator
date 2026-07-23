@@ -35,29 +35,20 @@ type Config struct {
 	// APIReadHeaderTimeout defaults to 5 seconds if zero.
 	APIReadHeaderTimeout time.Duration
 
-	MaxCycles       int
 	FIEFilterPolicy string
-	PDPath          string
-	Seed            uint64
-	// IssuanceRate is the target global issuance rate of probing directives
-	// (PDs per second, approximate).
-	IssuanceRate float64
-	// ImpactThreshold is the maximum number of concurrent directives allowed
-	// to impact a single address in the responsible probing algorithm.
-	ImpactThreshold float64
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
 
-	PoissonWheelSpan     time.Duration
-	PoissonSlotPeriod    time.Duration
-	PoissonFIEChanSize   int
-	StartingIssuanceRate float64
-	MinIssuanceRate      float64
-	MaxIssuanceRate      float64
-	LearningRate         float64
-
 	EventBusSize int
+
+	// StreamStartFromEarliest controls where a newly connected client's stream
+	// begins. False (default) preserves the original behavior: the client only
+	// sees FIEs sent after it connects. True starts the client from the
+	// earliest FIE still held in the ring buffer.
+	StreamStartFromEarliest bool
+
+	ResearchSchedulerConfig *ResearchSchedulerConfig
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -86,15 +77,6 @@ func (c *Config) Validate() error {
 	}
 	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
 		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
-	}
-	if c.PDPath == "" {
-		return fmt.Errorf("PDPath cannot be empty")
-	}
-	if c.IssuanceRate <= 0 {
-		return fmt.Errorf("IssuanceRate must be greater than zero: got %f", c.IssuanceRate)
-	}
-	if c.ImpactThreshold <= 0 {
-		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
 	}
 	return nil
 }
@@ -151,7 +133,12 @@ func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Or
 	}
 	o.pdQueue = pdQueue
 
-	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](config.RingBufferSize)
+	var ringBuffer *structures.RingBuffer[api.ForwardingInfoElement]
+	if !config.StreamStartFromEarliest {
+		ringBuffer, err = structures.NewRingBuffer[api.ForwardingInfoElement](config.RingBufferSize)
+	} else {
+		ringBuffer, err = structures.NewRingBufferTailFollower[api.ForwardingInfoElement](config.RingBufferSize)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("error on creating ring buffer: %w", err)
 	}
@@ -163,7 +150,7 @@ func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Or
 	}
 	o.ebus = ebus
 
-	sched, err := NewResearchScheduler(&ResearchSchedulerConfig{}, logger, ebus)
+	sched, err := NewResearchScheduler(config.ResearchSchedulerConfig, logger, ebus)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating research scheduler: %w", err)
 	}
@@ -175,6 +162,7 @@ func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Or
 		fieHandler:        o.fieStreamHandler,
 		sseHandler:        o.sseHandler,
 		insertHandler:     o.insertHandler,
+		logger:            logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error on creating API server: %w", err)

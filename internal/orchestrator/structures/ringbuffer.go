@@ -91,6 +91,8 @@ type RingBuffer[T any] struct {
 	buffer    []*T
 	capacity  uint64
 	consumers map[*RingConsumer[T]]struct{}
+	tailer    bool
+	pushCount uint64
 }
 
 // NewRingBuffer creates a new RingBuffer with the given capacity.
@@ -105,6 +107,24 @@ func NewRingBuffer[T any](capacity int) (*RingBuffer[T], error) {
 		capacity:  uint64(capacity),
 		consumers: make(map[*RingConsumer[T]]struct{}),
 		cond:      sync.NewCond(mu),
+		tailer:    false,
+	}, nil
+}
+
+// NewRingBufferTailFollower creates a regular ring buffer but the new consumer
+// starts from the earliest tail instead of the head.
+func NewRingBufferTailFollower[T any](capacity int) (*RingBuffer[T], error) {
+	if capacity <= 0 {
+		return nil, fmt.Errorf("invalid argument: capacity must be greater than zero")
+	}
+	mu := &sync.Mutex{}
+	return &RingBuffer[T]{
+		mutex:     mu,
+		buffer:    make([]*T, capacity),
+		capacity:  uint64(capacity),
+		consumers: make(map[*RingConsumer[T]]struct{}),
+		cond:      sync.NewCond(mu),
+		tailer:    true,
 	}, nil
 }
 
@@ -114,8 +134,19 @@ func (rb *RingBuffer[T]) NewConsumer() *RingConsumer[T] {
 	rb.mutex.Lock()
 	defer rb.mutex.Unlock()
 
+	var start uint64
+	if rb.tailer {
+		if rb.pushCount < rb.capacity {
+			start = 0
+		} else {
+			start = rb.head
+		}
+	} else {
+		start = rb.head
+	}
+
 	cons := &RingConsumer[T]{
-		tail: rb.head,
+		tail: start,
 		rb:   rb,
 	}
 	rb.consumers[cons] = struct{}{}
@@ -130,6 +161,7 @@ func (rb *RingBuffer[T]) Push(e *T) int {
 
 	rb.buffer[rb.head] = e
 	rb.head = (rb.head + 1) % rb.capacity
+	rb.pushCount++
 
 	// Advance the tails of slow consumers that have been lapped.
 	skipped := 0

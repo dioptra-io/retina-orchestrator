@@ -188,7 +188,7 @@ func typeName(e any) string {
 // capacity. Capacity bounds how far a slow subscriber may fall behind before
 // it is lapped and starts missing events (§5.5); it must be positive.
 func NewEventBus(capacity int) (*EventBus, error) {
-	ring, err := structures.NewRingBuffer[envelope](capacity)
+	ring, err := structures.NewRingBufferTailFollower[envelope](capacity)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create event bus: %w", err)
 	}

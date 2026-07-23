@@ -112,65 +112,6 @@ type ResearchSchedulerConfig struct {
 	DisableStaleness bool
 }
 
-// initialize populates the zero value fields of ResearchSchedulerConfig with
-// default values specified in the DSD section §6.
-func (c *ResearchSchedulerConfig) initialize() { //nolint:gocyclo
-	if c.LearningRate == 0 {
-		c.LearningRate = 0.5
-	}
-	if c.SamplingWidth == 0 {
-		c.SamplingWidth = 0.1
-	}
-	if c.ImpactThreshold == 0 {
-		c.ImpactThreshold = 1.0
-	}
-	if c.FIEHistoryCapacity == 0 {
-		c.FIEHistoryCapacity = 6
-	}
-	if c.MinIssuancePeriod == 0 {
-		c.MinIssuancePeriod = 500 * time.Millisecond
-	}
-	if c.MaxIssuancePeriod == 0 {
-		c.MaxIssuancePeriod = 12 * time.Hour
-	}
-	if c.AdmissionRate == 0 {
-		c.AdmissionRate = 1000
-	}
-	if c.StartingIssuancePeriod == 0 {
-		c.StartingIssuancePeriod = c.MinIssuancePeriod // Μ = μmin
-	}
-	if c.BusyTolerance == 0 {
-		c.BusyTolerance = 500 * time.Microsecond
-	}
-	if c.StatusInterval == 0 {
-		c.StatusInterval = time.Second * 30 // every 30 seconds.
-	}
-	if c.InsertChannelSize == 0 {
-		c.InsertChannelSize = 1024
-	}
-	if c.UpdateChannelSize == 0 {
-		c.UpdateChannelSize = 1024
-	}
-	if c.LatenessTolerance == 0 {
-		c.LatenessTolerance = time.Millisecond
-	}
-	if c.InitialQueueSize == 0 {
-		c.InitialQueueSize = 100_000
-	}
-	if c.MaxUpdateDrainPerIssuance == 0 {
-		c.MaxUpdateDrainPerIssuance = 5
-	}
-	if c.MaxInsertDrainPerIssuance == 0 {
-		c.MaxInsertDrainPerIssuance = 5
-	}
-	if c.WaitTolerance == 0 {
-		c.WaitTolerance = time.Millisecond
-	}
-	if c.DefaultImpactDelay == 0 {
-		c.DefaultImpactDelay = time.Second
-	}
-}
-
 // validate checks the configuration and returns an error describing the
 // first invalid parameter found.
 func (c *ResearchSchedulerConfig) validate() error { //nolint:gocyclo
@@ -401,27 +342,29 @@ var _ Scheduler = (*ResearchScheduler)(nil)
 // The scheduler starts empty (§4.3); PDs are admitted at runtime via Insert.
 // Loading an initial PD set is the caller's responsibility: read the file
 // and Insert in a loop — startup is just a burst of insertions.
-func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebus *EventBus) (*ResearchScheduler, error) {
+func NewResearchScheduler(config *ResearchSchedulerConfig, logger *slog.Logger, ebus *EventBus) (*ResearchScheduler, error) {
+	if config == nil {
+		return nil, fmt.Errorf("cannot create research scheduler because given config is nil")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	cfg.initialize()
-	if err := cfg.validate(); err != nil {
+	if err := config.validate(); err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &ResearchScheduler{
-		cfg:                cfg,
+		cfg:                config,
 		logger:             logger,
-		rand:               rand.New(rand.NewSource(int64(cfg.Seed))), //nolint:gosec // G404: not used for security
+		rand:               rand.New(rand.NewSource(int64(config.Seed))), //nolint:gosec // G404: not used for security
 		records:            make(map[uint64]*pdRecord),
-		queue:              make(pdHeap, 0, cfg.InitialQueueSize),
+		queue:              make(pdHeap, 0, config.InitialQueueSize),
 		addressTAT:         make(map[addrKey]time.Time),
-		insertCh:           make(chan *api.ProbingDirective, cfg.InsertChannelSize),
-		updateCh:           make(chan *api.ForwardingInfoElement, cfg.UpdateChannelSize),
-		statusTicker:       time.NewTicker(cfg.StatusInterval),
+		insertCh:           make(chan *api.ProbingDirective, config.InsertChannelSize),
+		updateCh:           make(chan *api.ForwardingInfoElement, config.UpdateChannelSize),
+		statusTicker:       time.NewTicker(config.StatusInterval),
 		ctx:                ctx,
 		cancel:             cancel,
 		lastStatusEmission: time.Now(),
@@ -431,13 +374,16 @@ func NewResearchScheduler(cfg *ResearchSchedulerConfig, logger *slog.Logger, ebu
 	}
 
 	s.logger.Info("Research scheduler initialized",
-		slog.Float64("alpha", cfg.LearningRate),
-		slog.Float64("beta", cfg.SamplingWidth),
-		slog.Float64("lambda", cfg.ImpactThreshold),
-		slog.Int("m", cfg.FIEHistoryCapacity),
-		slog.Duration("mu_min", cfg.MinIssuancePeriod),
-		slog.Duration("mu_max", cfg.MaxIssuancePeriod),
-		slog.Float64("r0", cfg.AdmissionRate))
+		slog.Float64("learning_rate_alpha", config.LearningRate),
+		slog.Float64("sampling_width_beta", config.SamplingWidth),
+		slog.Float64("impact_threshold_lambda", config.ImpactThreshold),
+		slog.Int("fie_history_capacity_m", config.FIEHistoryCapacity),
+		slog.Float64("min_issuance_period_mu_min", config.MinIssuancePeriod.Seconds()),
+		slog.Float64("max_issuance_period_mu_max", config.MaxIssuancePeriod.Seconds()),
+		slog.Float64("admission_rate_r0", config.AdmissionRate),
+		slog.Bool("disable_responsible_probing", config.DisableResponsibleProbing),
+		slog.Bool("disable_staleness", config.DisableStaleness))
+
 	return s, nil
 }
 
@@ -893,11 +839,6 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 	if rec.issuancePeriod > s.windowMaxPeriod {
 		s.windowMaxPeriod = rec.issuancePeriod
 	}
-	slog.Info("compute invoked",
-		slog.Float64("old_issuance_period", old),
-		slog.Float64("new_issuance_period", rec.issuancePeriod),
-		slog.Float64("responsible_probing_floor_period", rpFloorPeriod),
-		slog.String("rule", string(rule)))
 }
 
 // sampleInterIssuance samples X ~ Uniform((1 − β)·μ, (1 + β)·μ) (§4.1). The
