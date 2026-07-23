@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dioptra-io/retina-commons/api/v1"
+
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
 )
 
@@ -95,6 +97,12 @@ type PDInsertedEvent struct {
 	ProbingDirectiveID uint64    `json:"probing_directive_id"`
 	FirstIssuanceTime  time.Time `json:"first_issuance_time"`
 	CurrentPDCount     int       `json:"current_pd_count"`
+}
+
+type PDBulkInsertionEvent struct {
+	RetinaBaseEvent
+	NumPDs int                     `json:"num_pds"`
+	PDs    []*api.ProbingDirective `json:"pds"`
 }
 
 // PeriodAdjustmentRule identifies which rule produced a period change (§4.2,

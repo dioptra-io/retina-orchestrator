@@ -166,6 +166,7 @@ func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Or
 		fieHandler:        o.fieStreamHandler,
 		sseHandler:        o.sseHandler,
 		insertHandler:     o.insertHandler,
+		insertAfterHanler: o.insertAfterHandler,
 		logger:            logger,
 	})
 	if err != nil {
@@ -337,6 +338,13 @@ func (o *Orchestrator) sseHandler(s *sseClient) {
 
 func (o *Orchestrator) insertHandler(pd *api.ProbingDirective) (uint64, error) {
 	return o.scheduler.Insert(pd)
+}
+
+func (o *Orchestrator) insertAfterHandler(pds []*api.ProbingDirective) {
+	o.ebus.Emit(&PDBulkInsertionEvent{
+		NumPDs: len(pds),
+		PDs:    pds,
+	})
 }
 
 //nolint:funlen
