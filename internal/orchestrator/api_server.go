@@ -231,6 +231,9 @@ func (s *apiServer) handleBulkInsert(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, id)
 	}
 
+	s.logger.Info("Inserted new PDs into the scheduler",
+		slog.Int("num_inserted", len(req.ProbingDirectives)))
+
 	w.Header().Set("Content-Type", "application/json")
 	if len(ids) < len(req.ProbingDirectives) {
 		w.WriteHeader(http.StatusInternalServerError)

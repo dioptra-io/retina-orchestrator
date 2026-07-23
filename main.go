@@ -58,7 +58,7 @@ func run() error {
 		logLevel             = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 		metricsAddr          = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
 
-		streamStartFromEarliest = flag.Bool("stream-start-from-earliest", envOrDefaultBool("RETINA_STREAM_START_FROM_EARLIEST", false), "If true, newly connected FIE stream clients start from the earliest FIE still in the ring buffer instead of only future ones")
+		streamStartFromEarliest = flag.Bool("stream-start-from-earliest", envOrDefaultBool("RETINA_STREAM_START_FROM_EARLIEST", true), "If true, newly connected FIE stream clients start from the earliest FIE still in the ring buffer instead of only future ones")
 
 		// --- ResearchSchedulerConfig (rr- prefix) ---
 		rrSeed                      = flag.Uint64("rr-seed", envOrDefaultUInt64("RETINA_RR_SEED", 42), "Seed for the research scheduler's internal RNG")

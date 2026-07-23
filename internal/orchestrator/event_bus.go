@@ -57,11 +57,35 @@ type RetinaEvent interface {
 // atomic counter in Insert, so duplicates are impossible and there is no
 // rejection path (see errata).
 
-// SchedulerStartedEvent is emitted once at initialization. Payload: the
+// OrchestratorStartedEvent is emitted once at initialization. Payload: the
 // configuration parameters in effect (§5.5).
-type SchedulerStartedEvent struct {
+type OrchestratorStartedEvent struct {
 	RetinaBaseEvent
-	Config ResearchSchedulerConfig `json:"config"`
+	Config
+}
+
+// OrchestratorStoppedEvent is emitted when the orchestator is stopped, this is
+// most likely because of a stop signal. The message (if available) is provided.
+type OrchestratorStoppedEvent struct {
+	RetinaBaseEvent
+	Message string `json:"message"`
+}
+
+// AgentConnectedEvent is emitted when an agent becomes available (§5.5).
+// The Scheduler itself has no notion of agent liveness (see NewResearchScheduler's
+// integration notes); this event is emitted on the same bus by whichever
+// component owns agent state.
+type AgentConnectedEvent struct {
+	RetinaBaseEvent
+	AgentID string `json:"agent_id"`
+}
+
+// AgentDisconnectedEvent is emitted when an agent becomes unavailable (§5.5).
+// Like AgentConnectedEvent, this is emitted by the component that owns agent
+// state, not by the Scheduler.
+type AgentDisconnectedEvent struct {
+	RetinaBaseEvent
+	AgentID string `json:"agent_id"`
 }
 
 // PDInsertedEvent is emitted when an insertion is applied and the PD is
@@ -90,12 +114,53 @@ const (
 // from any rule: staleness slow-down or speed-up (§4.2.2), the responsible
 // probing floor (§4.2.1), or the μ_min/μ_max clamp (§3.4). A single learning
 // step emits at most one such event, attributed to the binding rule.
+//
+// Beyond the previous/new period and the binding rule, the payload also
+// carries the intermediate state of every rule considered during the step,
+// not just the one that ended up binding. This is needed to reconstruct why
+// a step landed where it did: e.g. staleness may have proposed a slow-down
+// that was then overridden by the responsible-probing floor, and without
+// StalenessCandidate that intermediate value would be lost. All diagnostic
+// fields are always populated, regardless of which rule bound; fields that
+// are not meaningful for a given step (e.g. HistoryStable when the FIE
+// history isn't yet full) are left at their zero value.
 type PeriodAdjustedEvent struct {
 	RetinaBaseEvent
 	ProbingDirectiveID uint64               `json:"probing_directive_id"`
 	PreviousPeriod     float64              `json:"previous_period"`
 	NewPeriod          float64              `json:"new_period"`
 	Rule               PeriodAdjustmentRule `json:"rule"`
+
+	// --- Staleness diagnostics (§4.2.2) ---
+
+	// FIEHistoryFull reports whether the FIE history had reached capacity
+	// (n = m) at this step, i.e. whether staleness was eligible to fire.
+	FIEHistoryFull bool `json:"fie_history_full"`
+	// HistoryStable is the result of the pairwise-equivalence check, only
+	// meaningful when FIEHistoryFull is true.
+	HistoryStable bool `json:"history_stable"`
+	// StalenessCandidate is the issuance period immediately after the
+	// staleness step, before responsible probing or the clamp could
+	// override it. Equal to PreviousPeriod when staleness did not fire.
+	StalenessCandidate float64 `json:"staleness_candidate"`
+
+	// --- Responsible probing diagnostics (§4.2.1) ---
+
+	// ImpactDelay is the PD's last known impact delay (rec.impactDelay) at
+	// the time of this step, in seconds.
+	ImpactDelay float64 `json:"impact_delay"`
+	// ImpactedNear / ImpactedFar are the near/far addresses the projection
+	// assumed this issuance would impact (rec.lastNear / rec.lastFar), i.e.
+	// the addresses reserveAndFloor was evaluated against. Empty string
+	// means null/no address.
+	ImpactedNear string `json:"impacted_near"`
+	ImpactedFar  string `json:"impacted_far"`
+	// RawImpactFloor is rpFloorPeriod: the tighter of the two per-address
+	// GCRA floors, before the 1/(1-β) widening.
+	RawImpactFloor float64 `json:"raw_impact_floor"`
+	// WorstCaseFloor is RawImpactFloor widened by 1/(1-β), the value
+	// actually compared against the staleness candidate.
+	WorstCaseFloor float64 `json:"worst_case_floor"`
 }
 
 // SchedulerLateEvent is emitted when an overdue PD is issued past its

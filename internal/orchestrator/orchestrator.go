@@ -22,33 +22,37 @@ import (
 // Config is the main configuration struct used in the orchestrator.
 type Config struct {
 	// AgentAddress is the TCP listening address for agent connections, in the form "host:port".
-	AgentAddress      string
-	AgentBufferLength int
+	AgentAddress string `json:"agent_address"`
+
+	AgentBufferLength int `json:"agent_buffer_length"`
 
 	// PDQueueSize is the number of PDs that can be queued per agent.
 	// Increase this value if agents are slow to consume directives.
-	PDQueueSize    int
-	RingBufferSize int
+	PDQueueSize int `json:"pd_queue_size"`
+
+	RingBufferSize int `json:"ring_buffer_size"`
 
 	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
-	APIAddress string
-	// APIReadHeaderTimeout defaults to 5 seconds if zero.
-	APIReadHeaderTimeout time.Duration
+	APIAddress string `json:"api_address"`
 
-	FIEFilterPolicy string
+	// APIReadHeaderTimeout defaults to 5 seconds if zero.
+	APIReadHeaderTimeout time.Duration `json:"api_read_header_timeout"`
+
+	FIEFilterPolicy string `json:"fie_filter_policy"`
+
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
-	Secret string
+	Secret string `json:"secret"`
 
-	EventBusSize int
+	EventBusSize int `json:"event_bus_size"`
 
 	// StreamStartFromEarliest controls where a newly connected client's stream
 	// begins. False (default) preserves the original behavior: the client only
 	// sees FIEs sent after it connects. True starts the client from the
 	// earliest FIE still held in the ring buffer.
-	StreamStartFromEarliest bool
+	StreamStartFromEarliest bool `json:"stream_start_from_earliest"`
 
-	ResearchSchedulerConfig *ResearchSchedulerConfig
+	ResearchSchedulerConfig *ResearchSchedulerConfig `json:"research_scheduler_config"`
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -220,12 +224,21 @@ func (o *Orchestrator) runScheduler(ctx context.Context) error {
 }
 
 func (o *Orchestrator) runAPIServer(ctx context.Context) error {
+	o.ebus.Emit(&OrchestratorStartedEvent{
+		Config: *o.config,
+	})
+
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
 		return o.apiServer.listenAndServe()
 	})
 	group.Go(func() error {
 		<-ctx.Done()
+
+		o.ebus.Emit(&OrchestratorStoppedEvent{
+			Message: ctx.Err().Error(),
+		})
+
 		return o.apiServer.close(3 * time.Second)
 	})
 	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
@@ -337,10 +350,16 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 
 	o.logger.Info("Agent connected", "agent_id", status.agentID)
 	o.metrics.AgentQueueSize.WithLabelValues(status.agentID).Set(0)
+	o.ebus.Emit(&AgentConnectedEvent{
+		AgentID: status.agentID,
+	})
 
 	defer func() {
 		o.logger.Info("Agent disconnected", "agent_id", status.agentID)
 		o.metrics.AgentQueueSize.DeleteLabelValues(status.agentID)
+		o.ebus.Emit(&AgentDisconnectedEvent{
+			AgentID: status.agentID,
+		})
 	}()
 
 	group, ctx := errgroup.WithContext(s.context())

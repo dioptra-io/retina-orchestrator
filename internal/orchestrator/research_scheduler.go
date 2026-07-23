@@ -37,79 +37,79 @@ import (
 // fixed at startup.
 type ResearchSchedulerConfig struct {
 	// Seed for the internal RNG; kept explicit for reproducible experiments.
-	Seed uint64
+	Seed uint64 `json:"seed"`
 
 	// LearningRate is α, the multiplicative step of the period learning
 	// rule (§3.4). Must be in (0, 1). Default: 0.3.
-	LearningRate float64
+	LearningRate float64 `json:"learning_rate"`
 
 	// SamplingWidth is β, the half-width of the uniform inter-issuance
 	// sampling interval (§4.1). Must be in (0, 1). Default: 0.1.
-	SamplingWidth float64
+	SamplingWidth float64 `json:"sampling_width"`
 
 	// ImpactThreshold is Λ, the maximum permitted impact rate for any PD,
 	// in impacts per second (§3.2, §4.2.1). Default: 1.0.
-	ImpactThreshold float64
+	ImpactThreshold float64 `json:"impact_threshold"`
 
 	// FIEHistoryCapacity is m, the number of FIEs retained per PD for the
 	// staleness rule (§3.3, §4.2.2). Default: 6.
-	FIEHistoryCapacity int
+	FIEHistoryCapacity int `json:"fie_history_capacity"`
 
 	// MinIssuancePeriod is μmin (§3.4). Default: 500ms.
-	MinIssuancePeriod time.Duration
+	MinIssuancePeriod time.Duration `json:"min_issuance_period"`
 
 	// MaxIssuancePeriod is μmax (§3.4). Default: 12h.
-	MaxIssuancePeriod time.Duration
+	MaxIssuancePeriod time.Duration `json:"max_issuance_period"`
 
 	// AdmissionRate is r₀, the rate at which newly inserted PDs are
 	// admitted into the schedule, in PDs per second (§4.3). Default: 1000.
-	AdmissionRate float64
+	AdmissionRate float64 `json:"admission_rate"`
 
 	// StartingIssuancePeriod is Μ, the period assigned at admission (§4.3).
 	// Zero means "use MinIssuancePeriod" (the DSD default Μ = μmin).
-	StartingIssuancePeriod time.Duration
+	StartingIssuancePeriod time.Duration `json:"starting_issuance_period"`
 
 	// StatusInterval is Tstatus, the CurrentStatus emission interval
 	// (§5.5). Default: 1 minute.
-	StatusInterval time.Duration
+	StatusInterval time.Duration `json:"status_interval"`
 
 	// InsertChannelSize and FIEChannelSize size the internal channels
 	// (§5.1). Insert and Update block when the corresponding channel is
 	// full; this backpressure is accepted. Defaults: 1024 each.
-	InsertChannelSize int
-	UpdateChannelSize int
+	InsertChannelSize int `json:"insert_channel_size"`
+	UpdateChannelSize int `json:"update_channel_size"`
 
 	// LatenessTolerance is the slack below which an issuance is not considered
 	// late; it absorbs clock-read granularity around the busy-wait exit.
-	LatenessTolerance time.Duration
+	LatenessTolerance time.Duration `json:"lateness_tolerance"`
 
 	// BusyTolerance is Tbusy, governing the hybrid sleep strategy (§5.1.1).
 	// Affects only timing precision, not scheduling semantics.
 	// Default: 100micros.
-	BusyTolerance time.Duration
+	BusyTolerance time.Duration `json:"busy_tolerance"`
 
-	WaitTolerance time.Duration
+	WaitTolerance time.Duration `json:"wait_tolerance"`
 
 	// InitialQueueSize is the default size of the queue variable.
-	InitialQueueSize int
+	InitialQueueSize int `json:"initial_queue_size"`
 
 	// MaxUpdateDrainPerIssuance is the number of FIE updates we can do per
 	// issuance call.
-	MaxUpdateDrainPerIssuance int
+	MaxUpdateDrainPerIssuance int `json:"max_update_drain_per_issuance"`
 
 	// MaxInsertDrainPerIssuance is the number of FIE updates we can do per
 	// issuance call.
-	MaxInsertDrainPerIssuance int
+	MaxInsertDrainPerIssuance int `json:"max_insert_drain_per_issuance"`
 
 	// DefaultImpactDelay is the default delay estimated for a PD's issuance and
 	// it's impact on the address.
-	DefaultImpactDelay time.Duration
+	DefaultImpactDelay time.Duration `json:"default_impact_delay"`
 
 	// DisableResponsibleProbing disables responsible probing checks.
-	DisableResponsibleProbing bool
+	DisableResponsibleProbing bool `json:"disable_responsible_probing"`
 
 	// DisableStaleness disables the staleness condition.
-	DisableStaleness bool
+	DisableStaleness bool `json:"disable_staleness"`
 }
 
 // validate checks the configuration and returns an error describing the
@@ -395,6 +395,8 @@ func (s *ResearchScheduler) Insert(req *api.ProbingDirective) (uint64, error) {
 	// ID starts from 0.
 	id := s.nextID.Add(1) - 1
 	req.ProbingDirectiveID = id
+
+	// Any validation etc?
 
 	select {
 	case s.insertCh <- req:
@@ -693,10 +695,16 @@ func (s *ResearchScheduler) update(fie *api.ForwardingInfoElement) {
 	if fie.NearInfo != nil {
 		mid := fie.NearInfo.SentTimestamp.Add(fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp) / 2)
 		rec.impactDelay = mid.Sub(rec.lastIssuedAt).Seconds()
+		if rec.impactDelay <= 0 {
+			rec.impactDelay = s.cfg.DefaultImpactDelay.Seconds()
+		}
 	}
 	if fie.FarInfo != nil {
 		mid := fie.FarInfo.SentTimestamp.Add(fie.FarInfo.ReceivedTimestamp.Sub(fie.FarInfo.SentTimestamp) / 2)
 		rec.impactDelay = mid.Sub(rec.lastIssuedAt).Seconds()
+		if rec.impactDelay <= 0 {
+			rec.impactDelay = s.cfg.DefaultImpactDelay.Seconds()
+		}
 	}
 }
 
@@ -736,7 +744,7 @@ func (s *ResearchScheduler) reserveAndFloor(addr net.IP, now time.Time, impactDe
 // single step emits at most one PeriodAdjusted, attributed to the binding
 // rule. Finally a new inter-issuance time is sampled and nextIssuance and
 // lastIssuedAt are set.
-func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyclo
+func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyclo,funlen
 	old := rec.issuancePeriod
 	candidate := old
 	rule := PeriodAdjustmentRuleNone
@@ -747,9 +755,12 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 	//
 	// This needs to be estimated as we discuss in "Catching FIE Changes with
 	// Poisson Process Summary" document.
+	fieHistoryFull := rec.histFill == len(rec.history)
+	var historyStable bool
 	if !s.cfg.DisableStaleness {
-		if rec.histFill == len(rec.history) {
-			if rec.historyStable() {
+		if fieHistoryFull {
+			historyStable = rec.historyStable()
+			if historyStable {
 				candidate = old * (1 + s.cfg.LearningRate)
 				rule = PeriodAdjustmentRuleStalenessSlowDown
 			} else {
@@ -758,6 +769,7 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 			}
 		}
 	}
+	stalenessCandidate := candidate
 
 	// --- Responsible probing rpFloorPeriod (§4.2.1, revised) ---
 	// Reserve this issuance's projected impact on both addresses (assumed
@@ -768,6 +780,7 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 	// mid-run would resume with a stale/missing TAT, silently losing any
 	// unthrottled activity during the disabled window.
 	rpFloorPeriod := 0.0
+	worstCaseFloor := 0.0
 	if !s.cfg.DisableResponsibleProbing {
 		rpFloorPeriod = math.Max(
 			s.reserveAndFloor(rec.lastNear, t, rec.impactDelay),
@@ -781,7 +794,7 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 		//
 		// Otherwise 50% of the time for the cases that we need to rise the μ we
 		// would violate the responsible probing constraint.
-		worstCaseFloor := rpFloorPeriod / (1 - s.cfg.SamplingWidth)
+		worstCaseFloor = rpFloorPeriod / (1 - s.cfg.SamplingWidth)
 		if candidate < worstCaseFloor {
 			candidate = worstCaseFloor
 			rule = PeriodAdjustmentRuleResponsibleProbing
@@ -824,6 +837,14 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 			PreviousPeriod:     old,
 			NewPeriod:          candidate,
 			Rule:               rule,
+			FIEHistoryFull:     fieHistoryFull,
+			HistoryStable:      historyStable,
+			StalenessCandidate: stalenessCandidate,
+			ImpactDelay:        rec.impactDelay,
+			ImpactedNear:       ipString(rec.lastNear),
+			ImpactedFar:        ipString(rec.lastFar),
+			RawImpactFloor:     rpFloorPeriod,
+			WorstCaseFloor:     worstCaseFloor,
 		})
 	}
 
@@ -897,4 +918,13 @@ func (s *ResearchScheduler) emitStatus() {
 
 func secondsToDuration(sec float64) time.Duration {
 	return time.Duration(sec * float64(time.Second))
+}
+
+// ipString renders a possibly-nil IP address for event payloads. A nil
+// address (no impact on that side) renders as the empty string.
+func ipString(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
