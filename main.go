@@ -73,7 +73,7 @@ func run() error {
 		rrStatusInterval              = flag.Duration("rr-status-interval", envOrDefaultDuration("RETINA_RR_STATUS_INTERVAL", time.Minute), "Interval between CurrentStatus event emissions")
 		rrInsertChannelSize           = flag.Int("rr-insert-channel-size", envOrDefaultInt("RETINA_RR_INSERT_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's insert channel")
 		rrUpdateChannelSize           = flag.Int("rr-update-channel-size", envOrDefaultInt("RETINA_RR_UPDATE_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's FIE update channel")
-		rrLatenessTolerance           = flag.Duration("rr-lateness-tolerance", envOrDefaultDuration("RETINA_RR_LATENESS_TOLERANCE", time.Millisecond), "Slack below which an issuance is not considered late")
+		rrLatenessTolerance           = flag.Duration("rr-lateness-tolerance", envOrDefaultDuration("RETINA_RR_LATENESS_TOLERANCE", 25*time.Millisecond), "Slack below which an issuance is not considered late")
 		rrBusyTolerance               = flag.Duration("rr-busy-tolerance", envOrDefaultDuration("RETINA_RR_BUSY_TOLERANCE", 500*time.Microsecond), "Commitment-window width for the hybrid sleep strategy (Tbusy)")
 		rrWaitTolerance               = flag.Duration("rr-wait-tolerance", envOrDefaultDuration("RETINA_RR_WAIT_TOLERANCE", time.Millisecond), "Busy-wait margin to absorb time.After over-sleep")
 		rrInitialQueueSize            = flag.Int("rr-initial-queue-size", envOrDefaultInt("RETINA_RR_INITIAL_QUEUE_SIZE", 100_000), "Initial capacity reserved for the scheduling heap")
