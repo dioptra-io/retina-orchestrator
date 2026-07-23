@@ -61,27 +61,29 @@ func run() error {
 		streamStartFromEarliest = flag.Bool("stream-start-from-earliest", envOrDefaultBool("RETINA_STREAM_START_FROM_EARLIEST", true), "If true, newly connected FIE stream clients start from the earliest FIE still in the ring buffer instead of only future ones")
 
 		// --- ResearchSchedulerConfig (rr- prefix) ---
-		rrSeed                      = flag.Uint64("rr-seed", envOrDefaultUInt64("RETINA_RR_SEED", 42), "Seed for the research scheduler's internal RNG")
-		rrLearningRate              = flag.Float64("rr-learning-rate", envOrDefaultFloat64("RETINA_RR_LEARNING_RATE", 0.1), "Learning rate (α) for the research scheduler's period adjustment")
-		rrSamplingWidth             = flag.Float64("rr-sampling-width", envOrDefaultFloat64("RETINA_RR_SAMPLING_WIDTH", 0.1), "Sampling width (β) for uniform inter-issuance sampling")
-		rrImpactThreshold           = flag.Float64("rr-impact-threshold", envOrDefaultFloat64("RETINA_RR_IMPACT_THRESHOLD", 1.0), "Impact threshold (Λ) for the research scheduler's responsible probing")
-		rrFIEHistoryCapacity        = flag.Int("rr-fie-history-capacity", envOrDefaultInt("RETINA_RR_FIE_HISTORY_CAPACITY", 6), "Number of FIEs retained per PD for the staleness rule")
-		rrMinIssuancePeriod         = flag.Duration("rr-min-issuance-period", envOrDefaultDuration("RETINA_RR_MIN_ISSUANCE_PERIOD", 500*time.Millisecond), "Minimum issuance period (μmin)")
-		rrMaxIssuancePeriod         = flag.Duration("rr-max-issuance-period", envOrDefaultDuration("RETINA_RR_MAX_ISSUANCE_PERIOD", 12*time.Hour), "Maximum issuance period (μmax)")
-		rrAdmissionRate             = flag.Float64("rr-admission-rate", envOrDefaultFloat64("RETINA_RR_ADMISSION_RATE", 1000), "Admission rate (r₀) for pacing newly inserted PDs' first issuance")
-		rrStartingIssuancePeriod    = flag.Duration("rr-starting-issuance-period", envOrDefaultDuration("RETINA_RR_STARTING_ISSUANCE_PERIOD", time.Second*10), "Starting issuance period (Μ) assigned at admission")
-		rrStatusInterval            = flag.Duration("rr-status-interval", envOrDefaultDuration("RETINA_RR_STATUS_INTERVAL", time.Minute), "Interval between CurrentStatus event emissions")
-		rrInsertChannelSize         = flag.Int("rr-insert-channel-size", envOrDefaultInt("RETINA_RR_INSERT_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's insert channel")
-		rrUpdateChannelSize         = flag.Int("rr-update-channel-size", envOrDefaultInt("RETINA_RR_UPDATE_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's FIE update channel")
-		rrLatenessTolerance         = flag.Duration("rr-lateness-tolerance", envOrDefaultDuration("RETINA_RR_LATENESS_TOLERANCE", time.Millisecond), "Slack below which an issuance is not considered late")
-		rrBusyTolerance             = flag.Duration("rr-busy-tolerance", envOrDefaultDuration("RETINA_RR_BUSY_TOLERANCE", 500*time.Microsecond), "Commitment-window width for the hybrid sleep strategy (Tbusy)")
-		rrWaitTolerance             = flag.Duration("rr-wait-tolerance", envOrDefaultDuration("RETINA_RR_WAIT_TOLERANCE", time.Millisecond), "Busy-wait margin to absorb time.After over-sleep")
-		rrInitialQueueSize          = flag.Int("rr-initial-queue-size", envOrDefaultInt("RETINA_RR_INITIAL_QUEUE_SIZE", 100_000), "Initial capacity reserved for the scheduling heap")
-		rrMaxUpdateDrainPerIssuance = flag.Int("rr-max-update-drain-per-issuance", envOrDefaultInt("RETINA_RR_MAX_UPDATE_DRAIN_PER_ISSUANCE", 5), "Maximum FIE updates drained per issuance call")
-		rrMaxInsertDrainPerIssuance = flag.Int("rr-max-insert-drain-per-issuance", envOrDefaultInt("RETINA_RR_MAX_INSERT_DRAIN_PER_ISSUANCE", 5), "Maximum inserts drained per issuance call")
-		rrDefaultImpactDelay        = flag.Duration("rr-default-impact-delay", envOrDefaultDuration("RETINA_RR_DEFAULT_IMPACT_DELAY", time.Second), "Default estimated delay between a PD's issuance and its impact on an address")
-		rrDisableResponsibleProbing = flag.Bool("rr-disable-responsible-probing", envOrDefaultBool("RETINA_RR_DISABLE_RESPONSIBLE_PROBING", false), "Disable the responsible probing constraint (testing only)")
-		rrDisableStaleness          = flag.Bool("rr-disable-staleness", envOrDefaultBool("RETINA_RR_DISABLE_STALENESS", false), "Disable the staleness-based period adjustment (testing only)")
+		rrSeed                        = flag.Uint64("rr-seed", envOrDefaultUInt64("RETINA_RR_SEED", 42), "Seed for the research scheduler's internal RNG")
+		rrLearningRate                = flag.Float64("rr-learning-rate", envOrDefaultFloat64("RETINA_RR_LEARNING_RATE", 0.1), "Learning rate (α) for the research scheduler's period adjustment")
+		rrSamplingWidth               = flag.Float64("rr-sampling-width", envOrDefaultFloat64("RETINA_RR_SAMPLING_WIDTH", 0.1), "Sampling width (β) for uniform inter-issuance sampling")
+		rrImpactThreshold             = flag.Float64("rr-impact-threshold", envOrDefaultFloat64("RETINA_RR_IMPACT_THRESHOLD", 1.0), "Impact threshold (Λ) for the research scheduler's responsible probing")
+		rrFIEHistoryCapacity          = flag.Int("rr-fie-history-capacity", envOrDefaultInt("RETINA_RR_FIE_HISTORY_CAPACITY", 6), "Number of FIEs retained per PD for the staleness rule")
+		rrMinIssuancePeriod           = flag.Duration("rr-min-issuance-period", envOrDefaultDuration("RETINA_RR_MIN_ISSUANCE_PERIOD", 500*time.Millisecond), "Minimum issuance period (μmin)")
+		rrMaxIssuancePeriod           = flag.Duration("rr-max-issuance-period", envOrDefaultDuration("RETINA_RR_MAX_ISSUANCE_PERIOD", 12*time.Hour), "Maximum issuance period (μmax)")
+		rrAdmissionRate               = flag.Float64("rr-admission-rate", envOrDefaultFloat64("RETINA_RR_ADMISSION_RATE", 1000), "Admission rate (r₀) for pacing newly inserted PDs' first issuance")
+		rrStartingIssuancePeriod      = flag.Duration("rr-starting-issuance-period", envOrDefaultDuration("RETINA_RR_STARTING_ISSUANCE_PERIOD", time.Second*10), "Starting issuance period (Μ) assigned at admission")
+		rrStatusInterval              = flag.Duration("rr-status-interval", envOrDefaultDuration("RETINA_RR_STATUS_INTERVAL", time.Minute), "Interval between CurrentStatus event emissions")
+		rrInsertChannelSize           = flag.Int("rr-insert-channel-size", envOrDefaultInt("RETINA_RR_INSERT_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's insert channel")
+		rrUpdateChannelSize           = flag.Int("rr-update-channel-size", envOrDefaultInt("RETINA_RR_UPDATE_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's FIE update channel")
+		rrLatenessTolerance           = flag.Duration("rr-lateness-tolerance", envOrDefaultDuration("RETINA_RR_LATENESS_TOLERANCE", time.Millisecond), "Slack below which an issuance is not considered late")
+		rrBusyTolerance               = flag.Duration("rr-busy-tolerance", envOrDefaultDuration("RETINA_RR_BUSY_TOLERANCE", 500*time.Microsecond), "Commitment-window width for the hybrid sleep strategy (Tbusy)")
+		rrWaitTolerance               = flag.Duration("rr-wait-tolerance", envOrDefaultDuration("RETINA_RR_WAIT_TOLERANCE", time.Millisecond), "Busy-wait margin to absorb time.After over-sleep")
+		rrInitialQueueSize            = flag.Int("rr-initial-queue-size", envOrDefaultInt("RETINA_RR_INITIAL_QUEUE_SIZE", 100_000), "Initial capacity reserved for the scheduling heap")
+		rrMaxUpdateDrainPerIssuance   = flag.Int("rr-max-update-drain-per-issuance", envOrDefaultInt("RETINA_RR_MAX_UPDATE_DRAIN_PER_ISSUANCE", 5), "Maximum FIE updates drained per issuance call")
+		rrMaxInsertDrainPerIssuance   = flag.Int("rr-max-insert-drain-per-issuance", envOrDefaultInt("RETINA_RR_MAX_INSERT_DRAIN_PER_ISSUANCE", 5), "Maximum inserts drained per issuance call")
+		rrDefaultImpactDelay          = flag.Duration("rr-default-impact-delay", envOrDefaultDuration("RETINA_RR_DEFAULT_IMPACT_DELAY", time.Second), "Default estimated delay between a PD's issuance and its impact on an address")
+		rrDisableResponsibleProbing   = flag.Bool("rr-disable-responsible-probing", envOrDefaultBool("RETINA_RR_DISABLE_RESPONSIBLE_PROBING", false), "Disable the responsible probing constraint (testing only)")
+		rrDisableStaleness            = flag.Bool("rr-disable-staleness", envOrDefaultBool("RETINA_RR_DISABLE_STALENESS", false), "Disable the staleness-based period adjustment (testing only)")
+		rrDisablePeriodAdjustedEvents = flag.Bool("rr-disable-period-adjustment-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_ADJUSTED_EVENTS", false), "Disable emitting period adjusted events")
+		rrDisablePDInsertedEvents     = flag.Bool("rr-disable-pd-inserted-events", envOrDefaultBool("RETINA_RR_DISABLE_PD_INSERTED_EVENTS", false), "Disable emitting PD inserted events")
 	)
 	flag.Parse()
 
@@ -113,27 +115,29 @@ func run() error {
 		EventBusSize:            *eventBusSize,
 		StreamStartFromEarliest: *streamStartFromEarliest,
 		ResearchSchedulerConfig: &orchestrator.ResearchSchedulerConfig{
-			Seed:                      *rrSeed,
-			LearningRate:              *rrLearningRate,
-			SamplingWidth:             *rrSamplingWidth,
-			ImpactThreshold:           *rrImpactThreshold,
-			FIEHistoryCapacity:        *rrFIEHistoryCapacity,
-			MinIssuancePeriod:         *rrMinIssuancePeriod,
-			MaxIssuancePeriod:         *rrMaxIssuancePeriod,
-			AdmissionRate:             *rrAdmissionRate,
-			StartingIssuancePeriod:    *rrStartingIssuancePeriod,
-			StatusInterval:            *rrStatusInterval,
-			InsertChannelSize:         *rrInsertChannelSize,
-			UpdateChannelSize:         *rrUpdateChannelSize,
-			LatenessTolerance:         *rrLatenessTolerance,
-			BusyTolerance:             *rrBusyTolerance,
-			WaitTolerance:             *rrWaitTolerance,
-			InitialQueueSize:          *rrInitialQueueSize,
-			MaxUpdateDrainPerIssuance: *rrMaxUpdateDrainPerIssuance,
-			MaxInsertDrainPerIssuance: *rrMaxInsertDrainPerIssuance,
-			DefaultImpactDelay:        *rrDefaultImpactDelay,
-			DisableResponsibleProbing: *rrDisableResponsibleProbing,
-			DisableStaleness:          *rrDisableStaleness,
+			Seed:                        *rrSeed,
+			LearningRate:                *rrLearningRate,
+			SamplingWidth:               *rrSamplingWidth,
+			ImpactThreshold:             *rrImpactThreshold,
+			FIEHistoryCapacity:          *rrFIEHistoryCapacity,
+			MinIssuancePeriod:           *rrMinIssuancePeriod,
+			MaxIssuancePeriod:           *rrMaxIssuancePeriod,
+			AdmissionRate:               *rrAdmissionRate,
+			StartingIssuancePeriod:      *rrStartingIssuancePeriod,
+			StatusInterval:              *rrStatusInterval,
+			InsertChannelSize:           *rrInsertChannelSize,
+			UpdateChannelSize:           *rrUpdateChannelSize,
+			LatenessTolerance:           *rrLatenessTolerance,
+			BusyTolerance:               *rrBusyTolerance,
+			WaitTolerance:               *rrWaitTolerance,
+			InitialQueueSize:            *rrInitialQueueSize,
+			MaxUpdateDrainPerIssuance:   *rrMaxUpdateDrainPerIssuance,
+			MaxInsertDrainPerIssuance:   *rrMaxInsertDrainPerIssuance,
+			DefaultImpactDelay:          *rrDefaultImpactDelay,
+			DisableResponsibleProbing:   *rrDisableResponsibleProbing,
+			DisableStaleness:            *rrDisableStaleness,
+			DisablePeriodAdjustedEvents: *rrDisablePeriodAdjustedEvents,
+			DisablePDInsertedEvents:     *rrDisablePDInsertedEvents,
 		},
 	}, logger, metrics)
 	if err != nil {

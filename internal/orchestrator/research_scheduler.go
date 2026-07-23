@@ -110,6 +110,12 @@ type ResearchSchedulerConfig struct {
 
 	// DisableStaleness disables the staleness condition.
 	DisableStaleness bool `json:"disable_staleness"`
+
+	// DisablePeriodAdjustedEvents disables the PeriodAdjusted events.
+	DisablePeriodAdjustedEvents bool `json:"disable_period_adjusted_events"`
+
+	// DisablePDInsertedEvents disables the PDInserted events.
+	DisablePDInsertedEvents bool `json:"disable_pd_inserted_events"`
 }
 
 // validate checks the configuration and returns an error describing the
@@ -635,10 +641,13 @@ func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
 	}
 	s.bucketNext = first.Add(time.Duration(float64(time.Second) / s.cfg.AdmissionRate))
 
+	// μᵢ = Μ (§4.3) but sampled.
+	issuancePeriod := s.sampleInterIssuance(s.cfg.StartingIssuancePeriod.Seconds()).Seconds()
+
 	rec := &pdRecord{
 		pdid:           pd.ProbingDirectiveID,
 		pd:             pd,
-		issuancePeriod: s.cfg.StartingIssuancePeriod.Seconds(), // μᵢ = Μ (§4.3)
+		issuancePeriod: issuancePeriod,
 		nextIssuance:   first,
 		history:        make([]fieObservation, s.cfg.FIEHistoryCapacity), // Fixed-capacity FIE ring buffer, allocated once at admission (§5.4).
 		impactDelay:    s.cfg.DefaultImpactDelay.Seconds(),
@@ -656,11 +665,13 @@ func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
 		s.pdsClampedAtMax++
 	}
 
-	s.ebus.Emit(&PDInsertedEvent{
-		ProbingDirectiveID: pd.ProbingDirectiveID,
-		FirstIssuanceTime:  first,
-		CurrentPDCount:     len(s.records),
-	})
+	if !s.cfg.DisablePDInsertedEvents {
+		s.ebus.Emit(&PDInsertedEvent{
+			ProbingDirectiveID: pd.ProbingDirectiveID,
+			FirstIssuanceTime:  first,
+			CurrentPDCount:     len(s.records),
+		})
+	}
 }
 
 // update applies one FIE to its PD's record: the address impact history is
@@ -832,22 +843,24 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 		}
 
 		rec.issuancePeriod = candidate
-		s.ebus.Emit(&PeriodAdjustedEvent{
-			ProbingDirectiveID: rec.pdid,
-			PreviousPeriod:     old,
-			NewPeriod:          candidate,
-			Rule:               rule,
-			FIEHistoryFull:     fieHistoryFull,
-			HistoryStable:      historyStable,
-			StalenessCandidate: stalenessCandidate,
-			ImpactDelay:        rec.impactDelay,
-			ImpactedNear:       ipString(rec.lastNear),
-			ImpactedFar:        ipString(rec.lastFar),
-			RawImpactFloor:     rpFloorPeriod,
-			WorstCaseFloor:     worstCaseFloor,
-		})
-	}
 
+		if !s.cfg.DisablePeriodAdjustedEvents {
+			s.ebus.Emit(&PeriodAdjustedEvent{
+				ProbingDirectiveID: rec.pdid,
+				PreviousPeriod:     old,
+				NewPeriod:          candidate,
+				Rule:               rule,
+				FIEHistoryFull:     fieHistoryFull,
+				HistoryStable:      historyStable,
+				StalenessCandidate: stalenessCandidate,
+				ImpactDelay:        rec.impactDelay,
+				ImpactedNear:       ipString(rec.lastNear),
+				ImpactedFar:        ipString(rec.lastFar),
+				RawImpactFloor:     rpFloorPeriod,
+				WorstCaseFloor:     worstCaseFloor,
+			})
+		}
+	}
 	// --- Sample X and reschedule (§4.1) ---
 	x := s.sampleInterIssuance(rec.issuancePeriod)
 	rec.lastIssuedAt = t

@@ -2,8 +2,9 @@
 #
 # Retina stream capture.
 #
-# Connects to the FIE stream and the event stream, writing FIEs as CSV and
-# events as JSONL, both rotated every ROTATE_EVERY records.
+# Connects to the FIE stream and the event stream. FIEs are written into a
+# SQLite database (single file, no indices — add those in post-processing).
+# Events are appended verbatim into JSONL, rotated every ROTATE_EVERY records.
 #
 # Neither stream reconnects. If either one ends, for any reason, the whole
 # capture shuts down. A run therefore covers one uninterrupted connection to
@@ -12,24 +13,28 @@
 #   ./capture.sh [output_root]
 #
 # Environment:
-#   RETINA_SERVER_URL   base URL                (default: http://localhost:8080)
-#   ROTATE_EVERY        records per file        (default: 1000000)
+#   RETINA_SERVER_URL   base URL              (default: http://localhost:8080)
+#   BATCH_SIZE          rows per FIE flush    (default: 5000)
+#   FLUSH_INTERVAL      max seconds unflushed (default: 30)
+#   ROTATE_EVERY        event records/file    (default: 1000000)
 #
 # Layout:
 #   YYYYMMDD__HHMMSS/
-#     fies/fies_000001.csv
+#     fies.db
 #     events/events_000001.jsonl
 #     capture.log
 
 set -uo pipefail
 
 SERVER_URL="${RETINA_SERVER_URL:-http://localhost:8080}"
+BATCH_SIZE="${BATCH_SIZE:-5000}"
+FLUSH_INTERVAL="${FLUSH_INTERVAL:-30}"
 ROTATE_EVERY="${ROTATE_EVERY:-1000000}"
 
 OUTPUT_ROOT="${1:-./data/streams}"
 RUN_DIR="${OUTPUT_ROOT}/$(date -u +'%Y%m%d__%H%M%S')"
-FIES_DIR="${RUN_DIR}/fies"
 EVENTS_DIR="${RUN_DIR}/events"
+DB_FILE="${RUN_DIR}/fies.db"
 LOG_FILE="${RUN_DIR}/capture.log"
 
 FIE_ENDPOINT="${SERVER_URL}/api/v1/stream"
@@ -45,24 +50,62 @@ die() {
 	exit 1
 }
 
-for tool in curl jq; do
+for tool in curl jq sqlite3; do
 	command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
 done
 
-mkdir -p "$FIES_DIR" "$EVENTS_DIR" || die "cannot create ${RUN_DIR}"
+mkdir -p "$EVENTS_DIR" || die "cannot create ${EVENTS_DIR}"
 : >"$LOG_FILE"
 
 # ---------------------------------------------------------------------------
-# Column order for the FIE CSV. No header is written, so this comment is the
-# schema of record:
+# Schema
 #
-#   agent_id, probing_directive_id, sequence_number, ip_version, protocol,
-#   source_address, destination_address,
-#   near_probe_ttl, near_reply_address, near_sent_timestamp,
-#   near_received_timestamp,
-#   far_probe_ttl, far_reply_address, far_sent_timestamp,
-#   far_received_timestamp,
-#   production_timestamp
+# Flat, one row per FIE, near and far denormalised. No indices here on
+# purpose — building them on a 100M+ row table costs real time, so that
+# happens once in post-processing rather than on every flush. WAL lets a
+# reader attach while the capture is running; NORMAL is durable across a
+# process crash, which is the failure this run is actually exposed to.
+# ---------------------------------------------------------------------------
+
+sqlite3 "$DB_FILE" >/dev/null <<'SQL' || die "cannot initialise ${DB_FILE}"
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA temp_store = MEMORY;
+PRAGMA cache_size = -200000;
+PRAGMA mmap_size = 1073741824;
+
+CREATE TABLE IF NOT EXISTS fies (
+    agent_id                TEXT        NOT NULL,
+    probing_directive_id    INTEGER     NOT NULL,
+    sequence_number         INTEGER     NOT NULL,
+    ip_version              INTEGER     NOT NULL,
+    protocol                INTEGER     NOT NULL,
+    source_address          TEXT        NOT NULL,
+    destination_address     TEXT        NOT NULL,
+    near_probe_ttl          INTEGER,
+    near_reply_address      TEXT,
+    near_sent_timestamp     TEXT,
+    near_received_timestamp TEXT,
+    far_probe_ttl           INTEGER,
+    far_reply_address       TEXT,
+    far_sent_timestamp      TEXT,
+    far_received_timestamp  TEXT,
+    production_timestamp    TEXT        NOT NULL
+);
+SQL
+
+log "run directory ${RUN_DIR}"
+log "fie stream    ${FIE_ENDPOINT}"
+log "event stream  ${SSE_ENDPOINT}"
+log "fie batch ${BATCH_SIZE} rows or ${FLUSH_INTERVAL}s"
+log "event rotate every ${ROTATE_EVERY} records"
+
+# ---------------------------------------------------------------------------
+# FIE stream
+#
+# jq flattens each FIE to a CSV row. Rows accumulate in a bash string buffer
+# and are piped straight to sqlite3's stdin via .import /dev/stdin, so nothing
+# is ever written to disk except the database itself.
 # ---------------------------------------------------------------------------
 
 readonly FIE_FILTER='
@@ -90,42 +133,62 @@ readonly FIE_FILTER='
     (.production_timestamp // "")
 ] | @csv'
 
-# ---------------------------------------------------------------------------
-# Streams
-#
-# Both are the same loop: read a line, append it, rotate on count. The write
-# is a plain append per line, so a kill can at worst truncate the final line
-# rather than lose a buffered batch.
-# ---------------------------------------------------------------------------
-
 capture_fies() {
-	trap 'exit 0' TERM INT
+	local buffer=""
+	local batch=0
+	local last_flush
+	last_flush=$(date -u +%s)
 
-	local index=1
-	local count=0
-	local file
-	file=$(printf '%s/fies_%06d.csv' "$FIES_DIR" "$index")
+	# Claim the buffered rows by reassigning the variable before sqlite3 is
+	# invoked. Signal handlers can re-enter this while sqlite3 is running, and
+	# the reassignment is a single bash operation with no external process in
+	# between, so a re-entrant call sees batch=0 and returns immediately
+	# instead of reimporting the same rows. No file ever touches disk: the CSV
+	# lives in the buffer variable and is piped straight to sqlite3's stdin.
+	flush_fies() {
+		[[ "$batch" -gt 0 ]] || return 0
+		local snapshot="$buffer"
+		buffer=""
+		batch=0
+		last_flush=$(date -u +%s)
+
+		printf '%s' "$snapshot" |
+			sqlite3 -csv -cmd "PRAGMA busy_timeout = 30000;" \
+				-cmd ".import /dev/stdin fies" "$DB_FILE" "" >/dev/null
+	}
+
+	# Flush whatever is staged when this stream is torn down.
+	trap 'flush_fies; exit 0' TERM INT
+	trap 'flush_fies' EXIT
 
 	log "fie stream connecting"
 
-	# jq --unbuffered keeps latency bounded; without it jq buffers and rows
-	# arrive in clumps.
+	# One connection, no retry. jq --unbuffered keeps latency bounded; without
+	# it jq buffers and rows arrive in clumps.
 	while IFS= read -r row; do
 		[[ -n "$row" ]] || continue
 
-		printf '%s\n' "$row" >>"$file"
-		count=$((count + 1))
+		printf -v buffer '%s%s\n' "$buffer" "$row"
+		batch=$((batch + 1))
 
-		if [[ "$count" -ge "$ROTATE_EVERY" ]]; then
-			index=$((index + 1))
-			count=0
-			file=$(printf '%s/fies_%06d.csv' "$FIES_DIR" "$index")
+		local now
+		now=$(date -u +%s)
+		if [[ "$batch" -ge "$BATCH_SIZE" ]] ||
+			[[ $((now - last_flush)) -ge "$FLUSH_INTERVAL" ]]; then
+			flush_fies
 		fi
 	done < <(curl -sN --no-buffer "$FIE_ENDPOINT" 2>/dev/null |
 		jq -r --unbuffered "$FIE_FILTER" 2>/dev/null)
 
+	flush_fies
 	log "fie stream ended"
 }
+
+# ---------------------------------------------------------------------------
+# Event stream
+#
+# Lines are appended verbatim, rotated on record count.
+# ---------------------------------------------------------------------------
 
 capture_events() {
 	trap 'exit 0' TERM INT
@@ -137,7 +200,6 @@ capture_events() {
 
 	log "event stream connecting"
 
-	# Lines are appended verbatim, no parsing.
 	while IFS= read -r line; do
 		[[ -n "$line" ]] || continue
 
@@ -158,7 +220,8 @@ capture_events() {
 # Shutdown
 #
 # Reached either from a signal or from one of the streams ending. Both paths
-# tear down both streams.
+# tear down both streams. No indices are built here — add them in
+# post-processing so stopping stays fast regardless of table size.
 # ---------------------------------------------------------------------------
 
 FIE_PID=""
@@ -180,9 +243,9 @@ shutdown() {
 	done
 
 	# kill returns as soon as the signal is queued, so poll until the children
-	# are actually gone.
+	# are actually gone and their final flush has released the write lock.
 	local waited=0
-	while [[ "$waited" -lt 100 ]]; do
+	while [[ "$waited" -lt 200 ]]; do
 		local alive=0
 		for pid in "$FIE_PID" "$EVENT_PID"; do
 			[[ -n "$pid" ]] || continue
@@ -192,6 +255,7 @@ shutdown() {
 		sleep 0.1
 		waited=$((waited + 1))
 	done
+	[[ "$waited" -lt 200 ]] || log "streams did not exit within 20s, continuing"
 
 	# curl and jq are grandchildren via process substitution and outlive their
 	# parent, so clear them out too.
@@ -200,20 +264,15 @@ shutdown() {
 		pkill -TERM -P "$pid" 2>/dev/null || true
 	done
 
-	local fie_rows event_rows
-	fie_rows=$(cat "$FIES_DIR"/*.csv 2>/dev/null | wc -l)
+	local rows event_rows
+	rows=$(sqlite3 "$DB_FILE" "SELECT count(*) FROM fies;" 2>/dev/null || echo "?")
 	event_rows=$(cat "$EVENTS_DIR"/*.jsonl 2>/dev/null | wc -l)
 
-	log "captured ${fie_rows} fies in $(find "$FIES_DIR" -name '*.csv' | wc -l) file(s)"
+	log "captured ${rows} fies into ${DB_FILE}"
 	log "captured ${event_rows} events in $(find "$EVENTS_DIR" -name '*.jsonl' | wc -l) file(s)"
 	log "run directory ${RUN_DIR}"
 	exit 0
 }
-
-log "run directory ${RUN_DIR}"
-log "fie stream    ${FIE_ENDPOINT}"
-log "event stream  ${SSE_ENDPOINT}"
-log "rotating every ${ROTATE_EVERY} records"
 
 # Note on stopping a backgrounded run: bash sets SIGINT to ignored for commands
 # launched with &, and a signal ignored on entry to a non-interactive shell
