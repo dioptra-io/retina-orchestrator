@@ -340,6 +340,9 @@ type ResearchScheduler struct {
 	pdsClampedAtMin       int
 	pdsClampedAtMax       int
 	pdsWithFullHistory    int
+
+	totalUpdates        uint64
+	updatesAtLastStatus uint64
 }
 
 var _ Scheduler = (*ResearchScheduler)(nil)
@@ -696,6 +699,7 @@ func (s *ResearchScheduler) update(fie *api.ForwardingInfoElement) {
 	}
 	rec.lastNear = near
 	rec.lastFar = far
+	s.totalUpdates++
 
 	wasFullBefore := rec.histFill == len(rec.history)
 	rec.appendFIE(fieObservation{near: near, far: far})
@@ -889,8 +893,10 @@ func (s *ResearchScheduler) emitStatus() {
 
 	interval := now.Sub(s.lastStatusEmission).Seconds()
 	var realized float64
+	var realizedFIEUpdates float64
 	if interval > 0 {
 		realized = float64(s.totalIssuances-s.issuancesAtLastStatus) / interval
+		realizedFIEUpdates = float64(s.totalUpdates-s.updatesAtLastStatus) / interval
 	}
 
 	var minP, maxP time.Duration
@@ -908,9 +914,10 @@ func (s *ResearchScheduler) emitStatus() {
 		CurrentPDCount:                  len(s.records),
 		CumulativeInsertions:            s.totalInsertions,
 		CumulativeIssuances:             s.totalIssuances,
+		CumulativeUpdates:               s.totalUpdates,
 		AggregateRequestedRate:          s.sumRate,
 		AggregatePeriodBetweenIssuances: aggregateRequestedPeriod,
-		RealizedRate:                    realized,
+		RealizedIssuanceRate:            realized,
 		DistinctImpactedAddrs:           len(s.addressTAT),
 		PeriodMin:                       minP.Seconds(),
 		PeriodMax:                       maxP.Seconds(),
@@ -920,12 +927,14 @@ func (s *ResearchScheduler) emitStatus() {
 		UpdateChannelOccupancy:          len(s.updateCh),
 		InsertChannelOccupancy:          len(s.insertCh),
 		CumulativeLateOccurrences:       s.totalLate,
+		RealizedUpdateRate:              realizedFIEUpdates,
 	})
 
 	// reset window
 	s.windowMinPeriod = math.Inf(1)
 	s.windowMaxPeriod = math.Inf(-1)
 	s.issuancesAtLastStatus = s.totalIssuances
+	s.updatesAtLastStatus = s.totalUpdates
 	s.lastStatusEmission = now
 }
 

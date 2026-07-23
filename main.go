@@ -82,8 +82,8 @@ func run() error {
 		rrDefaultImpactDelay          = flag.Duration("rr-default-impact-delay", envOrDefaultDuration("RETINA_RR_DEFAULT_IMPACT_DELAY", time.Second), "Default estimated delay between a PD's issuance and its impact on an address")
 		rrDisableResponsibleProbing   = flag.Bool("rr-disable-responsible-probing", envOrDefaultBool("RETINA_RR_DISABLE_RESPONSIBLE_PROBING", false), "Disable the responsible probing constraint (testing only)")
 		rrDisableStaleness            = flag.Bool("rr-disable-staleness", envOrDefaultBool("RETINA_RR_DISABLE_STALENESS", false), "Disable the staleness-based period adjustment (testing only)")
-		rrDisablePeriodAdjustedEvents = flag.Bool("rr-disable-period-adjustment-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_ADJUSTED_EVENTS", false), "Disable emitting period adjusted events")
-		rrDisablePDInsertedEvents     = flag.Bool("rr-disable-pd-inserted-events", envOrDefaultBool("RETINA_RR_DISABLE_PD_INSERTED_EVENTS", false), "Disable emitting PD inserted events")
+		rrDisablePeriodAdjustedEvents = flag.Bool("rr-disable-period-adjustment-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_ADJUSTED_EVENTS", true), "Disable emitting period adjusted events")
+		rrDisablePDInsertedEvents     = flag.Bool("rr-disable-pd-inserted-events", envOrDefaultBool("RETINA_RR_DISABLE_PD_INSERTED_EVENTS", true), "Disable emitting PD inserted events")
 	)
 	flag.Parse()
 
