@@ -7,11 +7,13 @@
 # ForwardingInfoElement derived from that directive.
 #
 # Environment:
-#   RETINA_SECRET   agent secret (required)
-#   RETINA_AGENT_ID      agent identifier            (default: agent_1)
-#   RETINA_SERVER_HOST   orchestrator host           (default: localhost)
-#   RETINA_SERVER_PORT   orchestrator port           (default: 50050)
-#   RETINA_REPLY_ADDRESS hardcoded reply address     (default: 203.0.113.1)
+#   RETINA_SECRET        agent secret (required)
+#   RETINA_AGENT_ID           agent identifier          (default: agent_1)
+#   RETINA_SERVER_HOST        orchestrator host         (default: localhost)
+#   RETINA_SERVER_PORT        orchestrator port         (default: 50050)
+#   RETINA_SOURCE_ADDRESS     agent egress address      (default: 192.0.2.1)
+#   RETINA_NEAR_REPLY_ADDRESS reply address at NearTTL  (default: 203.0.113.1)
+#   RETINA_FAR_REPLY_ADDRESS  reply address at NearTTL+1 (default: 203.0.113.2)
 
 set -euo pipefail
 
@@ -19,7 +21,9 @@ AGENT_ID="${RETINA_AGENT_ID:-agent_1}"
 AGENT_SECRET="${RETINA_SECRET:-}"
 SERVER_HOST="${RETINA_SERVER_HOST:-localhost}"
 SERVER_PORT="${RETINA_SERVER_PORT:-50050}"
-REPLY_ADDRESS="${RETINA_REPLY_ADDRESS:-203.0.113.1}"
+SOURCE_ADDRESS="${RETINA_SOURCE_ADDRESS:-192.0.2.1}"
+NEAR_REPLY_ADDRESS="${RETINA_NEAR_REPLY_ADDRESS:-203.0.113.1}"
+FAR_REPLY_ADDRESS="${RETINA_FAR_REPLY_ADDRESS:-203.0.113.2}"
 
 readonly HANDSHAKE_TIMEOUT=5
 
@@ -171,10 +175,10 @@ while IFS= read -r -u 3 directive; do
 		"$directive_id" \
 		"$ip_version" \
 		"$protocol" \
-		"$REPLY_ADDRESS" \
+		"$SOURCE_ADDRESS" \
 		"$destination" \
-		"$near_ttl" "$REPLY_ADDRESS" "$sent_ts" "$received_ts" \
-		"$far_ttl" "$REPLY_ADDRESS" "$sent_ts" "$received_ts" \
+		"$near_ttl" "$NEAR_REPLY_ADDRESS" "$sent_ts" "$received_ts" \
+		"$far_ttl" "$FAR_REPLY_ADDRESS" "$sent_ts" "$received_ts" \
 		"$production_ts" >&3
 
 	log "pd ${directive_id} ttl ${near_ttl}/${far_ttl} dst ${destination} -> fie sent"

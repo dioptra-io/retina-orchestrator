@@ -104,6 +104,12 @@ type ResearchSchedulerConfig struct {
 	// DefaultImpactDelay is the default delay estimated for a PD's issuance and
 	// it's impact on the address.
 	DefaultImpactDelay time.Duration
+
+	// DisableResponsibleProbing disables responsible probing checks.
+	DisableResponsibleProbing bool
+
+	// DisableStaleness disables the staleness condition.
+	DisableStaleness bool
 }
 
 // initialize populates the zero value fields of ResearchSchedulerConfig with
@@ -137,7 +143,7 @@ func (c *ResearchSchedulerConfig) initialize() { //nolint:gocyclo
 		c.BusyTolerance = 500 * time.Microsecond
 	}
 	if c.StatusInterval == 0 {
-		c.StatusInterval = time.Minute / 30
+		c.StatusInterval = time.Second * 30 // every 30 seconds.
 	}
 	if c.InsertChannelSize == 0 {
 		c.InsertChannelSize = 1024
@@ -738,8 +744,6 @@ func (s *ResearchScheduler) update(fie *api.ForwardingInfoElement) {
 		s.pdsWithFullHistory++
 	}
 
-	// TODO: If we are getting the timestamps in seconds granularity, then this
-	// would be 0. Then the impact deflay would be zero ???
 	if fie.NearInfo != nil {
 		mid := fie.NearInfo.SentTimestamp.Add(fie.NearInfo.ReceivedTimestamp.Sub(fie.NearInfo.SentTimestamp) / 2)
 		rec.impactDelay = mid.Sub(rec.lastIssuedAt).Seconds()
@@ -787,38 +791,55 @@ func (s *ResearchScheduler) reserveAndFloor(addr net.IP, now time.Time, impactDe
 // rule. Finally a new inter-issuance time is sampled and nextIssuance and
 // lastIssuedAt are set.
 func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyclo
-	fmt.Printf("rec.issuancePeriod: %v\n", rec.issuancePeriod)
 	old := rec.issuancePeriod
 	candidate := old
 	rule := PeriodAdjustmentRuleNone
+
+	// --- Staleness (§4.2.2) ---
+	// Applied only once the FIE history is full; then every issuance either
+	// slows down (stable) or speeds up (unstable).
+	//
+	// This needs to be estimated as we discuss in "Catching FIE Changes with
+	// Poisson Process Summary" document.
+	if !s.cfg.DisableStaleness {
+		if rec.histFill == len(rec.history) {
+			if rec.historyStable() {
+				candidate = old * (1 + s.cfg.LearningRate)
+				rule = PeriodAdjustmentRuleStalenessSlowDown
+			} else {
+				candidate = old / (1 + s.cfg.LearningRate)
+				rule = PeriodAdjustmentRuleStalenessSpeedUp
+			}
+		}
+	}
 
 	// --- Responsible probing rpFloorPeriod (§4.2.1, revised) ---
 	// Reserve this issuance's projected impact on both addresses (assumed
 	// same as the previous issuance's, per §4.2.1) and take the tighter of
 	// the two resulting floors for the next issuance.
-	rpFloorPeriod := math.Max(
-		s.reserveAndFloor(rec.lastNear, t, rec.impactDelay),
-		s.reserveAndFloor(rec.lastFar, t, rec.impactDelay),
-	)
-	// rpFloor = 0.0 // disable RP
+	//
+	// rpFloorPeriod: startup-only toggle; flipping DisableResponsibleProbing
+	// mid-run would resume with a stale/missing TAT, silently losing any
+	// unthrottled activity during the disabled window.
+	rpFloorPeriod := 0.0
+	if !s.cfg.DisableResponsibleProbing {
+		rpFloorPeriod = math.Max(
+			s.reserveAndFloor(rec.lastNear, t, rec.impactDelay),
+			s.reserveAndFloor(rec.lastFar, t, rec.impactDelay),
+		)
 
-	// --- Staleness (§4.2.2) ---
-	// Applied only once the FIE history is full; then every issuance either
-	// slows down (stable) or speeds up (unstable).
-	if rec.histFill == len(rec.history) {
-		if rec.historyStable() {
-			candidate = old * (1 + s.cfg.LearningRate)
-			rule = PeriodAdjustmentRuleStalenessSlowDown
-		} else {
-			candidate = old / (1 + s.cfg.LearningRate)
-			rule = PeriodAdjustmentRuleStalenessSpeedUp
+		// --- Enforce the responsible-probing floor last (§4.2.1 precedence) ---
+		// Widened by 1/(1-β): X's worst-case draw is (1-β)·μ, so μ itself must be
+		// raised enough that even the earliest possible sample still respects the
+		// floor, not just the mean (§4.1 sampling interacts with §4.2.1's floor).
+		//
+		// Otherwise 50% of the time for the cases that we need to rise the μ we
+		// would violate the responsible probing constraint.
+		worstCaseFloor := rpFloorPeriod / (1 - s.cfg.SamplingWidth)
+		if candidate < worstCaseFloor {
+			candidate = worstCaseFloor
+			rule = PeriodAdjustmentRuleResponsibleProbing
 		}
-	}
-
-	// --- Enforce the responsible-probing floor last (§4.2.1 precedence) ---
-	if candidate < rpFloorPeriod {
-		candidate = rpFloorPeriod
-		rule = PeriodAdjustmentRuleResponsibleProbing
 	}
 
 	// --- Clamp to [μmin, μmax] (§3.4) ---
@@ -854,8 +875,8 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 		rec.issuancePeriod = candidate
 		s.ebus.Emit(&PeriodAdjustedEvent{
 			ProbingDirectiveID: rec.pdid,
-			PreviousPeriod:     secondsToDuration(old),
-			NewPeriod:          secondsToDuration(candidate),
+			PreviousPeriod:     old,
+			NewPeriod:          candidate,
 			Rule:               rule,
 		})
 	}
@@ -865,7 +886,6 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 	rec.lastIssuedAt = t
 	rec.nextIssuance = t.Add(x)
 	s.totalIssuances++
-
 	// after rec.issuancePeriod is finalized:
 	if rec.issuancePeriod < s.windowMinPeriod {
 		s.windowMinPeriod = rec.issuancePeriod
@@ -873,6 +893,11 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 	if rec.issuancePeriod > s.windowMaxPeriod {
 		s.windowMaxPeriod = rec.issuancePeriod
 	}
+	slog.Info("compute invoked",
+		slog.Float64("old_issuance_period", old),
+		slog.Float64("new_issuance_period", rec.issuancePeriod),
+		slog.Float64("responsible_probing_floor_period", rpFloorPeriod),
+		slog.String("rule", string(rule)))
 }
 
 // sampleInterIssuance samples X ~ Uniform((1 − β)·μ, (1 + β)·μ) (§4.1). The
@@ -899,22 +924,27 @@ func (s *ResearchScheduler) emitStatus() {
 		maxP = secondsToDuration(s.windowMaxPeriod)
 	}
 
+	var aggregateRequestedPeriod float64 = -1
+	if s.sumRate > 0 {
+		aggregateRequestedPeriod = 1 / s.sumRate
+	}
+
 	s.ebus.Emit(&CurrentStatusEvent{
-		CurrentPDCount:            len(s.records),
-		CumulativeInsertions:      s.totalInsertions,
-		CumulativeIssuances:       s.totalIssuances,
-		AggregateRequestedRate:    s.sumRate,
-		AggregateRequestedPeriod:  1 / s.sumRate, // possible division by zero.
-		RealizedRate:              realized,
-		DistinctImpactedAddrs:     len(s.addressTAT),
-		PeriodMin:                 minP.Seconds(),
-		PeriodMax:                 maxP.Seconds(),
-		PDsClampedAtMin:           s.pdsClampedAtMin,
-		PDsClampedAtMax:           s.pdsClampedAtMax,
-		PDsWithFullHistory:        s.pdsWithFullHistory,
-		UpdateChannelOccupancy:    len(s.updateCh),
-		InsertChannelOccupancy:    len(s.insertCh),
-		CumulativeLateOccurrences: s.totalLate,
+		CurrentPDCount:                  len(s.records),
+		CumulativeInsertions:            s.totalInsertions,
+		CumulativeIssuances:             s.totalIssuances,
+		AggregateRequestedRate:          s.sumRate,
+		AggregatePeriodBetweenIssuances: aggregateRequestedPeriod,
+		RealizedRate:                    realized,
+		DistinctImpactedAddrs:           len(s.addressTAT),
+		PeriodMin:                       minP.Seconds(),
+		PeriodMax:                       maxP.Seconds(),
+		PDsClampedAtMin:                 s.pdsClampedAtMin,
+		PDsClampedAtMax:                 s.pdsClampedAtMax,
+		PDsWithFullHistory:              s.pdsWithFullHistory,
+		UpdateChannelOccupancy:          len(s.updateCh),
+		InsertChannelOccupancy:          len(s.insertCh),
+		CumulativeLateOccurrences:       s.totalLate,
 	})
 
 	// reset window

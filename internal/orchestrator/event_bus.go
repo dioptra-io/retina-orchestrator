@@ -93,8 +93,8 @@ const (
 type PeriodAdjustedEvent struct {
 	RetinaBaseEvent
 	ProbingDirectiveID uint64               `json:"probing_directive_id"`
-	PreviousPeriod     time.Duration        `json:"previous_period"`
-	NewPeriod          time.Duration        `json:"new_period"`
+	PreviousPeriod     float64              `json:"previous_period"`
+	NewPeriod          float64              `json:"new_period"`
 	Rule               PeriodAdjustmentRule `json:"rule"`
 }
 
@@ -114,21 +114,21 @@ type SchedulerLateEvent struct {
 // reconstructing state from the per-PD event stream.
 type CurrentStatusEvent struct {
 	RetinaBaseEvent
-	CurrentPDCount            int     `json:"current_pd_count"`
-	CumulativeInsertions      uint64  `json:"cumulative_insertions"`
-	CumulativeIssuances       uint64  `json:"cumulative_issuances"`
-	AggregateRequestedRate    float64 `json:"aggregate_requested_rate"`   // Σ rᵢ = Σ 1/μᵢ, per second
-	AggregateRequestedPeriod  float64 `json:"aggregate_requested_period"` // 1 / Σ rᵢ
-	RealizedRate              float64 `json:"realized_rate"`              // issuances over the last interval, per second
-	DistinctImpactedAddrs     int     `json:"distinct_impacted_addrs"`
-	PeriodMin                 float64 `json:"period_min"`
-	PeriodMax                 float64 `json:"period_max"`
-	PDsClampedAtMin           int     `json:"pds_clamped_at_min"`
-	PDsClampedAtMax           int     `json:"pds_clamped_at_max"`
-	PDsWithFullHistory        int     `json:"pds_with_full_history"`
-	UpdateChannelOccupancy    int     `json:"update_channel_occupancy"`
-	InsertChannelOccupancy    int     `json:"insert_channel_occupancy"`
-	CumulativeLateOccurrences uint64  `json:"cumulative_late_occurrences"`
+	CurrentPDCount                  int     `json:"current_pd_count"`
+	CumulativeInsertions            uint64  `json:"cumulative_insertions"`
+	CumulativeIssuances             uint64  `json:"cumulative_issuances"`
+	AggregateRequestedRate          float64 `json:"aggregate_requested_rate"`           // Σ rᵢ = Σ 1/μᵢ, per second
+	AggregatePeriodBetweenIssuances float64 `json:"aggregate_period_between_issuances"` // 1 / Σ rᵢ
+	RealizedRate                    float64 `json:"realized_rate"`                      // issuances over the last interval, per second
+	DistinctImpactedAddrs           int     `json:"distinct_impacted_addrs"`
+	PeriodMin                       float64 `json:"period_min"`
+	PeriodMax                       float64 `json:"period_max"`
+	PDsClampedAtMin                 int     `json:"pds_clamped_at_min"`
+	PDsClampedAtMax                 int     `json:"pds_clamped_at_max"`
+	PDsWithFullHistory              int     `json:"pds_with_full_history"`
+	UpdateChannelOccupancy          int     `json:"update_channel_occupancy"`
+	InsertChannelOccupancy          int     `json:"insert_channel_occupancy"`
+	CumulativeLateOccurrences       uint64  `json:"cumulative_late_occurrences"`
 }
 
 // ---------------------------------------------------------------------------

@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"slices"
 	"time"
 
@@ -175,6 +174,7 @@ func NewOrchestrator(config *Config, logger *slog.Logger, metrics *Metrics) (*Or
 		readHeaderTimeout: config.APIReadHeaderTimeout,
 		fieHandler:        o.fieStreamHandler,
 		sseHandler:        o.sseHandler,
+		insertHandler:     o.insertHandler,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("error on creating API server: %w", err)
@@ -206,30 +206,6 @@ func (o *Orchestrator) Run(parentCtx context.Context) error {
 }
 
 func (o *Orchestrator) runScheduler(ctx context.Context) error {
-	// Read the PDs from the file and feed it to the scheduler.
-	go func() {
-		time.Sleep(time.Second * 5)
-		fmt.Println("insering PD")
-		for range 1 { // test this for 1 PDs.
-			_, _ = o.scheduler.Insert(&api.ProbingDirective{
-				ProbingDirectiveID: 0,
-				IPVersion:          api.IPv4,
-				Protocol:           api.ICMP,
-				AgentID:            "agent_1",
-				DestinationAddress: net.ParseIP("1.1.1.1"),
-				NearTTL:            5,
-				NextHeader: api.NextHeader{
-					ICMPNextHeader: &api.ICMPNextHeader{
-						FirstHalfWord:  0,
-						SecondHalfWord: 0,
-					},
-				},
-			})
-		}
-
-		fmt.Println("Added all of the PDs!")
-	}()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -356,6 +332,10 @@ func (o *Orchestrator) sseHandler(s *sseClient) {
 			return
 		}
 	}
+}
+
+func (o *Orchestrator) insertHandler(pd *api.ProbingDirective) (uint64, error) {
+	return o.scheduler.Insert(pd)
 }
 
 //nolint:funlen

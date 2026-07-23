@@ -27,6 +27,7 @@ type SequencedFIE struct {
 
 type fieHandleFunc func(s *fieClient)
 type sseHandleFunc func(s *sseClient)
+type insertHanleFunc func(*api.ProbingDirective) (uint64, error)
 
 type apiServerConfig struct {
 	// address is the TCP listening address in the form "host:port".
@@ -35,6 +36,8 @@ type apiServerConfig struct {
 	readHeaderTimeout time.Duration
 	fieHandler        fieHandleFunc
 	sseHandler        sseHandleFunc
+	insertHandler     insertHanleFunc
+
 	// eventBuffer is the ring buffer for SSE events.
 	logger *slog.Logger
 }
@@ -51,6 +54,12 @@ func newAPIServer(config *apiServerConfig) (*apiServer, error) {
 	if config.fieHandler == nil {
 		return nil, fmt.Errorf("fieHandler cannot be nil")
 	}
+	if config.insertHandler == nil {
+		return nil, fmt.Errorf("insertHandler cannot be nil")
+	}
+	if config.sseHandler == nil {
+		return nil, fmt.Errorf("sseHandler cannot be nil")
+	}
 	if config.logger == nil {
 		config.logger = slog.Default()
 	}
@@ -62,9 +71,9 @@ func newAPIServer(config *apiServerConfig) (*apiServer, error) {
 	}
 
 	mux := http.NewServeMux()
-	if config.sseHandler != nil {
-		mux.HandleFunc("/api/v1/sse", s.handleSSE)
-	}
+
+	mux.HandleFunc("/api/v1/sse", s.handleSSE)
+	mux.HandleFunc("/api/v1/pds", s.handleBulkInsert)
 	mux.HandleFunc("/api/v1/stream", s.handleStream)
 	mux.HandleFunc("/api/v1/swagger/", httpSwagger.WrapHandler)
 
@@ -173,6 +182,65 @@ func (s *apiServer) removeClient(client *fieClient) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	delete(s.clients, client)
+}
+
+// BulkInsertRequest is the payload for admitting multiple PDs in one call.
+type BulkInsertRequest struct {
+	ProbingDirectives []*api.ProbingDirective `json:"probing_directives"`
+}
+
+// BulkInsertResponse reports the result of a bulk insertion. AssignedIDs is
+// in the same order as the request's ProbingDirectives.
+type BulkInsertResponse struct {
+	InsertedCount int      `json:"inserted_count"`
+	AssignedIDs   []uint64 `json:"assigned_ids"`
+}
+
+// @Summary		Bulk-insert probing directives
+// @Description	Admits multiple PDs into the scheduler in one call, blocking until each is handed off. Aborts on the first insertion error (e.g. scheduler shutdown) and reports how many succeeded.
+// @Tags			pds
+// @Accept			json
+// @Produce		json
+// @Success		200	{object}	BulkInsertResponse
+// @Failure		400	{string}	string	"invalid request body"
+// @Failure		500	{string}	string	"internal server error"
+// @Router			/pds [post]
+func (s *apiServer) handleBulkInsert(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req BulkInsertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if len(req.ProbingDirectives) == 0 {
+		http.Error(w, "probing_directives must not be empty", http.StatusBadRequest)
+		return
+	}
+
+	ids := make([]uint64, 0, len(req.ProbingDirectives))
+	for _, pd := range req.ProbingDirectives {
+		id, err := s.config.insertHandler(pd)
+		if err != nil {
+			s.logger.Error("bulk insert aborted", slog.Int("inserted", len(ids)), slog.Any("error", err))
+			break
+		}
+		ids = append(ids, id)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if len(ids) < len(req.ProbingDirectives) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	if err := json.NewEncoder(w).Encode(&BulkInsertResponse{
+		InsertedCount: len(ids),
+		AssignedIDs:   ids,
+	}); err != nil {
+		s.logger.Error("failed to encode bulk insert response", slog.Any("error", err))
+	}
 }
 
 type fieClient struct {
