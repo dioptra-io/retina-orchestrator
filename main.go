@@ -70,7 +70,7 @@ func run() error {
 		rrMaxIssuancePeriod           = flag.Duration("rr-max-issuance-period", envOrDefaultDuration("RETINA_RR_MAX_ISSUANCE_PERIOD", 12*time.Hour), "Maximum issuance period (μmax)")
 		rrAdmissionRate               = flag.Float64("rr-admission-rate", envOrDefaultFloat64("RETINA_RR_ADMISSION_RATE", 1000), "Admission rate (r₀) for pacing newly inserted PDs' first issuance")
 		rrStartingIssuancePeriod      = flag.Duration("rr-starting-issuance-period", envOrDefaultDuration("RETINA_RR_STARTING_ISSUANCE_PERIOD", time.Second*10), "Starting issuance period (Μ) assigned at admission")
-		rrStatusInterval              = flag.Duration("rr-status-interval", envOrDefaultDuration("RETINA_RR_STATUS_INTERVAL", time.Minute), "Interval between CurrentStatus event emissions")
+		rrStatusInterval              = flag.Duration("rr-status-interval", envOrDefaultDuration("RETINA_RR_STATUS_INTERVAL", 20*time.Second), "Interval between CurrentStatus event emissions")
 		rrInsertChannelSize           = flag.Int("rr-insert-channel-size", envOrDefaultInt("RETINA_RR_INSERT_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's insert channel")
 		rrUpdateChannelSize           = flag.Int("rr-update-channel-size", envOrDefaultInt("RETINA_RR_UPDATE_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's FIE update channel")
 		rrLatenessTolerance           = flag.Duration("rr-lateness-tolerance", envOrDefaultDuration("RETINA_RR_LATENESS_TOLERANCE", 25*time.Millisecond), "Slack below which an issuance is not considered late")
