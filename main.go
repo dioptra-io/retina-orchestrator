@@ -71,6 +71,7 @@ func run() error {
 		rrAdmissionRate               = flag.Float64("rr-admission-rate", envOrDefaultFloat64("RETINA_RR_ADMISSION_RATE", 1000), "Admission rate (r₀) for pacing newly inserted PDs' first issuance")
 		rrStartingIssuancePeriod      = flag.Duration("rr-starting-issuance-period", envOrDefaultDuration("RETINA_RR_STARTING_ISSUANCE_PERIOD", time.Second*10), "Starting issuance period (Μ) assigned at admission")
 		rrStatusInterval              = flag.Duration("rr-status-interval", envOrDefaultDuration("RETINA_RR_STATUS_INTERVAL", 20*time.Second), "Interval between CurrentStatus event emissions")
+		rrPeriodDumpInterval          = flag.Duration("rr-period-dump-interval", envOrDefaultDuration("RETINA_RR_PERIOD_DUMP_INTERVAL", 20*time.Second), "Interval between PeriodDump event emissions")
 		rrInsertChannelSize           = flag.Int("rr-insert-channel-size", envOrDefaultInt("RETINA_RR_INSERT_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's insert channel")
 		rrUpdateChannelSize           = flag.Int("rr-update-channel-size", envOrDefaultInt("RETINA_RR_UPDATE_CHANNEL_SIZE", 1024), "Buffer size of the research scheduler's FIE update channel")
 		rrLatenessTolerance           = flag.Duration("rr-lateness-tolerance", envOrDefaultDuration("RETINA_RR_LATENESS_TOLERANCE", 25*time.Millisecond), "Slack below which an issuance is not considered late")
@@ -84,6 +85,7 @@ func run() error {
 		rrDisableStaleness            = flag.Bool("rr-disable-staleness", envOrDefaultBool("RETINA_RR_DISABLE_STALENESS", false), "Disable the staleness-based period adjustment (testing only)")
 		rrDisablePeriodAdjustedEvents = flag.Bool("rr-disable-period-adjustment-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_ADJUSTED_EVENTS", true), "Disable emitting period adjusted events")
 		rrDisablePDInsertedEvents     = flag.Bool("rr-disable-pd-inserted-events", envOrDefaultBool("RETINA_RR_DISABLE_PD_INSERTED_EVENTS", true), "Disable emitting PD inserted events")
+		rrDisablePeriodDumpEvents     = flag.Bool("rr-disable-period-dump-events", envOrDefaultBool("RETINA_RR_DISABLE_PERIOD_DUMP_EVENTS", false), "Disable emitting period dump events")
 	)
 	flag.Parse()
 
@@ -125,6 +127,7 @@ func run() error {
 			AdmissionRate:               *rrAdmissionRate,
 			StartingIssuancePeriod:      *rrStartingIssuancePeriod,
 			StatusInterval:              *rrStatusInterval,
+			PeriodDumpInterval:          *rrPeriodDumpInterval,
 			InsertChannelSize:           *rrInsertChannelSize,
 			UpdateChannelSize:           *rrUpdateChannelSize,
 			LatenessTolerance:           *rrLatenessTolerance,
@@ -138,6 +141,7 @@ func run() error {
 			DisableStaleness:            *rrDisableStaleness,
 			DisablePeriodAdjustedEvents: *rrDisablePeriodAdjustedEvents,
 			DisablePDInsertedEvents:     *rrDisablePDInsertedEvents,
+			DisablePeriodDumps:          *rrDisablePeriodDumpEvents,
 		},
 	}, logger, metrics)
 	if err != nil {

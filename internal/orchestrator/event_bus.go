@@ -105,6 +105,12 @@ type PDBulkInsertionEvent struct {
 	PDs    []*api.ProbingDirective `json:"pds"`
 }
 
+type PeriodDumpEvent struct {
+	RetinaBaseEvent
+	NumPDs          int       `json:"num_pds"`
+	IssuancePeriods []float64 `json:"issuance_periods"` // maps uint64 -> float64
+}
+
 // PeriodAdjustmentRule identifies which rule produced a period change (§4.2,
 // §3.4). PeriodAdjustmentRuleNone is the zero value, used internally when no
 // rule changed the period (no event is emitted in that case).

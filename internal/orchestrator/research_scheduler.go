@@ -22,10 +22,11 @@ import (
 	"math"
 	"math/rand"
 	"net"
-	"sync/atomic"
 	"time"
 
 	api "github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
+	"golang.org/x/sync/errgroup"
 )
 
 // ---------------------------------------------------------------------------
@@ -70,8 +71,12 @@ type ResearchSchedulerConfig struct {
 	StartingIssuancePeriod time.Duration `json:"starting_issuance_period"`
 
 	// StatusInterval is Tstatus, the CurrentStatus emission interval
-	// (§5.5). Default: 1 minute.
+	// (§5.5). Default: 10 seconds.
 	StatusInterval time.Duration `json:"status_interval"`
+
+	// PeriodDumpInterval is Tperiod, the current period dump of all inserted PDs.
+	// Default: 5 minutes.
+	PeriodDumpInterval time.Duration `json:"period_interval"`
 
 	// InsertChannelSize and FIEChannelSize size the internal channels
 	// (§5.1). Insert and Update block when the corresponding channel is
@@ -116,6 +121,9 @@ type ResearchSchedulerConfig struct {
 
 	// DisablePDInsertedEvents disables the PDInserted events.
 	DisablePDInsertedEvents bool `json:"disable_pd_inserted_events"`
+
+	// DisablePeriodDumps disables the PeriodDump events.
+	DisablePeriodDumps bool `json:"disable_period_dumps"`
 }
 
 // validate checks the configuration and returns an error describing the
@@ -152,6 +160,9 @@ func (c *ResearchSchedulerConfig) validate() error { //nolint:gocyclo
 	}
 	if c.StatusInterval <= 0 {
 		return fmt.Errorf("status interval (Tstatus) must be positive: %v", c.StatusInterval)
+	}
+	if c.PeriodDumpInterval <= 0 {
+		return fmt.Errorf("period dump interval (Tperiod) must be positive: %v", c.PeriodDumpInterval)
 	}
 	if c.LatenessTolerance <= 0 {
 		return fmt.Errorf("lateness tolerance must be positive: %v", c.LatenessTolerance)
@@ -315,12 +326,11 @@ type ResearchScheduler struct {
 	// §4.2.1 revised: theoretical arrival time per address
 	addressTAT map[addrKey]time.Time
 
-	nextID atomic.Uint64
-
 	// insertCh and fieCh are the internal channels of §5.1.
 	insertCh     chan *api.ProbingDirective
 	updateCh     chan *api.ForwardingInfoElement
 	statusTicker *time.Ticker
+	periodTicker *time.Ticker
 	ctx          context.Context
 	cancel       context.CancelFunc
 
@@ -343,6 +353,9 @@ type ResearchScheduler struct {
 
 	totalUpdates        uint64
 	updatesAtLastStatus uint64
+
+	// Period counters for concurrent access.
+	periodArray *structures.AtomicFloat64Array
 }
 
 var _ Scheduler = (*ResearchScheduler)(nil)
@@ -374,12 +387,14 @@ func NewResearchScheduler(config *ResearchSchedulerConfig, logger *slog.Logger, 
 		insertCh:           make(chan *api.ProbingDirective, config.InsertChannelSize),
 		updateCh:           make(chan *api.ForwardingInfoElement, config.UpdateChannelSize),
 		statusTicker:       time.NewTicker(config.StatusInterval),
+		periodTicker:       time.NewTicker(config.PeriodDumpInterval),
 		ctx:                ctx,
 		cancel:             cancel,
 		lastStatusEmission: time.Now(),
 		ebus:               ebus,
 		windowMinPeriod:    math.Inf(1),
 		windowMaxPeriod:    math.Inf(-1),
+		periodArray:        structures.NewAtomicFloat64Array(config.InitialQueueSize),
 	}
 
 	s.logger.Info("Research scheduler initialized",
@@ -393,6 +408,19 @@ func NewResearchScheduler(config *ResearchSchedulerConfig, logger *slog.Logger, 
 		slog.Bool("disable_responsible_probing", config.DisableResponsibleProbing),
 		slog.Bool("disable_staleness", config.DisableStaleness))
 
+	// This separate thread dumps all the info about the periods.
+	g, gCtx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		for range s.periodTicker.C {
+			if err := s.periodicDump(gCtx); err != nil {
+				s.logger.Warn("Periodic dump routine exitted with error",
+					slog.String("err", err.Error()))
+				return err
+			}
+		}
+		return nil
+	})
+
 	return s, nil
 }
 
@@ -401,11 +429,12 @@ func NewResearchScheduler(config *ResearchSchedulerConfig, logger *slog.Logger, 
 // ---------------------------------------------------------------------------
 
 func (s *ResearchScheduler) Insert(req *api.ProbingDirective) (uint64, error) {
-	// ID starts from 0.
-	id := s.nextID.Add(1) - 1
+	id := uint64(s.periodArray.Add(s.cfg.StartingIssuancePeriod.Seconds())) //nolint:gosec
 	req.ProbingDirectiveID = id
 
 	// Any validation etc?
+
+	// We are also missin the admission rate limiter. TODO
 
 	select {
 	case s.insertCh <- req:
@@ -473,6 +502,7 @@ func (s *ResearchScheduler) Update(fie *api.ForwardingInfoElement) error {
 
 func (s *ResearchScheduler) Close() error {
 	s.statusTicker.Stop()
+	s.periodTicker.Stop()
 	s.cancel()
 	return nil
 }
@@ -660,6 +690,7 @@ func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
 	s.totalInsertions++
 
 	rec.issuancePeriod = s.cfg.StartingIssuancePeriod.Seconds()
+	s.periodArray.Set(int(rec.pdid), rec.issuancePeriod) //nolint:gosec
 	s.sumRate += 1 / rec.issuancePeriod
 	if rec.issuancePeriod == s.cfg.MinIssuancePeriod.Seconds() {
 		s.pdsClampedAtMin++
@@ -865,6 +896,7 @@ func (s *ResearchScheduler) compute(rec *pdRecord, t time.Time) { //nolint:gocyc
 			})
 		}
 	}
+	s.periodArray.Set(int(rec.pdid), rec.issuancePeriod) //nolint:gosec
 	// --- Sample X and reschedule (§4.1) ---
 	x := s.sampleInterIssuance(rec.issuancePeriod)
 	rec.lastIssuedAt = t
@@ -938,6 +970,25 @@ func (s *ResearchScheduler) emitStatus() {
 	s.lastStatusEmission = now
 }
 
+// periodicDump emits the period information of all PDs in one dump. This is
+// being called by a separate goroutine. It is readonly so no race.
+func (s *ResearchScheduler) periodicDump(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.periodTicker.C:
+			periods := s.periodArray.Dump()
+
+			if !s.cfg.DisablePeriodDumps {
+				s.ebus.Emit(&PeriodDumpEvent{
+					NumPDs:          len(periods),
+					IssuancePeriods: periods,
+				})
+			}
+		}
+	}
+}
 func secondsToDuration(sec float64) time.Duration {
 	return time.Duration(sec * float64(time.Second))
 }
