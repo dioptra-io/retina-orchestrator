@@ -1,0 +1,17 @@
+name: Build
+on:
+  push:
+    branches: [main, dev, 'research', 'research/**']
+    tags: ['v*.*.*']
+  workflow_dispatch:
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dioptra-io/publish-docker-action@v1
+        with:
+          file: ./Dockerfile
+          image: dioptra-io/retina-orchestrator
+          password: ${{ secrets.GITHUB_TOKEN }}
+          push: true
