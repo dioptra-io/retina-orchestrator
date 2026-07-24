@@ -315,6 +315,7 @@ func (o *Orchestrator) sseHandler(s *sseClient) {
 	prevSeq := uint64(0)
 	for {
 		eventEnvelope, seq, err := consumer.Pop(s.context())
+		prevSeq++
 		if err != nil {
 			return
 		}
@@ -323,7 +324,7 @@ func (o *Orchestrator) sseHandler(s *sseClient) {
 				slog.Uint64("current_seq", seq),
 				slog.Uint64("previous_seq", prevSeq))
 		}
-		prevSeq++ // increment to keep up with the seq.
+		prevSeq = seq // set prevSeq to seq to prevent infinite warnings.
 
 		// Send the event to the sseClient.
 		if err := s.sendEvent(eventEnvelope.RetinaEvent); err != nil {
@@ -388,7 +389,7 @@ func (o *Orchestrator) agentHandler(status *agentAuthStatus, s *agentStream) {
 				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.agentID, "err", err)
 			}
 
-			allow, err := o.filterFIE(fie)
+			allow, err := o.allowFIE(fie)
 			if err != nil {
 				return fmt.Errorf("error on filtering FIE: %w", err)
 			}
@@ -444,9 +445,9 @@ func (o *Orchestrator) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
 	}
 }
 
-// filterFIE reports whether a FIE should be streamed based on the policy.
+// allowFIE reports whether a FIE should be streamed based on the policy.
 // Returns true if the FIE is allowed.
-func (o *Orchestrator) filterFIE(fie *api.ForwardingInfoElement) (bool, error) {
+func (o *Orchestrator) allowFIE(fie *api.ForwardingInfoElement) (bool, error) {
 	switch o.config.FIEFilterPolicy {
 	case "any": // allow all FIEs
 		return true, nil
