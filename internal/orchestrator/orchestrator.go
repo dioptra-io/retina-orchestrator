@@ -312,19 +312,18 @@ func (o *Orchestrator) sseHandler(s *sseClient) {
 		o.logger.Debug("SSE stream closed", slog.String("reason", closeReason))
 	}()
 
-	prevSeq := uint64(0)
+	nextSeq := uint64(0)
 	for {
 		eventEnvelope, seq, err := consumer.Pop(s.context())
-		prevSeq++
 		if err != nil {
 			return
 		}
-		if prevSeq != seq {
+		if nextSeq != seq {
 			o.logger.Warn("One or more events are skipped on SSE handler",
 				slog.Uint64("current_seq", seq),
-				slog.Uint64("previous_seq", prevSeq))
+				slog.Uint64("previous_seq", nextSeq))
 		}
-		prevSeq = seq // set prevSeq to seq to prevent infinite warnings.
+		nextSeq = seq + 1
 
 		// Send the event to the sseClient.
 		if err := s.sendEvent(eventEnvelope.RetinaEvent); err != nil {

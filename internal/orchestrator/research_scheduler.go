@@ -22,6 +22,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"sync"
 	"time"
 
 	api "github.com/dioptra-io/retina-commons/api/v1"
@@ -337,6 +338,7 @@ type ResearchScheduler struct {
 	// bucketNext is the token bucket state for admission pacing (§5.6): the
 	// earliest time the next admitted PD may be first-issued.
 	bucketNext time.Time
+	bucketMu   sync.Mutex
 
 	// Counters for CurrentStatus (§5.5).
 	totalInsertions       uint64
@@ -432,9 +434,30 @@ func (s *ResearchScheduler) Insert(req *api.ProbingDirective) (uint64, error) {
 	id := uint64(s.periodArray.Add(s.cfg.StartingIssuancePeriod.Seconds())) //nolint:gosec
 	req.ProbingDirectiveID = id
 
-	// Any validation etc?
+	// TODO: Any validation etc?
 
-	// We are also missin the admission rate limiter. TODO
+	// Token bucket with rate r₀ and capacity one token (§5.6): the first
+	// issuance time is the later of now and the bucket's next-available
+	// time, which then advances by 1/r₀.
+	s.bucketMu.Lock()
+	now := time.Now()
+	first := s.bucketNext
+	if now.After(first) {
+		first = now
+	}
+	s.bucketNext = first.Add(time.Duration(float64(time.Second) / s.cfg.AdmissionRate))
+	sleep := time.Until(first)
+
+	if sleep > s.cfg.BusyTolerance {
+		time.Sleep(sleep - s.cfg.BusyTolerance)
+	}
+
+	for time.Now().Before(first) {
+	}
+
+	// Putting the mutex after the wait ensures a general admission rate rather
+	// than per requests one.
+	s.bucketMu.Unlock()
 
 	select {
 	case s.insertCh <- req:
@@ -665,15 +688,6 @@ func (s *ResearchScheduler) wait(d time.Time) error { //nolint:gocyclo
 func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
 	now := time.Now()
 
-	// Token bucket with rate r₀ and capacity one token (§5.6): the first
-	// issuance time is the later of now and the bucket's next-available
-	// time, which then advances by 1/r₀.
-	first := s.bucketNext
-	if now.After(first) {
-		first = now
-	}
-	s.bucketNext = first.Add(time.Duration(float64(time.Second) / s.cfg.AdmissionRate))
-
 	// μᵢ = Μ (§4.3) but sampled.
 	issuancePeriod := s.sampleInterIssuance(s.cfg.StartingIssuancePeriod.Seconds()).Seconds()
 
@@ -681,7 +695,7 @@ func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
 		pdid:           pd.ProbingDirectiveID,
 		pd:             pd,
 		issuancePeriod: issuancePeriod,
-		nextIssuance:   first,
+		nextIssuance:   now.Add(secondsToDuration(issuancePeriod)),
 		history:        make([]fieObservation, s.cfg.FIEHistoryCapacity), // Fixed-capacity FIE ring buffer, allocated once at admission (§5.4).
 		impactDelay:    s.cfg.DefaultImpactDelay.Seconds(),
 	}
@@ -702,7 +716,7 @@ func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
 	if !s.cfg.DisablePDInsertedEvents {
 		s.ebus.Emit(&PDInsertedEvent{
 			ProbingDirectiveID: pd.ProbingDirectiveID,
-			FirstIssuanceTime:  first,
+			FirstIssuanceTime:  rec.nextIssuance,
 			CurrentPDCount:     len(s.records),
 		})
 	}
