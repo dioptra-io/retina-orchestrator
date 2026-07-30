@@ -696,6 +696,9 @@ func (s *ResearchScheduler) insert(pd *api.ProbingDirective) {
 	// μᵢ = Μ (§4.3) but sampled.
 	issuancePeriod := s.sampleInterIssuance(s.cfg.StartingIssuancePeriod.Seconds()).Seconds()
 
+	// μᵢ = Μ (§4.3) but sampled.
+	issuancePeriod := s.sampleInterIssuance(s.cfg.StartingIssuancePeriod.Seconds()).Seconds()
+
 	rec := &pdRecord{
 		pdid:           pd.ProbingDirectiveID,
 		pd:             pd,
