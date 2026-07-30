@@ -125,6 +125,9 @@ type ResearchSchedulerConfig struct {
 
 	// DisablePeriodDumps disables the PeriodDump events.
 	DisablePeriodDumps bool `json:"disable_period_dumps"`
+
+	// DisableSchedulerLateEvents disables the SchedulerLate events.
+	DisableSchedulerLateEvents bool `json:"disable_scheduler_late_events"`
 }
 
 // validate checks the configuration and returns an error describing the
@@ -497,13 +500,15 @@ func (s *ResearchScheduler) Next() (*api.ProbingDirective, error) {
 
 		if now.Sub(rec.nextIssuance) > s.cfg.LatenessTolerance {
 			s.totalLate++
-			s.ebus.Emit(&SchedulerLateEvent{
-				ProbingDirectiveID: rec.pdid,
-				ScheduledTime:      rec.nextIssuance,
-				ActualTime:         now,
-			})
-		}
 
+			if !s.cfg.DisableSchedulerLateEvents {
+				s.ebus.Emit(&SchedulerLateEvent{
+					ProbingDirectiveID: rec.pdid,
+					ScheduledTime:      rec.nextIssuance,
+					ActualTime:         now,
+				})
+			}
+		}
 		s.compute(rec, now)
 		heap.Push(&s.queue, rec)
 
