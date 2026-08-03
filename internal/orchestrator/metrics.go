@@ -103,8 +103,8 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 		}, []string{"agent_id"}),
 		PDsUnusedTotal: factory.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "retina_orchestrator_pds_unused_total",
-			Help: "Current number of probing directives in the unused pool, labeled by agent ID.",
-		}, []string{"agent_id"}),
+			Help: "Current number of probing directives in the unused pool, labeled by IP version (4 or 6).",
+		}, []string{"ip_version"}),
 		PDsActiveTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Name: "retina_orchestrator_pds_active_total",
 			Help: "Current number of probing directives in the active set.",

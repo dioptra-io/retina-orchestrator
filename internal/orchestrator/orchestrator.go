@@ -43,9 +43,9 @@ type Config struct {
 	Secret string
 
 	// Scheduler parameters
-	PDPath       string
+	PDPathV4     string
+	PDPathV6     string
 	IssuanceRate float64
-
 	// ImpactThreshold is the maximum allowed probe rate (probes/second) on any
 	// single address in the responsible probing algorithm.
 	ImpactThreshold            float64
@@ -81,8 +81,13 @@ func (c *Config) Validate() error {
 	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
 		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
 	}
-	if c.PDPath == "" {
-		return fmt.Errorf("PDPath cannot be empty")
+	return c.validateSchedulerConfig()
+}
+
+// validateSchedulerConfig checks scheduler-specific configuration fields.
+func (c *Config) validateSchedulerConfig() error {
+	if c.PDPathV4 == "" && c.PDPathV6 == "" {
+		return fmt.Errorf("at least one of PDPathV4 or PDPathV6 must be provided")
 	}
 	if c.IssuanceRate <= 0 {
 		return fmt.Errorf("IssuanceRate must be greater than zero: got %f", c.IssuanceRate)
@@ -135,7 +140,8 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	scheduler, err := NewScheduler(&SchedulerConfig{
 		Seed:                       config.Seed,
 		IssuanceRate:               config.IssuanceRate,
-		PDPath:                     config.PDPath,
+		PDPathV4:                   config.PDPathV4,
+		PDPathV6:                   config.PDPathV6,
 		ActiveSetSize:              config.ActiveSetSize,
 		ConsecutiveMissesThreshold: config.ConsecutiveMissesThreshold,
 		MaxEvictions:               config.MaxEvictions,

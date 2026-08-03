@@ -13,7 +13,7 @@ import (
 
 // Coverage is ~99%: the only uncovered branch is the `newRandomizer` error path
 // in NewScheduler, which is unreachable — indices is guaranteed non-empty by the
-// `len(pds) == 0` guard directly above it.
+// `len(v4pds) == 0 && len(v6pds) == 0` guard directly above it.
 
 // -- helpers ------------------------------------------------------------------
 
@@ -39,7 +39,15 @@ func writeSchedulerPDFile(t *testing.T, pds []*api.ProbingDirective) string {
 }
 
 func makePD(id uint64) *api.ProbingDirective {
-	return &api.ProbingDirective{ProbingDirectiveID: id}
+	return &api.ProbingDirective{ProbingDirectiveID: id, IPVersion: api.IPv4}
+}
+
+func makePDV4(id uint64) *api.ProbingDirective {
+	return &api.ProbingDirective{ProbingDirectiveID: id, IPVersion: api.IPv4}
+}
+
+func makePDV6(id uint64) *api.ProbingDirective {
+	return &api.ProbingDirective{ProbingDirectiveID: id, IPVersion: api.IPv6}
 }
 
 // makeFIEFull creates a FIE with both near and far replies — considered yielding.
@@ -58,11 +66,23 @@ func makeFIETimeout(id uint64) *api.ForwardingInfoElement {
 
 func newTestSchedulerConfig(t *testing.T, pds []*api.ProbingDirective) *SchedulerConfig {
 	t.Helper()
+	// Split pds by IP version for the two-file approach.
+	var v4pds, v6pds []*api.ProbingDirective
+	for _, pd := range pds {
+		if pd.IPVersion == api.IPv6 {
+			v6pds = append(v6pds, pd)
+		} else {
+			v4pds = append(v4pds, pd)
+		}
+	}
+	// ActiveSetSize * 2 ensures all PDs go into the active set regardless of
+	// protocol split — halfActive = len(pds), so all PDs from each file are active.
 	return &SchedulerConfig{
 		Seed:                       42,
 		IssuanceRate:               1000.0,
-		PDPath:                     writeSchedulerPDFile(t, pds),
-		ActiveSetSize:              len(pds),
+		PDPathV4:                   writeSchedulerPDFile(t, v4pds),
+		PDPathV6:                   writeSchedulerPDFile(t, v6pds),
+		ActiveSetSize:              len(pds) * 2,
 		ConsecutiveMissesThreshold: 100, // high threshold so tests don't trigger replacement unexpectedly
 		MaxEvictions:               3,
 	}
@@ -77,13 +97,33 @@ func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
 	return s
 }
 
+// newTestSchedulerWithConfig creates a scheduler with explicit V4 file and config.
+// V6 pool is empty — use newTestScheduler for mixed protocol tests.
+//
+//nolint:unparam // activeSetSize is always 1 in current tests but is a meaningful parameter
+func newTestSchedulerWithConfig(t *testing.T, v4pds []*api.ProbingDirective, activeSetSize, missingThreshold, maxEvictions int) *Scheduler {
+	t.Helper()
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       42,
+		IssuanceRate:               1000.0,
+		PDPathV4:                   writeSchedulerPDFile(t, v4pds),
+		ActiveSetSize:              activeSetSize,
+		ConsecutiveMissesThreshold: missingThreshold,
+		MaxEvictions:               maxEvictions,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return s
+}
+
 // -- NewScheduler -------------------------------------------------------------
 
 func TestNewScheduler_InvalidRate(t *testing.T) {
 	t.Parallel()
 	for _, rate := range []float64{0, -1} {
 		_, err := NewScheduler(&SchedulerConfig{
-			Seed: 0, IssuanceRate: rate, PDPath: "irrelevant",
+			Seed: 0, IssuanceRate: rate, PDPathV4: "irrelevant",
 			ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
 		}, nil, testMetrics())
 		if err == nil {
@@ -92,25 +132,104 @@ func TestNewScheduler_InvalidRate(t *testing.T) {
 	}
 }
 
-func TestNewScheduler_MissingFile(t *testing.T) {
+func TestNewScheduler_BothFilesMissing(t *testing.T) {
 	t.Parallel()
 	_, err := NewScheduler(&SchedulerConfig{
-		Seed: 0, IssuanceRate: 1.0, PDPath: "/nonexistent/path.jsonl",
+		Seed: 0, IssuanceRate: 1.0, PDPathV4: "/nonexistent/v4.jsonl", PDPathV6: "/nonexistent/v6.jsonl",
 		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
 	}, testLogger(), testMetrics())
 	if err == nil {
-		t.Fatal("expected error for missing file, got nil")
+		t.Fatal("expected error for missing files, got nil")
 	}
 }
 
-func TestNewScheduler_EmptyFile(t *testing.T) {
+func TestNewScheduler_EmptyFiles(t *testing.T) {
 	t.Parallel()
 	_, err := NewScheduler(&SchedulerConfig{
-		Seed: 0, IssuanceRate: 1.0, PDPath: writeSchedulerPDFile(t, nil),
-		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+		Seed: 0, IssuanceRate: 1.0,
+		PDPathV4:                   writeSchedulerPDFile(t, nil),
+		PDPathV6:                   writeSchedulerPDFile(t, nil),
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
 	}, testLogger(), testMetrics())
 	if err == nil {
-		t.Fatal("expected error for empty directive file, got nil")
+		t.Fatal("expected error for empty files, got nil")
+	}
+}
+
+func TestNewScheduler_BadV6File(t *testing.T) {
+	t.Parallel()
+	_, err := NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0,
+		PDPathV6:                   "/nonexistent/v6.jsonl",
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err == nil {
+		t.Fatal("expected error for missing V6 file, got nil")
+	}
+}
+
+func TestNewScheduler_V6UnusedPool(t *testing.T) {
+	t.Parallel()
+	// Three V6 PDs with ActiveSetSize=2: two active, one in unused pool.
+	// This exercises ipVersionLabel("6") in the PDsUnusedTotal metric initialization.
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0,
+		PDPathV6: writeSchedulerPDFile(t, []*api.ProbingDirective{
+			makePDV6(1),
+			makePDV6(2),
+			makePDV6(3),
+		}),
+		ActiveSetSize:              2,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil scheduler")
+	}
+}
+
+func TestNewScheduler_OnlyV4(t *testing.T) {
+	t.Parallel()
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       0,
+		IssuanceRate:               1.0,
+		PDPathV4:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV4(1)}),
+		PDPathV6:                   "",
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error with V4 only: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil scheduler")
+	}
+}
+
+func TestNewScheduler_OnlyV6(t *testing.T) {
+	t.Parallel()
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       0,
+		IssuanceRate:               1.0,
+		PDPathV4:                   "",
+		PDPathV6:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV6(1)}),
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error with V6 only: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil scheduler")
 	}
 }
 
@@ -125,8 +244,11 @@ func TestNewScheduler_Valid(t *testing.T) {
 func TestNewScheduler_NilLogger(t *testing.T) {
 	t.Parallel()
 	s, err := NewScheduler(&SchedulerConfig{
-		Seed: 0, IssuanceRate: 1.0, PDPath: writeSchedulerPDFile(t, []*api.ProbingDirective{makePD(1)}),
-		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+		Seed: 0, IssuanceRate: 1.0,
+		PDPathV4:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV4(1)}),
+		ActiveSetSize:              1,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
 	}, nil, testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error with nil logger: %v", err)
@@ -139,7 +261,7 @@ func TestNewScheduler_NilLogger(t *testing.T) {
 func TestNewScheduler_NilMetrics(t *testing.T) {
 	t.Parallel()
 	_, err := NewScheduler(&SchedulerConfig{
-		Seed: 0, IssuanceRate: 1.0, PDPath: "valid/path.jsonl",
+		Seed: 0, IssuanceRate: 1.0, PDPathV4: "valid/path.jsonl",
 		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
 	}, testLogger(), nil)
 	if err == nil {
@@ -162,7 +284,7 @@ func TestReadPDs_InvalidJSON(t *testing.T) {
 		t.Fatalf("cannot close temp file: %v", err)
 	}
 	_, err = NewScheduler(&SchedulerConfig{
-		Seed: 0, IssuanceRate: 1.0, PDPath: f.Name(),
+		Seed: 0, IssuanceRate: 1.0, PDPathV4: f.Name(),
 		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
 	}, testLogger(), testMetrics())
 	if err == nil {
@@ -185,11 +307,44 @@ func TestReadPDs_ScannerError(t *testing.T) {
 		t.Fatalf("cannot close temp file: %v", err)
 	}
 	_, err = NewScheduler(&SchedulerConfig{
-		Seed: 0, IssuanceRate: 1.0, PDPath: f.Name(),
+		Seed: 0, IssuanceRate: 1.0, PDPathV4: f.Name(),
 		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
 	}, testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected scanner error for oversized line, got nil")
+	}
+}
+
+func TestReadPDs_SkipsBlankLines(t *testing.T) {
+	t.Parallel()
+	f, err := os.CreateTemp(t.TempDir(), "pds-*.jsonl")
+	if err != nil {
+		t.Fatalf("cannot create temp file: %v", err)
+	}
+	pd := makePDV4(1)
+	b, _ := json.Marshal(pd)
+	// Write blank line before and after a valid PD.
+	if _, err := f.WriteString("\n"); err != nil {
+		t.Fatalf("cannot write to temp file: %v", err)
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		t.Fatalf("cannot write to temp file: %v", err)
+	}
+	if _, err := f.WriteString("\n"); err != nil {
+		t.Fatalf("cannot write to temp file: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("cannot close temp file: %v", err)
+	}
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0, PDPathV4: f.Name(),
+		ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(s.pdMap) != 1 {
+		t.Errorf("expected 1 PD loaded, got %d", len(s.pdMap))
 	}
 }
 
@@ -352,25 +507,15 @@ func TestUpdateFromFIE_MaxOfNearAndFarImpacts(t *testing.T) {
 
 func TestUpdateFromFIE_ConsecutiveMissesTriggersReplacement(t *testing.T) {
 	t.Parallel()
-	// Active set: pd1. Unused pool: pd2 (same agent).
-	pds := []*api.ProbingDirective{
-		{ProbingDirectiveID: 1, AgentID: "agent-a"},
-		{ProbingDirectiveID: 2, AgentID: "agent-a"},
-	}
-	s, err := NewScheduler(&SchedulerConfig{
-		Seed:                       42,
-		IssuanceRate:               1000.0,
-		PDPath:                     writeSchedulerPDFile(t, pds),
-		ActiveSetSize:              1,
-		ConsecutiveMissesThreshold: 3,
-		MaxEvictions:               3,
-	}, testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	// Active set: pd1 (V4). Unused pool: pd2 (V4, same agent).
+	s := newTestSchedulerWithConfig(t,
+		[]*api.ProbingDirective{
+			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
+			{ProbingDirectiveID: 2, AgentID: "agent-a", IPVersion: api.IPv4},
+		},
+		1, 3, 3)
 
 	// Send ConsecutiveMissesThreshold nil FIEs to trigger replacement.
-	// The last call removes pd1 from pdMap; errors are expected after that.
 	for range s.config.ConsecutiveMissesThreshold {
 		_ = s.UpdateFromFIE(makeFIETimeout(1))
 	}
@@ -384,26 +529,19 @@ func TestUpdateFromFIE_ConsecutiveMissesTriggersReplacement(t *testing.T) {
 	}
 }
 
+// -- replacePD ----------------------------------------------------------------
+
 func TestReplacePD_PermanentEviction(t *testing.T) {
 	t.Parallel()
-	// Active set: pd1. Unused pool: pd2, pd3 (same agent).
+	// Active set: pd1 (V4). Unused pool: pd2, pd3 (V4, same agent).
 	// MaxEvictions=1: a PD is permanently evicted after one recycling.
-	pds := []*api.ProbingDirective{
-		{ProbingDirectiveID: 1, AgentID: "agent-a"},
-		{ProbingDirectiveID: 2, AgentID: "agent-a"},
-		{ProbingDirectiveID: 3, AgentID: "agent-a"},
-	}
-	s, err := NewScheduler(&SchedulerConfig{
-		Seed:                       42,
-		IssuanceRate:               1000.0,
-		PDPath:                     writeSchedulerPDFile(t, pds),
-		ActiveSetSize:              1,
-		ConsecutiveMissesThreshold: 3,
-		MaxEvictions:               1,
-	}, testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s := newTestSchedulerWithConfig(t,
+		[]*api.ProbingDirective{
+			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
+			{ProbingDirectiveID: 2, AgentID: "agent-a", IPVersion: api.IPv4},
+			{ProbingDirectiveID: 3, AgentID: "agent-a", IPVersion: api.IPv4},
+		},
+		1, 3, 1)
 
 	triggerReplacement := func() {
 		var activeID uint64
@@ -423,29 +561,20 @@ func TestReplacePD_PermanentEviction(t *testing.T) {
 	triggerReplacement()
 	triggerReplacement()
 
-	// PDsEvictedTotal should have incremented.
-	if len(s.unusedByAgent["agent-a"]) >= 3 {
-		t.Errorf("expected unused pool to shrink due to permanent eviction, got %d entries", len(s.unusedByAgent["agent-a"]))
+	// Unused pool should have shrunk due to permanent eviction.
+	if len(s.unusedByAgent["agent-a"][0]) >= 3 {
+		t.Errorf("expected unused pool to shrink due to permanent eviction, got %d entries", len(s.unusedByAgent["agent-a"][0]))
 	}
 }
 
 func TestReplacePD_PoolExhausted(t *testing.T) {
 	t.Parallel()
 	// Active set: pd1 only, no unused pool.
-	pds := []*api.ProbingDirective{
-		{ProbingDirectiveID: 1, AgentID: "agent-a"},
-	}
-	s, err := NewScheduler(&SchedulerConfig{
-		Seed:                       42,
-		IssuanceRate:               1000.0,
-		PDPath:                     writeSchedulerPDFile(t, pds),
-		ActiveSetSize:              1,
-		ConsecutiveMissesThreshold: 3,
-		MaxEvictions:               3,
-	}, testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s := newTestSchedulerWithConfig(t,
+		[]*api.ProbingDirective{
+			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
+		},
+		1, 3, 3)
 
 	// Trigger replacement — unused pool is empty, replacePD returns nil.
 	for range s.config.ConsecutiveMissesThreshold {
@@ -459,23 +588,16 @@ func TestReplacePD_PoolExhausted(t *testing.T) {
 	}
 }
 
+// -- NextPD -------------------------------------------------------------------
+
 func TestNextPD_PoolExhaustedOnBernoulli(t *testing.T) {
 	t.Parallel()
 	// Single PD, no unused pool — Bernoulli failure with nothing to replace from.
-	pds := []*api.ProbingDirective{
-		{ProbingDirectiveID: 1, AgentID: "agent-a"},
-	}
-	s, err := NewScheduler(&SchedulerConfig{
-		Seed:                       42,
-		IssuanceRate:               1000.0,
-		PDPath:                     writeSchedulerPDFile(t, pds),
-		ActiveSetSize:              1,
-		ConsecutiveMissesThreshold: 100,
-		MaxEvictions:               3,
-	}, testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	s := newTestSchedulerWithConfig(t,
+		[]*api.ProbingDirective{
+			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
+		},
+		1, 100, 3)
 
 	// Force Bernoulli failure — unused pool is empty so replacePD returns nil.
 	s.pdMap[1].issuanceProb = 0.0
@@ -496,22 +618,13 @@ func TestNextPD_ReturnsDirective(t *testing.T) {
 
 func TestNextPD_ReplacesOnLowProbability(t *testing.T) {
 	t.Parallel()
-	// Active set: pd1. Unused pool: pd2 (same agent).
-	pds := []*api.ProbingDirective{
-		{ProbingDirectiveID: 1, AgentID: "agent-a"},
-		{ProbingDirectiveID: 2, AgentID: "agent-a"},
-	}
-	s, err := NewScheduler(&SchedulerConfig{
-		Seed:                       42,
-		IssuanceRate:               1000.0,
-		PDPath:                     writeSchedulerPDFile(t, pds),
-		ActiveSetSize:              1,
-		ConsecutiveMissesThreshold: 3,
-		MaxEvictions:               3,
-	}, testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	// Active set: pd1 (V4). Unused pool: pd2 (V4, same agent).
+	s := newTestSchedulerWithConfig(t,
+		[]*api.ProbingDirective{
+			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
+			{ProbingDirectiveID: 2, AgentID: "agent-a", IPVersion: api.IPv4},
+		},
+		1, 3, 3)
 
 	// Force issuance prob to 0 to guarantee Bernoulli failure and replacement.
 	s.pdMap[1].issuanceProb = 0.0
@@ -541,11 +654,9 @@ func TestUpdateFromFIE_TimeoutClearsStaleAddress(t *testing.T) {
 	}{
 		{
 			name: "near address",
-			// Full FIE to establish near address without counting as miss.
 			firstFIE: func(addr net.IP) *api.ForwardingInfoElement {
 				return makeFIEFull(1, addr, net.ParseIP("10.0.0.99"))
 			},
-			// FIE with nil near clears the stale near address.
 			resetFIE: func(addr net.IP) *api.ForwardingInfoElement {
 				return makeFIEFull(1, nil, net.ParseIP("10.0.0.99"))
 			},

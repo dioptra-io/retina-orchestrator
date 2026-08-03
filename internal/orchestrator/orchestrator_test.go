@@ -43,7 +43,7 @@ func writePDFile(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("cannot create temp file: %v", err)
 	}
-	pd := api.ProbingDirective{ProbingDirectiveID: 1}
+	pd := api.ProbingDirective{ProbingDirectiveID: 1, IPVersion: api.IPv4}
 	b, _ := json.Marshal(pd)
 	_, _ = f.Write(append(b, '\n'))
 	_ = f.Close()
@@ -58,14 +58,14 @@ func validConfig(t *testing.T) *Config {
 		PDQueueSize:                100,
 		RingBufferSize:             100,
 		APIAddress:                 "127.0.0.1:0",
-		PDPath:                     writePDFile(t),
+		PDPathV4:                   writePDFile(t),
 		Seed:                       0,
 		IssuanceRate:               1.0,
 		ImpactThreshold:            1.0,
 		Secret:                     "secret",
 		ActiveSetSize:              1,
 		ConsecutiveMissesThreshold: 3,
-		MaxEvictions:               3,
+		MaxEvictions:               9,
 	}
 }
 
@@ -138,7 +138,7 @@ func TestConfig_Validate_Errors(t *testing.T) {
 		{"zero PDQueueSize", func(c *Config) { c.PDQueueSize = 0 }},
 		{"zero RingBufferSize", func(c *Config) { c.RingBufferSize = 0 }},
 		{"empty APIAddress", func(c *Config) { c.APIAddress = "" }},
-		{"empty PDPath", func(c *Config) { c.PDPath = "" }},
+		{"both PD paths empty", func(c *Config) { c.PDPathV4 = ""; c.PDPathV6 = "" }},
 		{"zero IssuanceRate", func(c *Config) { c.IssuanceRate = 0 }},
 		{"negative IssuanceRate", func(c *Config) { c.IssuanceRate = -1 }},
 		{"zero ImpactThreshold", func(c *Config) { c.ImpactThreshold = 0 }},
@@ -185,7 +185,7 @@ func TestNewOrch_InvalidConfig(t *testing.T) {
 func TestNewOrch_SchedulerError(t *testing.T) {
 	t.Parallel()
 	c := validConfig(t)
-	c.PDPath = "/nonexistent/path.jsonl"
+	c.PDPathV4 = "/nonexistent/path.jsonl"
 	if _, err := NewOrch(c, testLogger(), testMetrics()); err == nil {
 		t.Fatal("expected error for bad PDPath, got nil")
 	}

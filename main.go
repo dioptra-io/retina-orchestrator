@@ -45,7 +45,8 @@ func run() error {
 		agentAddr                  = flag.String("agent-addr", envOrDefault("RETINA_AGENT_ADDR", "localhost:50050"), "Listening address for agent connections")
 		pdQueueSize                = flag.Int("pd-queue-size", envOrDefaultInt("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
 		ringBufferSize             = flag.Int("ring-buffer-size", envOrDefaultInt("RETINA_RING_BUFFER_SIZE", 100), "The size of the ring buffer")
-		pdPath                     = flag.String("pd-path", envOrDefault("RETINA_PD_PATH", ""), "Path to the probing directives file")
+		pdPathV4                   = flag.String("pd-path-v4", envOrDefault("RETINA_PD_PATH_V4", ""), "Path to the IPv4 probing directives file")
+		pdPathV6                   = flag.String("pd-path-v6", envOrDefault("RETINA_PD_PATH_V6", ""), "Path to the IPv6 probing directives file")
 		issuanceRate               = flag.Float64("issuance-rate", envOrDefaultFloat64("RETINA_ISSUANCE_RATE", 1.0), "Target global issuance rate of probing directives (PDs per second, approximate)")
 		impactThreshold            = flag.Float64("impact-threshold", envOrDefaultFloat64("RETINA_IMPACT_THRESHOLD", 1.0), "Maximum impact threshold per address for the responsible probing algorithm")
 		seed                       = flag.Uint64("seed", envOrDefaultUInt64("RETINA_SEED", 42), "Seed for the randomizer")
@@ -55,7 +56,7 @@ func run() error {
 		metricsAddr                = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
 		activeSetSize              = flag.Int("active-set-size", envOrDefaultInt("RETINA_ACTIVE_SET_SIZE", 10000), "Number of PDs in the active probing set")
 		consecutiveMissesThreshold = flag.Int("consecutive-misses-threshold", envOrDefaultInt("RETINA_CONSECUTIVE_MISSES_THRESHOLD", 3), "Number of consecutive cycles without a reply before a PD is replaced")
-		maxEvictions               = flag.Int("max-evictions", envOrDefaultInt("RETINA_MAX_EVICTIONS", 9), "Number of times a PD can be replaced before permanent eviction")
+		maxEvictions               = flag.Int("max-evictions", envOrDefaultInt("RETINA_MAX_EVICTIONS", 3), "Number of times a PD can be replaced before permanent eviction")
 	)
 	flag.Parse()
 
@@ -82,7 +83,8 @@ func run() error {
 		AgentBufferLength:          defaultAgentBufferLength,
 		APIAddress:                 *apiAddr,
 		APIReadHeaderTimeout:       *apiReadHeaderTimeout,
-		PDPath:                     *pdPath,
+		PDPathV4:                   *pdPathV4,
+		PDPathV6:                   *pdPathV6,
 		IssuanceRate:               *issuanceRate,
 		Seed:                       *seed,
 		ImpactThreshold:            *impactThreshold,
@@ -99,7 +101,8 @@ func run() error {
 	logger.Info("Starting orchestrator",
 		"api_addr", *apiAddr,
 		"agent_addr", *agentAddr,
-		"pd_path", *pdPath,
+		"pd_path_v4", *pdPathV4,
+		"pd_path_v6", *pdPathV6,
 		"issuance_rate", *issuanceRate,
 		"impact_threshold", *impactThreshold,
 		"active_set_size", *activeSetSize,
