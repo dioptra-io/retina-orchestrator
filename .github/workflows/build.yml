@@ -4,6 +4,15 @@ on:
     branches: [main, dev, 'research', 'research/**']
     tags: ['v*.*.*']
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   docker:
     runs-on: ubuntu-latest
