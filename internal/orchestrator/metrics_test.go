@@ -25,7 +25,6 @@ func TestNewMetrics_WithRegistry(t *testing.T) {
 		t.Fatal("expected non-nil Metrics")
 		return
 	}
-
 	// NOTE: If a new metric is added to Metrics, add a corresponding nil check here.
 	if m.AgentsConnected == nil {
 		t.Error("expected AgentsConnected to be non-nil")
@@ -54,8 +53,20 @@ func TestNewMetrics_WithRegistry(t *testing.T) {
 	if m.CyclesTotal == nil {
 		t.Error("expected CyclesTotal to be non-nil")
 	}
-	if m.PDsSkippedTotal == nil {
-		t.Error("expected PDsSkippedTotal to be non-nil")
+	if m.PDsReplacedBernoulliTotal == nil {
+		t.Error("expected PDsReplacedBernoulliTotal to be non-nil")
+	}
+	if m.PDsReplacedMissTotal == nil {
+		t.Error("expected PDsReplacedMissTotal to be non-nil")
+	}
+	if m.PDsEvictedTotal == nil {
+		t.Error("expected PDsEvictedTotal to be non-nil")
+	}
+	if m.PDsUnusedTotal == nil {
+		t.Error("expected PDsUnusedTotal to be non-nil")
+	}
+	if m.PDsActiveTotal == nil {
+		t.Error("expected PDsActiveTotal to be non-nil")
 	}
 	if m.StreamClientsConnected == nil {
 		t.Error("expected StreamClientsConnected to be non-nil")

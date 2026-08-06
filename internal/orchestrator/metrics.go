@@ -23,7 +23,14 @@ type Metrics struct {
 	PDsTotal             prometheus.Gauge
 	CycleDurationSeconds prometheus.Histogram
 	CyclesTotal          prometheus.Counter
-	PDsSkippedTotal      prometheus.Counter
+
+	// PD replacement — labeled by agent_id
+	PDsReplacedBernoulliTotal *prometheus.CounterVec
+	PDsReplacedMissTotal      *prometheus.CounterVec
+	PDsEvictedTotal           *prometheus.CounterVec
+	PDsUnusedTotal            *prometheus.GaugeVec
+	// PDsActiveTotal is not per-agent since the active set is shared across agents.
+	PDsActiveTotal prometheus.Gauge
 
 	// Streaming endpoint
 	StreamClientsConnected    prometheus.Gauge
@@ -69,7 +76,7 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 		// PD cycling
 		PDsTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Name: "retina_orchestrator_pds_total",
-			Help: "Total number of probing directives in the current list.",
+			Help: "Total number of probing directives loaded at startup.",
 		}),
 		CycleDurationSeconds: factory.NewHistogram(prometheus.HistogramOpts{ // TODO: tune buckets once we have real cycle duration data.
 			Name:    "retina_orchestrator_cycle_duration_seconds",
@@ -80,9 +87,27 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 			Name: "retina_orchestrator_cycles_total",
 			Help: "Total number of completed PD cycles.",
 		}),
-		PDsSkippedTotal: factory.NewCounter(prometheus.CounterOpts{
-			Name: "retina_orchestrator_pds_skipped_total",
-			Help: "Total number of directives skipped by the Bernoulli experiment due to issuance probability < 1.",
+
+		// PD replacement
+		PDsReplacedBernoulliTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_pds_replaced_bernoulli_total",
+			Help: "Total number of probing directives replaced due to failed Bernoulli experiment (responsible probing), labeled by agent ID.",
+		}, []string{"agent_id"}),
+		PDsReplacedMissTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_pds_replaced_miss_total",
+			Help: "Total number of probing directives replaced due to consecutive misses threshold, labeled by agent ID.",
+		}, []string{"agent_id"}),
+		PDsEvictedTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_pds_evicted_total",
+			Help: "Total number of probing directives permanently evicted from the pool, labeled by agent ID.",
+		}, []string{"agent_id"}),
+		PDsUnusedTotal: factory.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "retina_orchestrator_pds_unused_total",
+			Help: "Current number of probing directives in the unused pool, labeled by IP version (4 or 6).",
+		}, []string{"ip_version"}),
+		PDsActiveTotal: factory.NewGauge(prometheus.GaugeOpts{
+			Name: "retina_orchestrator_pds_active_total",
+			Help: "Current number of probing directives in the active set.",
 		}),
 
 		// Streaming endpoint
