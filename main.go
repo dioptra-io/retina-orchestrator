@@ -56,7 +56,7 @@ func run() error {
 		metricsAddr                = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
 		activeSetSize              = flag.Int("active-set-size", envOrDefaultInt("RETINA_ACTIVE_SET_SIZE", 10000), "Number of PDs in the active probing set")
 		consecutiveMissesThreshold = flag.Int("consecutive-misses-threshold", envOrDefaultInt("RETINA_CONSECUTIVE_MISSES_THRESHOLD", 3), "Number of consecutive cycles without a reply before a PD is replaced")
-		maxEvictions               = flag.Int("max-evictions", envOrDefaultInt("RETINA_MAX_EVICTIONS", 3), "Number of times a PD can be replaced before permanent eviction")
+		maxEvictions               = flag.Int("max-evictions", envOrDefaultInt("RETINA_MAX_EVICTIONS", 9), "Number of times a PD can be replaced before permanent eviction")
 	)
 	flag.Parse()
 

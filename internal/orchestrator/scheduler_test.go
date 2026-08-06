@@ -42,10 +42,12 @@ func makePD(id uint64) *api.ProbingDirective {
 	return &api.ProbingDirective{ProbingDirectiveID: id, IPVersion: api.IPv4}
 }
 
+//nolint:unparam // id is always 1 in current tests but is a meaningful parameter
 func makePDV4(id uint64) *api.ProbingDirective {
 	return &api.ProbingDirective{ProbingDirectiveID: id, IPVersion: api.IPv4}
 }
 
+//nolint:unparam // id is always 1 in current tests but is a meaningful parameter
 func makePDV6(id uint64) *api.ProbingDirective {
 	return &api.ProbingDirective{ProbingDirectiveID: id, IPVersion: api.IPv6}
 }
@@ -155,6 +157,39 @@ func TestNewScheduler_EmptyFiles(t *testing.T) {
 	}, testLogger(), testMetrics())
 	if err == nil {
 		t.Fatal("expected error for empty files, got nil")
+	}
+}
+
+func TestNewScheduler_DuplicatePDID(t *testing.T) {
+	t.Parallel()
+	// Same PD ID in both V4 and V6 files should be rejected.
+	_, err := NewScheduler(&SchedulerConfig{
+		Seed:                       0,
+		IssuanceRate:               1.0,
+		PDPathV4:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV4(1)}),
+		PDPathV6:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV6(1)}),
+		ActiveSetSize:              2,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err == nil {
+		t.Fatal("expected error for duplicate PD ID across V4 and V6 files, got nil")
+	}
+}
+
+func TestNewScheduler_DuplicatePDIDWithinFile(t *testing.T) {
+	t.Parallel()
+	// Same PD ID appearing twice in the same file should be rejected.
+	_, err := NewScheduler(&SchedulerConfig{
+		Seed:                       0,
+		IssuanceRate:               1.0,
+		PDPathV4:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV4(1), makePDV4(1)}),
+		ActiveSetSize:              2,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err == nil {
+		t.Fatal("expected error for duplicate PD ID within V4 file, got nil")
 	}
 }
 

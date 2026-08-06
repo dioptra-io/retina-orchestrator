@@ -117,14 +117,20 @@ type Scheduler struct {
 // The first maxActive PDs go into pdMap and indices (active set); the rest go
 // into the per-agent unused pool. The slice should be shuffled before calling
 // to avoid IP range bias in the active set.
+// seen tracks all PD IDs across both V4 and V6 calls to detect duplicates.
 func loadPDsIntoPool(
 	pds []*api.ProbingDirective,
 	maxActive int,
 	pdMap map[uint64]*pdState,
 	indices *[]uint64,
 	unusedByAgent map[string][2][]*unusedPD,
-) {
+	seen map[uint64]struct{},
+) error {
 	for i, pd := range pds {
+		if _, exists := seen[pd.ProbingDirectiveID]; exists {
+			return fmt.Errorf("duplicate PD ID %d", pd.ProbingDirectiveID)
+		}
+		seen[pd.ProbingDirectiveID] = struct{}{}
 		if i < maxActive {
 			pdMap[pd.ProbingDirectiveID] = &pdState{
 				directive:    pd,
@@ -140,6 +146,32 @@ func loadPDsIntoPool(
 			unusedByAgent[pd.AgentID] = pools
 		}
 	}
+	return nil
+}
+
+// loadAllPDs reads the V4 and V6 PD files from config. Either path may be empty,
+// but at least one file must produce non-zero PDs.
+func loadAllPDs(config *SchedulerConfig) ([]*api.ProbingDirective, []*api.ProbingDirective, error) {
+	var (
+		err          error
+		v4pds, v6pds []*api.ProbingDirective
+	)
+	if config.PDPathV4 != "" {
+		v4pds, err = readPDs(config.PDPathV4)
+		if err != nil {
+			return nil, nil, fmt.Errorf("cannot read IPv4 PD file: %w", err)
+		}
+	}
+	if config.PDPathV6 != "" {
+		v6pds, err = readPDs(config.PDPathV6)
+		if err != nil {
+			return nil, nil, fmt.Errorf("cannot read IPv6 PD file: %w", err)
+		}
+	}
+	if len(v4pds) == 0 && len(v6pds) == 0 {
+		return nil, nil, fmt.Errorf("invalid arguments: both PD files are empty")
+	}
+	return v4pds, v6pds, nil
 }
 
 // NewScheduler creates a new Scheduler from the given configuration.
@@ -152,24 +184,9 @@ func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics
 		return nil, fmt.Errorf("metrics cannot be nil")
 	}
 
-	var (
-		err          error
-		v4pds, v6pds []*api.ProbingDirective
-	)
-	if config.PDPathV4 != "" {
-		v4pds, err = readPDs(config.PDPathV4)
-		if err != nil {
-			return nil, fmt.Errorf("cannot read IPv4 PD file: %w", err)
-		}
-	}
-	if config.PDPathV6 != "" {
-		v6pds, err = readPDs(config.PDPathV6)
-		if err != nil {
-			return nil, fmt.Errorf("cannot read IPv6 PD file: %w", err)
-		}
-	}
-	if len(v4pds) == 0 && len(v6pds) == 0 {
-		return nil, fmt.Errorf("invalid arguments: both PD files are empty")
+	v4pds, v6pds, err := loadAllPDs(config)
+	if err != nil {
+		return nil, err
 	}
 
 	logger.Info("Scheduler loaded directives",
@@ -192,8 +209,13 @@ func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics
 		v4Active = config.ActiveSetSize
 	}
 
-	loadPDsIntoPool(v4pds, v4Active, pdMap, &indices, unusedByAgent)
-	loadPDsIntoPool(v6pds, v6Active, pdMap, &indices, unusedByAgent)
+	seen := make(map[uint64]struct{}, len(v4pds)+len(v6pds))
+	if err := loadPDsIntoPool(v4pds, v4Active, pdMap, &indices, unusedByAgent, seen); err != nil {
+		return nil, fmt.Errorf("IPv4 PD file: %w", err)
+	}
+	if err := loadPDsIntoPool(v6pds, v6Active, pdMap, &indices, unusedByAgent, seen); err != nil {
+		return nil, fmt.Errorf("IPv6 PD file: %w", err)
+	}
 
 	randomizer, err := newRandomizer(config.Seed, indices)
 	if err != nil {
