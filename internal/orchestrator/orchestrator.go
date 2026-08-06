@@ -20,6 +20,7 @@ import (
 )
 
 // Config is the main configuration struct used in the orchestrator.
+// All CLI flags are defined here; sub-components are configured from this struct.
 type Config struct {
 	// AgentAddress is the TCP listening address for agent connections, in the form "host:port".
 	AgentAddress      string
@@ -36,17 +37,21 @@ type Config struct {
 	APIReadHeaderTimeout time.Duration
 
 	FIEFilterPolicy string
-	PDPath          string
 	Seed            uint64
-	// IssuanceRate is the target global issuance rate of probing directives
-	// (PDs per second, approximate).
-	IssuanceRate float64
-	// ImpactThreshold is the maximum number of concurrent directives allowed
-	// to impact a single address in the responsible probing algorithm.
-	ImpactThreshold float64
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
+
+	// Scheduler parameters
+	PDPathV4     string
+	PDPathV6     string
+	IssuanceRate float64
+	// ImpactThreshold is the maximum allowed probe rate (probes/second) on any
+	// single address in the responsible probing algorithm.
+	ImpactThreshold            float64
+	ActiveSetSize              int
+	ConsecutiveMissesThreshold int
+	MaxEvictions               int
 }
 
 // Validate checks all configuration fields and applies defaults where appropriate.
@@ -76,14 +81,28 @@ func (c *Config) Validate() error {
 	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
 		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
 	}
-	if c.PDPath == "" {
-		return fmt.Errorf("PDPath cannot be empty")
+	return c.validateSchedulerConfig()
+}
+
+// validateSchedulerConfig checks scheduler-specific configuration fields.
+func (c *Config) validateSchedulerConfig() error {
+	if c.PDPathV4 == "" && c.PDPathV6 == "" {
+		return fmt.Errorf("at least one of PDPathV4 or PDPathV6 must be provided")
 	}
 	if c.IssuanceRate <= 0 {
 		return fmt.Errorf("IssuanceRate must be greater than zero: got %f", c.IssuanceRate)
 	}
 	if c.ImpactThreshold <= 0 {
 		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
+	}
+	if c.ActiveSetSize <= 0 {
+		return fmt.Errorf("ActiveSetSize must be greater than zero: got %d", c.ActiveSetSize)
+	}
+	if c.ConsecutiveMissesThreshold <= 0 {
+		return fmt.Errorf("ConsecutiveMissesThreshold must be greater than zero: got %d", c.ConsecutiveMissesThreshold)
+	}
+	if c.MaxEvictions <= 0 {
+		return fmt.Errorf("MaxEvictions must be greater than zero: got %d", c.MaxEvictions)
 	}
 	return nil
 }
@@ -118,7 +137,15 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		metrics: metrics,
 	}
 
-	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, logger.With("component", "scheduler"), metrics)
+	scheduler, err := NewScheduler(&SchedulerConfig{
+		Seed:                       config.Seed,
+		IssuanceRate:               config.IssuanceRate,
+		PDPathV4:                   config.PDPathV4,
+		PDPathV6:                   config.PDPathV6,
+		ActiveSetSize:              config.ActiveSetSize,
+		ConsecutiveMissesThreshold: config.ConsecutiveMissesThreshold,
+		MaxEvictions:               config.MaxEvictions,
+	}, logger.With("component", "scheduler"), metrics)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}

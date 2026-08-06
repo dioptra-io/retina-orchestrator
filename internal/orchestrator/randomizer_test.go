@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// 100% coverage: every branch in newRandomizer, Next, and Cycle is exercised.
+// 100% coverage: every branch in newRandomizer, Next, Cycle, and Replace is exercised.
 
 // -- newRandomizer ------------------------------------------------------------
 
@@ -199,5 +199,72 @@ func TestRandomizer_AllIndicesReachableAcrossCycles(t *testing.T) {
 		if _, ok := valid[v]; !ok {
 			t.Errorf("Next returned unexpected value %d", v)
 		}
+	}
+}
+
+// -- Replace ------------------------------------------------------------------
+
+func TestRandomizer_Replace(t *testing.T) {
+	t.Parallel()
+	r, err := newRandomizer(42, []uint64{1, 2, 3})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Replace ID 2 with ID 99
+	r.Replace(2, 99)
+
+	// 99 should appear in a full cycle, 2 should not
+	seen := make(map[uint64]int)
+	for range 3 {
+		seen[r.Next()]++
+	}
+	if seen[2] != 0 {
+		t.Error("replaced ID 2 should not appear")
+	}
+	if seen[99] != 1 {
+		t.Errorf("new ID 99 should appear once, got %d", seen[99])
+	}
+}
+
+func TestRandomizer_ReplaceUnknownID(t *testing.T) {
+	t.Parallel()
+	r, err := newRandomizer(42, []uint64{1, 2, 3})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should be a no-op, not panic
+	r.Replace(999, 100)
+	seen := make(map[uint64]int)
+	for range 3 {
+		seen[r.Next()]++
+	}
+	for _, id := range []uint64{1, 2, 3} {
+		if seen[id] != 1 {
+			t.Errorf("ID %d should appear once after no-op Replace, got %d", id, seen[id])
+		}
+	}
+}
+
+func TestRandomizer_IndexPDConsistency(t *testing.T) {
+	t.Parallel()
+	indices := []uint64{10, 20, 30, 40, 50}
+	r, err := newRandomizer(42, append([]uint64(nil), indices...))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	checkConsistency := func() {
+		for id, pos := range r.indexPD {
+			if r.indices[pos] != id {
+				t.Errorf("indexPD inconsistency: indexPD[%d]=%d but indices[%d]=%d", id, pos, pos, r.indices[pos])
+			}
+		}
+	}
+
+	// Check after each Next call
+	for range len(indices) * 2 {
+		r.Next()
+		checkConsistency()
 	}
 }
