@@ -140,6 +140,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	scheduler, err := NewScheduler(&SchedulerConfig{
 		Seed:                       config.Seed,
 		IssuanceRate:               config.IssuanceRate,
+		ImpactThreshold:            config.ImpactThreshold,
 		PDPathV4:                   config.PDPathV4,
 		PDPathV6:                   config.PDPathV6,
 		ActiveSetSize:              config.ActiveSetSize,
