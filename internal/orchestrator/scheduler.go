@@ -23,6 +23,7 @@ import (
 type SchedulerConfig struct {
 	Seed                       uint64
 	IssuanceRate               float64
+	ImpactThreshold            float64
 	PDPathV4                   string
 	PDPathV6                   string
 	ActiveSetSize              int
@@ -438,10 +439,11 @@ func (s *Scheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
 	}
 
 	maxImpacts := max(numNearImpacts, numFarImpacts)
-	if maxImpacts == 0 {
+	if maxImpacts <= 1 {
 		pd.issuanceProb = 1.0
 	} else {
-		pd.issuanceProb = 1.0 / float64(maxImpacts)
+		cycleDuration := float64(s.config.ActiveSetSize) / s.config.IssuanceRate
+		pd.issuanceProb = min(1.0, s.config.ImpactThreshold*cycleDuration/float64(maxImpacts))
 	}
 
 	if fie.NearInfo == nil || fie.FarInfo == nil {
