@@ -5,7 +5,6 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
@@ -13,7 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/framing"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 )
 
 // agentKeepalivePeriod is the interval between TCP keepalive probes
@@ -35,7 +36,12 @@ type agentAuthStatus struct {
 type agentHandleFunc func(status *agentAuthStatus, s *agentStream)
 
 // authHandleFunc handles agent authentication. If Authenticated is false, the connection is closed.
-type authHandleFunc func(req api.AuthRequest) api.AuthResponse
+// wire.AuthRequest/AuthResponse are used directly (no model wrapper) since
+// this type is only ever touched once per connection, at the handshake —
+// not threaded deeply the way ProbingDirective/ForwardingInfoElement are.
+// Pointers, not values: these generated proto messages embed a sync.Mutex
+// (via protoimpl.MessageState) that copylocks flags if copied by value.
+type authHandleFunc func(req *wire.AuthRequest) *wire.AuthResponse
 
 type agentServerConfig struct {
 	// address is the TCP listening address in the form "host:port".
@@ -47,7 +53,8 @@ type agentServerConfig struct {
 	authHandler      authHandleFunc
 }
 
-// agentServer handles bidirectional PD/FIE communication with agents over newline-delimited JSON.
+// agentServer handles bidirectional PD/FIE communication with agents over
+// length-prefixed protobuf (see retina-commons/framing).
 type agentServer struct {
 	config   *agentServerConfig
 	logger   *slog.Logger
@@ -195,13 +202,13 @@ func (s *agentServer) handleAgent(stream *agentStream) {
 }
 
 func (s *agentServer) handshake(stream *agentStream) (*agentAuthStatus, error) {
-	authReq, err := receive[api.AuthRequest](stream.conn, stream.decoder, s.config.handshakeTimeout)
-	if err != nil {
+	var authReq wire.AuthRequest
+	if err := framing.Receive(stream.conn, s.config.handshakeTimeout, &authReq); err != nil {
 		return nil, fmt.Errorf("could not receive auth request: %w", err)
 	}
 
-	authResp := s.config.authHandler(*authReq)
-	if err := send(stream.conn, stream.encoder, s.config.handshakeTimeout, &authResp); err != nil {
+	authResp := s.config.authHandler(&authReq)
+	if err := framing.Send(stream.conn, s.config.handshakeTimeout, authResp); err != nil {
 		return nil, fmt.Errorf("could not send auth response: %w", err)
 	}
 
@@ -216,7 +223,7 @@ func (s *agentServer) handshake(stream *agentStream) (*agentAuthStatus, error) {
 	}
 
 	return &agentAuthStatus{
-		agentID:       authReq.AgentID,
+		agentID:       authReq.AgentId, // wire.AuthRequest field — see authHandleFunc doc
 		remoteAddress: stream.conn.RemoteAddr(),
 	}, nil
 }
@@ -232,13 +239,11 @@ func (s *agentServer) removeConnection(stream *agentStream) {
 }
 
 type agentStream struct {
-	id      int
-	ctx     context.Context
-	cancel  context.CancelFunc
-	conn    *net.TCPConn
-	encoder *json.Encoder
-	decoder *json.Decoder
-	server  *agentServer
+	id     int
+	ctx    context.Context
+	cancel context.CancelFunc
+	conn   *net.TCPConn
+	server *agentServer
 }
 
 func newAgentStream(id int, conn *net.TCPConn, server *agentServer) (*agentStream, error) {
@@ -251,13 +256,11 @@ func newAgentStream(id int, conn *net.TCPConn, server *agentServer) (*agentStrea
 
 	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118
 	return &agentStream{
-		id:      id,
-		conn:    conn,
-		ctx:     ctx,
-		cancel:  cancel,
-		encoder: json.NewEncoder(conn),
-		decoder: json.NewDecoder(conn),
-		server:  server,
+		id:     id,
+		conn:   conn,
+		ctx:    ctx,
+		cancel: cancel,
+		server: server,
 	}, nil
 }
 
@@ -265,35 +268,31 @@ func (s *agentStream) context() context.Context {
 	return s.ctx
 }
 
-func (s *agentStream) sendPD(e *api.ProbingDirective) error {
-	return send(s.conn, s.encoder, agentSendTimeout, e)
-}
-
-func (s *agentStream) receiveFIE() (*api.ForwardingInfoElement, error) {
-	return receive[api.ForwardingInfoElement](s.conn, s.decoder, 0)
-}
-
-func send[E any](conn *net.TCPConn, encoder *json.Encoder, timeout time.Duration, e *E) error {
-	if timeout > 0 {
-		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
-			return fmt.Errorf("send failed: cannot set write deadline: %w", err)
-		}
+// sendPD converts pd to its wire representation and sends it, prefixed
+// with its length (see retina-commons/framing).
+func (s *agentStream) sendPD(pd *model.ProbingDirective) error {
+	wirePD, err := pd.ToProto()
+	if err != nil {
+		return fmt.Errorf("send failed: cannot convert PD to wire format: %w", err)
 	}
-	if err := encoder.Encode(e); err != nil {
-		return fmt.Errorf("send failed: cannot encode: %w", err)
+	if err := framing.Send(s.conn, agentSendTimeout, wirePD); err != nil {
+		return fmt.Errorf("send failed: %w", err)
 	}
 	return nil
 }
 
-func receive[E any](conn *net.TCPConn, decoder *json.Decoder, timeout time.Duration) (*E, error) {
-	var e E
-	if timeout > 0 {
-		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-			return nil, fmt.Errorf("receive failed: cannot set read deadline: %w", err)
-		}
+// receiveFIE reads a length-prefixed frame and converts it from its wire
+// representation (see retina-commons/framing). No read deadline is set
+// here — the FIE stream from an already-authenticated agent is expected
+// to be long-lived and idle between probes, unlike the bounded handshake.
+func (s *agentStream) receiveFIE() (*model.ForwardingInfoElement, error) {
+	var wireFIE wire.ForwardingInfoElement
+	if err := framing.Receive(s.conn, 0, &wireFIE); err != nil {
+		return nil, fmt.Errorf("receive failed: %w", err)
 	}
-	if err := decoder.Decode(&e); err != nil {
-		return nil, fmt.Errorf("receive failed: cannot decode: %w", err)
+	fie, err := model.ForwardingInfoElementFromProto(&wireFIE)
+	if err != nil {
+		return nil, fmt.Errorf("receive failed: cannot convert FIE from wire format: %w", err)
 	}
-	return &e, nil
+	return &fie, nil
 }

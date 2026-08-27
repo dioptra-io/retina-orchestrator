@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
 	"golang.org/x/sync/errgroup"
 )
@@ -114,13 +116,16 @@ type orch struct {
 	scheduler   *Scheduler
 	agentServer *agentServer
 	apiServer   *apiServer
-	pdQueue     *structures.Queue[api.ProbingDirective]
-	ringBuffer  *structures.RingBuffer[api.ForwardingInfoElement]
+	pdQueue     *structures.Queue[model.ProbingDirective]
+	ringBuffer  *structures.RingBuffer[model.ForwardingInfoElement]
 }
 
 // NewOrch creates a new orchestrator from the given configuration. Returns an
 // error if the configuration is invalid or any component creation fails.
 func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -130,6 +135,12 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	if metrics == nil {
 		return nil, fmt.Errorf("metrics cannot be nil")
 	}
+
+	// Copy after Validate() (which applies defaults by mutating config) so
+	// the orchestrator's own reads can't race with the caller mutating the
+	// original afterward.
+	configCopy := *config
+	config = &configCopy
 
 	o := &orch{
 		config:  config,
@@ -174,13 +185,13 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.agentServer = agentServer
 
-	pdQueue, err := structures.NewQueue[api.ProbingDirective](config.PDQueueSize)
+	pdQueue, err := structures.NewQueue[model.ProbingDirective](config.PDQueueSize)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating pd queue: %w", err)
 	}
 	o.pdQueue = pdQueue
 
-	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](config.RingBufferSize)
+	ringBuffer, err := structures.NewRingBuffer[model.ForwardingInfoElement](config.RingBufferSize)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating ring buffer: %w", err)
 	}
@@ -206,13 +217,10 @@ func (o *orch) Run(parentCtx context.Context) error {
 
 func (o *orch) runScheduler(ctx context.Context) error {
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		pd := o.scheduler.NextPD(ctx)
+		if ctx.Err() != nil {
+			return nil
 		}
-
-		pd := o.scheduler.NextPD()
 		if pd == nil {
 			continue
 		}
@@ -227,9 +235,13 @@ func (o *orch) runScheduler(ctx context.Context) error {
 	}
 }
 
-func (o *orch) runAPIServer(ctx context.Context) error {
+func (o *orch) runAPIServer(parentCtx context.Context) error {
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
+		defer cancel() // wake the shutdown goroutine even if listenAndServe returns nil
 		return o.apiServer.listenAndServe()
 	})
 	group.Go(func() error {
@@ -242,9 +254,13 @@ func (o *orch) runAPIServer(ctx context.Context) error {
 	return nil
 }
 
-func (o *orch) runAgentServer(ctx context.Context) error {
+func (o *orch) runAgentServer(parentCtx context.Context) error {
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
+		defer cancel() // wake the shutdown goroutine even if listenAndServe returns nil
 		return o.agentServer.listenAndServe()
 	})
 	group.Go(func() error {
@@ -255,6 +271,54 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// modelFIEToAPIv1 converts a model.ForwardingInfoElement to the legacy
+// api/v1 type api_server.go's SequencedFIE still embeds, preserving the
+// existing HTTP/JSON wire format for clients until api_server.go's own
+// migration. Fallible: wire.IPVersion/wire.Protocol are int32-based
+// (protobuf enums) but api.IPVersion/api.Protocol are uint8-based
+// (confirmed against api/v1's real source) — a blind numeric cast would
+// be a genuine narrowing conversion, even though both enums' legitimate
+// values (0, 4, 6 for IPVersion; 0-58 for Protocol) fit comfortably in a
+// uint8 in practice. Explicit range checks here, rather than a bare
+// cast, so a corrupted/unexpected value errors instead of silently
+// wrapping — same reasoning as this codebase's other narrowing
+// conversions (e.g. model's TTL narrowing).
+func modelFIEToAPIv1(fie *model.ForwardingInfoElement) (api.ForwardingInfoElement, error) {
+	if fie.IPVersion < 0 || fie.IPVersion > 255 {
+		return api.ForwardingInfoElement{}, fmt.Errorf("ip_version %d exceeds uint8 range", fie.IPVersion)
+	}
+	if fie.Protocol < 0 || fie.Protocol > 255 {
+		return api.ForwardingInfoElement{}, fmt.Errorf("protocol %d exceeds uint8 range", fie.Protocol)
+	}
+
+	out := api.ForwardingInfoElement{
+		Agent:               api.Agent{AgentID: fie.Agent.ID},
+		ProbingDirectiveID:  fie.ProbingDirectiveID,
+		IPVersion:           api.IPVersion(fie.IPVersion), //nolint:gosec // range-checked above
+		Protocol:            api.Protocol(fie.Protocol),   //nolint:gosec // range-checked above
+		SourceAddress:       fie.SourceAddress,
+		DestinationAddress:  fie.DestinationAddress,
+		ProductionTimestamp: fie.ProductionTimestamp,
+	}
+	if fie.NearInfo != nil {
+		out.NearInfo = &api.Info{
+			ProbeTTL:          fie.NearInfo.ProbeTTL,
+			ReplyAddress:      fie.NearInfo.ReplyAddress,
+			SentTimestamp:     fie.NearInfo.SentTimestamp,
+			ReceivedTimestamp: fie.NearInfo.ReceivedTimestamp,
+		}
+	}
+	if fie.FarInfo != nil {
+		out.FarInfo = &api.Info{
+			ProbeTTL:          fie.FarInfo.ProbeTTL,
+			ReplyAddress:      fie.FarInfo.ReplyAddress,
+			SentTimestamp:     fie.FarInfo.SentTimestamp,
+			ReceivedTimestamp: fie.FarInfo.ReceivedTimestamp,
+		}
+	}
+	return out, nil
 }
 
 func (o *orch) fieStreamHandler(s *fieClient) {
@@ -278,8 +342,14 @@ func (o *orch) fieStreamHandler(s *fieClient) {
 			}
 			return
 		}
+		apiFIE, err := modelFIEToAPIv1(fie)
+		if err != nil {
+			closeReason = "internal_error"
+			o.logger.Error("Failed to convert FIE for HTTP client", slog.Any("err", err))
+			return
+		}
 		seqFIE := &SequencedFIE{
-			ForwardingInfoElement: *fie,
+			ForwardingInfoElement: apiFIE,
 			SequenceNumber:        seq,
 		}
 
@@ -328,14 +398,12 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 				slog.String("agent_id", status.agentID),
 				slog.Uint64("pd_id", fie.ProbingDirectiveID),
 				slog.Bool("complete", fie.NearInfo != nil && fie.FarInfo != nil))
+
 			if err := o.scheduler.UpdateFromFIE(fie); err != nil {
 				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.agentID, "err", err)
 			}
 
-			allow, err := o.filterFIE(fie)
-			if err != nil {
-				return fmt.Errorf("error on filtering FIE: %w", err)
-			}
+			allow := o.filterFIE(fie)
 			if !allow {
 				continue
 			}
@@ -374,31 +442,35 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 	}
 }
 
-func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
+// agentAuthHandler takes/returns *wire.AuthRequest/AuthResponse — pointers,
+// not values, since these generated proto messages embed a sync.Mutex
+// (via protoimpl.MessageState) that copylocks correctly flags if copied
+// by value. See authHandleFunc's doc comment in agent_server.go.
+func (o *orch) agentAuthHandler(auth *wire.AuthRequest) *wire.AuthResponse {
 	if auth.Secret == o.config.Secret {
-		return api.AuthResponse{
+		return &wire.AuthResponse{
 			Authenticated: true,
 			Message:       "authenticated",
 		}
 	}
 	o.logger.Warn("Agent authentication failed")
-	return api.AuthResponse{
+	return &wire.AuthResponse{
 		Authenticated: false,
 		Message:       "secret is not correct",
 	}
 }
 
 // filterFIE reports whether a FIE should be streamed based on the policy.
-// Returns true if the FIE is allowed.
-func (o *orch) filterFIE(fie *api.ForwardingInfoElement) (bool, error) {
+// No longer returns an error: the policy is validated once in
+// Config.Validate() against an immutable config copy, so the default
+// case below is unreachable in practice.
+func (o *orch) filterFIE(fie *model.ForwardingInfoElement) bool {
 	switch o.config.FIEFilterPolicy {
 	case "any": // allow all FIEs
-		return true, nil
-	case "both": // allow FIEs with two non-nil response addresses
-		return fie.NearInfo != nil && fie.FarInfo != nil, nil
+		return true
 	case "one": // allow FIEs with at least one non-nil response address
-		return fie.NearInfo != nil || fie.FarInfo != nil, nil
-	default:
-		return false, fmt.Errorf("unsupported fie filtering policy: %q", o.config.FIEFilterPolicy)
+		return fie.NearInfo != nil || fie.FarInfo != nil
+	default: // "both", already the only other value Config.Validate() allows
+		return fie.NearInfo != nil && fie.FarInfo != nil
 	}
 }
