@@ -5,16 +5,20 @@ package orchestrator
 
 import (
 	"bufio"
-	"encoding/json"
+	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // SchedulerConfig holds the configuration for the Scheduler.
@@ -40,7 +44,7 @@ type pdState struct {
 	issuanceProb       float64
 	consecutiveMisses  int
 	evictionCount      int
-	directive          *api.ProbingDirective
+	directive          *model.ProbingDirective
 }
 
 // unusedPD is a lightweight representation of a ProbingDirective in the unused
@@ -48,7 +52,7 @@ type pdState struct {
 // only meaningful for active directives, reducing memory usage at scale.
 type unusedPD struct {
 	evictionCount int
-	directive     *api.ProbingDirective
+	directive     *model.ProbingDirective
 }
 
 // promote converts an unusedPD to a pdState ready for insertion into the active set.
@@ -62,16 +66,16 @@ func (u *unusedPD) promote() *pdState {
 
 // ipIdx returns 0 for IPv4 and 1 for IPv6, used to index the per-protocol
 // unused pool slices.
-func ipIdx(ipVersion api.IPVersion) int {
-	if ipVersion == api.IPv6 {
+func ipIdx(ipVersion wire.IPVersion) int {
+	if ipVersion == wire.IPVersion_IP_VERSION_IPV6 {
 		return 1
 	}
 	return 0
 }
 
 // ipVersionLabel returns a compact label for the IP version, used in metrics.
-func ipVersionLabel(ipVersion api.IPVersion) string {
-	if ipVersion == api.IPv6 {
+func ipVersionLabel(ipVersion wire.IPVersion) string {
+	if ipVersion == wire.IPVersion_IP_VERSION_IPV6 {
 		return "6"
 	}
 	return "4"
@@ -120,7 +124,7 @@ type Scheduler struct {
 // to avoid IP range bias in the active set.
 // seen tracks all PD IDs across both V4 and V6 calls to detect duplicates.
 func loadPDsIntoPool(
-	pds []*api.ProbingDirective,
+	pds []*model.ProbingDirective,
 	maxActive int,
 	pdMap map[uint64]*pdState,
 	indices *[]uint64,
@@ -152,10 +156,10 @@ func loadPDsIntoPool(
 
 // loadAllPDs reads the V4 and V6 PD files from config. Either path may be empty,
 // but at least one file must produce non-zero PDs.
-func loadAllPDs(config *SchedulerConfig) ([]*api.ProbingDirective, []*api.ProbingDirective, error) {
+func loadAllPDs(config *SchedulerConfig) ([]*model.ProbingDirective, []*model.ProbingDirective, error) {
 	var (
 		err          error
-		v4pds, v6pds []*api.ProbingDirective
+		v4pds, v6pds []*model.ProbingDirective
 	)
 	if config.PDPathV4 != "" {
 		v4pds, err = readPDs(config.PDPathV4)
@@ -178,12 +182,23 @@ func loadAllPDs(config *SchedulerConfig) ([]*api.ProbingDirective, []*api.Probin
 // NewScheduler creates a new Scheduler from the given configuration.
 // Returns an error if the configuration is invalid or the PD files cannot be read.
 func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics) (*Scheduler, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if config.IssuanceRate <= 0 {
+		return nil, fmt.Errorf("IssuanceRate must be greater than zero: got %f", config.IssuanceRate)
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if metrics == nil {
 		return nil, fmt.Errorf("metrics cannot be nil")
 	}
+
+	// Defensive copy so the caller can't mutate config out from under
+	// concurrent reads after construction.
+	configCopy := *config
+	config = &configCopy
 
 	v4pds, v6pds, err := loadAllPDs(config)
 	if err != nil {
@@ -199,6 +214,7 @@ func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics
 	pdMap := make(map[uint64]*pdState, config.ActiveSetSize)
 	indices := make([]uint64, 0, config.ActiveSetSize)
 	unusedByAgent := make(map[string][2][]*unusedPD)
+
 	halfActive := config.ActiveSetSize / 2
 
 	// When only one protocol is present, give all active set slots to that protocol.
@@ -226,7 +242,7 @@ func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics
 	totalPDs := len(v4pds) + len(v6pds)
 	metrics.PDsTotal.Set(float64(totalPDs))
 	metrics.PDsActiveTotal.Set(float64(len(pdMap)))
-	for _, ipVer := range []api.IPVersion{api.IPv4, api.IPv6} {
+	for _, ipVer := range []wire.IPVersion{wire.IPVersion_IP_VERSION_IPV4, wire.IPVersion_IP_VERSION_IPV6} {
 		total := 0
 		for _, pools := range unusedByAgent {
 			total += len(pools[ipIdx(ipVer)])
@@ -253,9 +269,9 @@ func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics
 // rate limit allows the next issuance, then runs a Bernoulli experiment to
 // decide whether to issue the directive. If the Bernoulli experiment fails,
 // the directive is replaced with a new candidate from the unused pool for the
-// same agent and protocol. Returns nil if the active set is empty or the
-// unused pool is exhausted.
-func (s *Scheduler) NextPD() *api.ProbingDirective {
+// same agent and protocol. Returns nil if the active set is empty, the
+// unused pool is exhausted, or ctx is canceled while waiting.
+func (s *Scheduler) NextPD(ctx context.Context) *model.ProbingDirective {
 	s.mutex.Lock()
 	oldCycle := s.randomizer.Cycle()
 	pd := s.pdMap[s.randomizer.Next()]
@@ -269,17 +285,8 @@ func (s *Scheduler) NextPD() *api.ProbingDirective {
 	}
 	s.mutex.Unlock()
 
-	if s.issuancePeriod >= 10*time.Millisecond {
-		time.Sleep(time.Until(nextTime))
-	} else {
-		// Busy-wait for sub-10ms periods: time.Sleep's effective resolution on
-		// Linux (timer slack, scheduler granularity, C-states) can be several
-		// milliseconds under load, which would distort high issuance rates.
-		// Note: at very high rates (e.g. 25k PD/s, period=40µs), this spins a
-		// core continuously. A ticker-based batching approach should be considered
-		// if sustained rates above ~1k PD/s are needed.
-		for time.Now().Before(nextTime) {
-		}
+	if !s.waitUntil(ctx, nextTime) {
+		return nil
 	}
 
 	s.mutex.Lock()
@@ -302,9 +309,17 @@ func (s *Scheduler) NextPD() *api.ProbingDirective {
 		return pd.directive
 	}
 
+	// pd may have been replaced by a concurrent UpdateFromFIE call since
+	// selection — re-check it's still active before replacing it again.
 	s.mutex.Lock()
+	current, stillActive := s.pdMap[pd.directive.ProbingDirectiveID]
+	if !stillActive || current != pd {
+		s.mutex.Unlock()
+		return nil
+	}
 	replacement := s.replacePD(pd)
 	s.mutex.Unlock()
+
 	s.metrics.PDsReplacedBernoulliTotal.WithLabelValues(pd.directive.AgentID).Inc()
 	s.logger.Debug("PD replaced (Bernoulli)",
 		slog.Uint64("pd_id", pd.directive.ProbingDirectiveID))
@@ -314,6 +329,45 @@ func (s *Scheduler) NextPD() *api.ProbingDirective {
 	s.logger.Error("No replacement available, pool exhausted",
 		slog.String("agent_id", pd.directive.AgentID))
 	return nil
+}
+
+// waitUntil blocks until nextTime or ctx is canceled, whichever comes
+// first. Returns false if ctx was canceled before nextTime was reached.
+// Split out of NextPD to keep that function's cyclomatic complexity down —
+// this logic is self-contained (only reads s.issuancePeriod) and doesn't
+// need to be inlined.
+func (s *Scheduler) waitUntil(ctx context.Context, nextTime time.Time) bool {
+	if s.issuancePeriod >= 10*time.Millisecond {
+		timer := time.NewTimer(time.Until(nextTime))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+
+	// Busy-wait for sub-10ms periods: time.Sleep's effective resolution on
+	// Linux (timer slack, scheduler granularity, C-states) can be several
+	// milliseconds under load, which would distort high issuance rates.
+	// Yield/sleep near the end instead of spinning the whole window —
+	// same precision, less CPU pinned. Checks ctx each iteration so
+	// cancellation can interrupt the wait rather than spinning past it.
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		remaining := time.Until(nextTime)
+		if remaining <= 0 {
+			return true
+		}
+		if remaining > 100*time.Microsecond {
+			time.Sleep(remaining - 50*time.Microsecond)
+		} else {
+			runtime.Gosched()
+		}
+	}
 }
 
 // recycleOrEvict returns the PD to the unused pool or permanently evicts it
@@ -357,6 +411,9 @@ func (s *Scheduler) replacePD(pd *pdState) *pdState {
 	pools := s.unusedByAgent[agentID]
 	unused := pools[ipVersion]
 	if len(unused) == 0 {
+		// Active set permanently shrinks here — no fallback policy
+		// (draw from another agent/protocol, reset and reinsert) is
+		// implemented; left as a product decision, not guessed.
 		s.logger.Warn("Unused pool exhausted for agent and protocol",
 			slog.String("agent_id", agentID),
 			slog.String("ip_version", ipVersionLabel(pd.directive.IPVersion)))
@@ -372,7 +429,6 @@ func (s *Scheduler) replacePD(pd *pdState) *pdState {
 	pools[ipVersion] = unused[:len(unused)-1]
 	s.unusedByAgent[agentID] = pools
 	s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(pd.directive.IPVersion)).Dec()
-
 	// Promote replacement to active pdState and add to active set
 	replacement := rawReplacement.promote()
 	s.pdMap[replacement.directive.ProbingDirectiveID] = replacement
@@ -393,7 +449,7 @@ func (s *Scheduler) replacePD(pd *pdState) *pdState {
 // absent — to trigger replacement of unresponsive directives. A directive
 // is considered yielding only when both near and far replies are present.
 // Returns an error if the directive ID is not recognized.
-func (s *Scheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
+func (s *Scheduler) UpdateFromFIE(fie *model.ForwardingInfoElement) error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
@@ -442,7 +498,9 @@ func (s *Scheduler) UpdateFromFIE(fie *api.ForwardingInfoElement) error {
 	if maxImpacts <= 1 {
 		pd.issuanceProb = 1.0
 	} else {
-		cycleDuration := float64(s.config.ActiveSetSize) / s.config.IssuanceRate
+		// Actual active-set size, not the configured target — it's an
+		// upper bound and can shrink (see replacePD).
+		cycleDuration := float64(len(s.pdMap)) / s.config.IssuanceRate
 		pd.issuanceProb = min(1.0, s.config.ImpactThreshold*cycleDuration/float64(maxImpacts))
 	}
 
@@ -495,16 +553,24 @@ func (s *Scheduler) removeImpact(address net.IP, pd *pdState) {
 	}
 }
 
-// ipKey returns a normalized string key for a net.IP address, suitable for
-// use as a map key. Returns an empty string for nil addresses.
+// ipKey returns a normalized string key for a net.IP address. Returns ""
+// for a nil address or one To16() can't normalize.
 func ipKey(ip net.IP) string {
 	if ip == nil {
 		return ""
 	}
-	return ip.To16().String()
+	normalized := ip.To16()
+	if normalized == nil {
+		return ""
+	}
+	return normalized.String()
 }
 
-func readPDs(filepath string) ([]*api.ProbingDirective, error) {
+// readPDs reads a PD file and returns the parsed directives. Each line is
+// a protojson-encoded wire.ProbingDirective — protojson is used rather
+// than encoding/json because it understands oneofs (next_header) and
+// accepts numeric enum values, both confirmed against a real file sample.
+func readPDs(filepath string) ([]*model.ProbingDirective, error) {
 	f, err := os.Open(filepath) //nolint:gosec
 	if err != nil {
 		return nil, fmt.Errorf("cannot open file: %w", err)
@@ -513,20 +579,28 @@ func readPDs(filepath string) ([]*api.ProbingDirective, error) {
 		_ = f.Close()
 	}()
 
-	var results []*api.ProbingDirective
+	var results []*model.ProbingDirective
 	scanner := bufio.NewScanner(f)
+	// 4MiB max (default ~64KiB), in case a directive line is unusually large.
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
-		line := scanner.Bytes()
+		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
-			continue // skip blank lines
+			continue // skip blank or whitespace-only lines
 		}
-		var obj api.ProbingDirective
-		if err := json.Unmarshal(line, &obj); err != nil {
+
+		var wirePD wire.ProbingDirective
+		if err := protojson.Unmarshal(line, &wirePD); err != nil {
 			return nil, fmt.Errorf("cannot unmarshal line %d: %w", lineNum, err)
 		}
-		results = append(results, &obj)
+
+		pd, err := model.ProbingDirectiveFromProto(&wirePD)
+		if err != nil {
+			return nil, fmt.Errorf("invalid PD on line %d: %w", lineNum, err)
+		}
+		results = append(results, &pd)
 	}
 
 	if err := scanner.Err(); err != nil {
