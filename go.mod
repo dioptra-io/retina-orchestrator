@@ -3,7 +3,7 @@ module github.com/dioptra-io/retina-orchestrator
 go 1.25.7
 
 require (
-	github.com/dioptra-io/retina-commons v1.0.1-0.20260826144704-2be8f7eba49f
+	github.com/dioptra-io/retina-commons v1.0.1-0.20260828124422-c68dfe358527
 	github.com/prometheus/client_golang v1.23.2
 	github.com/swaggo/http-swagger v1.3.4
 	github.com/swaggo/swag v1.16.6
