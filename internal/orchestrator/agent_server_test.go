@@ -3,12 +3,14 @@
 package orchestrator
 
 import (
-	"encoding/json"
 	"net"
 	"testing"
 	"time"
 
-	api "github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/framing"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Remaining coverage gaps are unreachable without refactoring *net.TCPConn to
@@ -20,6 +22,11 @@ import (
 //   - listenAndServe: non-TCP type assertion, newAgentStream error continue,
 //     second shutdown race after listener setup — all require syscall-level
 //     error injection on *net.TCPConn.
+//
+// send[E]/receive[E]'s own round-trip, timeout, and decode-error behavior is
+// covered directly in retina-commons/framing's test suite, not duplicated
+// here — this file only exercises them through the orchestrator's actual
+// call sites (handshake, sendPD, receiveFIE).
 
 // -- helpers ------------------------------------------------------------------
 
@@ -34,6 +41,9 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
+// newTCPPair is a shared helper (also used by orchestrator_test.go, same
+// package) for tests that need a real connected TCP pair rather than going
+// through the full agentServer accept/handshake flow.
 func newTCPPair(t *testing.T) (client, server *net.TCPConn) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -75,12 +85,12 @@ func newTestAgentServer(t *testing.T, auth authHandleFunc, agent agentHandleFunc
 	return s, addr
 }
 
-var allowAll authHandleFunc = func(_ api.AuthRequest) api.AuthResponse {
-	return api.AuthResponse{Authenticated: true}
+var allowAll authHandleFunc = func(_ *wire.AuthRequest) *wire.AuthResponse {
+	return &wire.AuthResponse{Authenticated: true}
 }
 
-var denyAll authHandleFunc = func(_ api.AuthRequest) api.AuthResponse {
-	return api.AuthResponse{Authenticated: false, Message: "denied"}
+var denyAll authHandleFunc = func(_ *wire.AuthRequest) *wire.AuthResponse {
+	return &wire.AuthResponse{Authenticated: false, Message: "denied"}
 }
 
 var nopAgentHandler agentHandleFunc = func(_ *agentAuthStatus, _ *agentStream) {}
@@ -91,21 +101,46 @@ func startAgentServer(t *testing.T, s *agentServer) {
 	time.Sleep(20 * time.Millisecond)
 }
 
-// doHandshake sends an AuthRequest and returns the AuthResponse along with the
-// persistent decoder. Callers that read further messages from conn must reuse
-// the returned decoder — creating a new one would re-buffer bytes already
-// consumed, silently discarding them.
-func doHandshake(t *testing.T, conn net.Conn, req api.AuthRequest) (api.AuthResponse, *json.Decoder) {
+// doHandshake sends an AuthRequest and returns the AuthResponse. Unlike the
+// old JSON-based version, there's no decoder to thread through to callers —
+// framing.Receive reads directly off conn each call, with no buffering state
+// to preserve across calls. Takes/returns pointers, not values — these
+// generated proto messages embed a sync.Mutex that copylocks flags if
+// copied by value.
+func doHandshake(t *testing.T, conn net.Conn, req *wire.AuthRequest) *wire.AuthResponse {
 	t.Helper()
-	dec := json.NewDecoder(conn)
-	if err := json.NewEncoder(conn).Encode(req); err != nil { //nolint:gosec // G117: test helper, not a real secret
+	if err := framing.Send(conn, 0, req); err != nil {
 		t.Fatalf("cannot send auth request: %v", err)
 	}
-	var resp api.AuthResponse
-	if err := dec.Decode(&resp); err != nil {
+	var resp wire.AuthResponse
+	if err := framing.Receive(conn, 0, &resp); err != nil {
 		t.Fatalf("cannot decode auth response: %v", err)
 	}
-	return resp, dec
+	return &resp
+}
+
+// validPD returns a ProbingDirective with the fields model.ProbingDirective.
+// ToProto() requires (DestinationAddress) filled in — the old api.ProbingDirective
+// had no such validation, so pre-migration tests could get away with a bare
+// literal; this can't.
+func validPD(id uint64) *model.ProbingDirective {
+	return &model.ProbingDirective{
+		ProbingDirectiveID: id,
+		DestinationAddress: net.ParseIP("192.0.2.1"),
+	}
+}
+
+// validWireFIE returns a wire.ForwardingInfoElement with the fields
+// model.ForwardingInfoElementFromProto requires (Agent, SourceAddress,
+// DestinationAddress, ProductionTimestamp) — same reasoning as validPD.
+func validWireFIE(pdID uint64) *wire.ForwardingInfoElement {
+	return &wire.ForwardingInfoElement{
+		Agent:               &wire.Agent{AgentId: "a1"},
+		ProbingDirectiveId:  pdID,
+		SourceAddress:       "192.0.2.2",
+		DestinationAddress:  "192.0.2.1",
+		ProductionTimestamp: timestamppb.New(time.Now()),
+	}
 }
 
 // -- newAgentServer -----------------------------------------------------------
@@ -255,7 +290,7 @@ func TestClose_Timeout(t *testing.T) {
 		t.Fatalf("cannot dial: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
-	doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
+	doHandshake(t, conn, &wire.AuthRequest{AgentId: "a1"})
 	<-started
 
 	err = s.close(time.Millisecond)
@@ -282,7 +317,7 @@ func TestHandshake_Success(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	resp, _ := doHandshake(t, conn, api.AuthRequest{AgentID: "agent-1", Secret: "s"})
+	resp := doHandshake(t, conn, &wire.AuthRequest{AgentId: "agent-1", Secret: "s"})
 	if !resp.Authenticated {
 		t.Fatalf("expected authenticated, got: %s", resp.Message)
 	}
@@ -308,7 +343,7 @@ func TestHandshake_Failure(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	resp, _ := doHandshake(t, conn, api.AuthRequest{AgentID: "bad", Secret: "wrong"})
+	resp := doHandshake(t, conn, &wire.AuthRequest{AgentId: "bad", Secret: "wrong"})
 	if resp.Authenticated {
 		t.Fatal("expected not authenticated")
 	}
@@ -336,7 +371,7 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 
 	handshakeTimeout := 100 * time.Millisecond
 	addr := freeAddr(t)
-	fieCh := make(chan *api.ForwardingInfoElement, 1)
+	fieCh := make(chan *model.ForwardingInfoElement, 1)
 
 	s, err := newAgentServer(&agentServerConfig{
 		address:          addr,
@@ -344,7 +379,7 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 		bufferLength:     4096,
 		authHandler:      allowAll,
 		agentHandler: func(_ *agentAuthStatus, stream *agentStream) {
-			if err := stream.sendPD(&api.ProbingDirective{ProbingDirectiveID: 1}); err != nil {
+			if err := stream.sendPD(validPD(1)); err != nil {
 				return
 			}
 			fie, err := stream.receiveFIE()
@@ -366,21 +401,20 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Reuse the decoder from doHandshake to avoid losing buffered bytes.
-	_, dec := doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
+	doHandshake(t, conn, &wire.AuthRequest{AgentId: "a1"})
 
 	// Read the PD immediately — the server sends it right after auth.
-	var pd api.ProbingDirective
-	if err := dec.Decode(&pd); err != nil {
+	var wirePD wire.ProbingDirective
+	if err := framing.Receive(conn, 0, &wirePD); err != nil {
 		t.Fatalf("cannot decode PD: %v", err)
 	}
 
 	// Wait longer than handshakeTimeout before sending the FIE — if the
 	// deadline is not cleared, the server-side connection will have timed
-	// out by now and the encode below will fail.
+	// out by now and the send below will fail.
 	time.Sleep(handshakeTimeout * 3)
 
-	if err := json.NewEncoder(conn).Encode(&api.ForwardingInfoElement{ProbingDirectiveID: 1}); err != nil {
+	if err := framing.Send(conn, 0, validWireFIE(1)); err != nil {
 		t.Fatalf("connection timed out after handshake — deadline not cleared: %v", err)
 	}
 
@@ -391,103 +425,6 @@ func TestHandshake_DeadlineClearedAfterAuth(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("did not receive FIE — connection may have timed out")
-	}
-}
-
-// -- send / receive -----------------------------------------------------------
-
-func TestSendReceive_RoundTrip(t *testing.T) {
-	t.Parallel()
-	client, server := newTCPPair(t)
-	defer func() { _ = client.Close() }()
-	defer func() { _ = server.Close() }()
-
-	pd := &api.ProbingDirective{ProbingDirectiveID: 99}
-	if err := send(client, json.NewEncoder(client), 0, pd); err != nil {
-		t.Fatalf("send failed: %v", err)
-	}
-	got, err := receive[api.ProbingDirective](server, json.NewDecoder(server), 0)
-	if err != nil {
-		t.Fatalf("receive failed: %v", err)
-	}
-	if got.ProbingDirectiveID != 99 {
-		t.Errorf("expected ID 99, got %d", got.ProbingDirectiveID)
-	}
-}
-
-func TestSendReceive_WithTimeout(t *testing.T) {
-	t.Parallel()
-	client, server := newTCPPair(t)
-	defer func() { _ = client.Close() }()
-	defer func() { _ = server.Close() }()
-
-	fie := &api.ForwardingInfoElement{ProbingDirectiveID: 7}
-	if err := send(client, json.NewEncoder(client), time.Second, fie); err != nil {
-		t.Fatalf("send with timeout failed: %v", err)
-	}
-	got, err := receive[api.ForwardingInfoElement](server, json.NewDecoder(server), time.Second)
-	if err != nil {
-		t.Fatalf("receive with timeout failed: %v", err)
-	}
-	if got.ProbingDirectiveID != 7 {
-		t.Errorf("expected ID 7, got %d", got.ProbingDirectiveID)
-	}
-}
-
-func TestSend_WriteDeadlineError(t *testing.T) {
-	t.Parallel()
-	client, server := newTCPPair(t)
-	_ = server.Close()
-	_ = client.Close()
-
-	if err := send(client, json.NewEncoder(client), time.Second, &api.ProbingDirective{}); err == nil {
-		t.Fatal("expected error sending on closed connection, got nil")
-	}
-}
-
-func TestSend_EncodeError(t *testing.T) {
-	t.Parallel()
-	client, server := newTCPPair(t)
-	_ = server.Close()
-	_ = client.Close()
-
-	if err := send(client, json.NewEncoder(client), 0, &api.ProbingDirective{}); err == nil {
-		t.Fatal("expected encode error sending on closed connection, got nil")
-	}
-}
-
-func TestReceive_DecodeError(t *testing.T) {
-	t.Parallel()
-	client, server := newTCPPair(t)
-	defer func() { _ = server.Close() }()
-
-	if _, err := client.Write([]byte("not json\n")); err != nil {
-		t.Fatalf("cannot write: %v", err)
-	}
-	_ = client.Close()
-
-	if _, err := receive[api.ProbingDirective](server, json.NewDecoder(server), 0); err == nil {
-		t.Fatal("expected decode error, got nil")
-	}
-}
-
-func TestReceive_DeadlineExceeded(t *testing.T) {
-	t.Parallel()
-	_, server := newTCPPair(t)
-	defer func() { _ = server.Close() }()
-
-	if _, err := receive[api.ProbingDirective](server, json.NewDecoder(server), time.Millisecond); err == nil {
-		t.Fatal("expected timeout error, got nil")
-	}
-}
-
-func TestReceive_ReadDeadlineError(t *testing.T) {
-	t.Parallel()
-	_, server := newTCPPair(t)
-	_ = server.Close()
-
-	if _, err := receive[api.ProbingDirective](server, json.NewDecoder(server), time.Second); err == nil {
-		t.Fatal("expected error receiving on closed connection, got nil")
 	}
 }
 
@@ -507,7 +444,7 @@ func TestAgentStream_Context(t *testing.T) {
 		t.Fatalf("cannot dial: %v", err)
 	}
 	defer func() { _ = conn.Close() }()
-	doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
+	doHandshake(t, conn, &wire.AuthRequest{AgentId: "a1"})
 
 	select {
 	case ok := <-ctxCh:
@@ -521,9 +458,9 @@ func TestAgentStream_Context(t *testing.T) {
 
 func TestAgentStream_SendPDReceiveFIE(t *testing.T) {
 	t.Parallel()
-	fieCh := make(chan *api.ForwardingInfoElement, 1)
+	fieCh := make(chan *model.ForwardingInfoElement, 1)
 	s, addr := newTestAgentServer(t, allowAll, func(_ *agentAuthStatus, stream *agentStream) {
-		if err := stream.sendPD(&api.ProbingDirective{ProbingDirectiveID: 42}); err != nil {
+		if err := stream.sendPD(validPD(42)); err != nil {
 			return
 		}
 		fie, err := stream.receiveFIE()
@@ -541,18 +478,17 @@ func TestAgentStream_SendPDReceiveFIE(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	// Reuse the decoder from doHandshake to avoid re-buffering bytes already consumed.
-	_, dec := doHandshake(t, conn, api.AuthRequest{AgentID: "a1"})
+	doHandshake(t, conn, &wire.AuthRequest{AgentId: "a1"})
 
-	var pd api.ProbingDirective
-	if err := dec.Decode(&pd); err != nil {
+	var wirePD wire.ProbingDirective
+	if err := framing.Receive(conn, 0, &wirePD); err != nil {
 		t.Fatalf("cannot decode PD: %v", err)
 	}
-	if pd.ProbingDirectiveID != 42 {
-		t.Errorf("expected PD ID 42, got %d", pd.ProbingDirectiveID)
+	if wirePD.ProbingDirectiveId != 42 {
+		t.Errorf("expected PD ID 42, got %d", wirePD.ProbingDirectiveId)
 	}
 
-	if err := json.NewEncoder(conn).Encode(&api.ForwardingInfoElement{ProbingDirectiveID: 42}); err != nil {
+	if err := framing.Send(conn, 0, validWireFIE(42)); err != nil {
 		t.Fatalf("cannot encode FIE: %v", err)
 	}
 
@@ -563,5 +499,49 @@ func TestAgentStream_SendPDReceiveFIE(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("did not receive FIE in time")
+	}
+}
+
+// -- sendPD / receiveFIE conversion errors -------------------------------------
+
+// TestAgentStream_SendPD_ToProtoError covers sendPD's own conversion-error
+// branch (pd.ToProto() failing) as distinct from a network-level send
+// failure — TestAgentHandler_SendPDError already covers the latter.
+func TestAgentStream_SendPD_ToProtoError(t *testing.T) {
+	t.Parallel()
+	client, server := newTCPPair(t)
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+
+	stream := &agentStream{conn: server}
+
+	// Missing DestinationAddress — pd.ToProto() rejects this before any
+	// network I/O happens.
+	if err := stream.sendPD(&model.ProbingDirective{ProbingDirectiveID: 1}); err == nil {
+		t.Fatal("expected error for PD with missing DestinationAddress, got nil")
+	}
+}
+
+// TestAgentStream_ReceiveFIE_FromProtoError covers receiveFIE's own
+// conversion-error branch (ForwardingInfoElementFromProto failing on a
+// well-framed but semantically invalid message) as distinct from a
+// framing-level receive failure.
+func TestAgentStream_ReceiveFIE_FromProtoError(t *testing.T) {
+	t.Parallel()
+	client, server := newTCPPair(t)
+	defer func() { _ = client.Close() }()
+	defer func() { _ = server.Close() }()
+
+	stream := &agentStream{conn: server}
+
+	// Well-framed but missing required fields (Agent, SourceAddress,
+	// DestinationAddress, ProductionTimestamp) — framing.Receive succeeds,
+	// but the model conversion rejects it.
+	go func() {
+		_ = framing.Send(client, 0, &wire.ForwardingInfoElement{ProbingDirectiveId: 1})
+	}()
+
+	if _, err := stream.receiveFIE(); err == nil {
+		t.Fatal("expected error for malformed FIE, got nil")
 	}
 }

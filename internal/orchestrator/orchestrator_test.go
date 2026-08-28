@@ -8,12 +8,17 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"testing"
 	"time"
 
-	api "github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/framing"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Intentionally uncovered:
@@ -26,6 +31,13 @@ import (
 //     failure unrelated to shutdown — not injectable without refactoring.
 //   - fieStreamHandler: internal_error on Pop requires a non-context error
 //     from RingBuffer, which has no injectable trigger.
+//   - agentHandler: the o.scheduler.UpdateFromFIE error-log branch is
+//     unreachable with the real *Scheduler — UpdateFromFIE's only two
+//     return points both return nil, so the error path exists on the
+//     method signature but nothing in its body ever populates it. Testing
+//     this would need agentHandler to depend on a Scheduler interface
+//     rather than the concrete type, purely to inject a fake that errors —
+//     not worth that structural change for one log line.
 
 // -- helpers ------------------------------------------------------------------
 
@@ -37,15 +49,29 @@ func testMetrics() *Metrics {
 	return NewMetrics(prometheus.NewRegistry())
 }
 
+// writePDFile writes a single, valid PD as a protojson-encoded
+// wire.ProbingDirective — readPDs() parses PD files with protojson now
+// (see scheduler.go), and model.ProbingDirectiveFromProto rejects an
+// empty destination_address, so this can't be a bare zero-value literal
+// the way the old api.ProbingDirective version could.
 func writePDFile(t *testing.T) string {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "pds-*.jsonl")
 	if err != nil {
 		t.Fatalf("cannot create temp file: %v", err)
 	}
-	pd := api.ProbingDirective{ProbingDirectiveID: 1, IPVersion: api.IPv4}
-	b, _ := json.Marshal(pd)
-	_, _ = f.Write(append(b, '\n'))
+	pd := &wire.ProbingDirective{
+		ProbingDirectiveId: 1,
+		IpVersion:          wire.IPVersion_IP_VERSION_IPV4,
+		DestinationAddress: "192.0.2.1",
+	}
+	b, err := protojson.Marshal(pd)
+	if err != nil {
+		t.Fatalf("cannot marshal PD: %v", err)
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		t.Fatalf("cannot write PD file: %v", err)
+	}
 	_ = f.Close()
 	return f.Name()
 }
@@ -69,30 +95,43 @@ func validConfig(t *testing.T) *Config {
 	}
 }
 
-// sendFIEs sends a sequence of FIEs to exercise agentHandler FIE receive paths:
-// one with an unknown PD ID (UpdateFromFIE error log), one incomplete (continue
-// branch), and one complete (ring buffer push).
-func sendFIEs(t *testing.T, enc *json.Encoder) {
+// validWireInfo returns an Info with the fields InfoFromProto requires
+// (timestamps are always required in this schema — see retina-commons/model).
+func validWireInfo() *wire.Info {
+	return &wire.Info{
+		ProbeTtl:          1,
+		SentTimestamp:     timestamppb.New(time.Now()),
+		ReceivedTimestamp: timestamppb.New(time.Now()),
+	}
+}
+
+// validWireFIE is defined in agent_server_test.go (same package) — reused
+// here rather than redefined.
+
+// sendFIEs sends a sequence of FIEs over conn to exercise agentHandler FIE
+// receive paths: one with an unknown PD ID (UpdateFromFIE error log), one
+// incomplete (continue branch), and one complete (ring buffer push). Each
+// FIE is otherwise fully valid — see validWireFIE's doc comment for why a
+// bare/empty literal no longer works here the way api.ForwardingInfoElement
+// allowed.
+func sendFIEs(t *testing.T, conn net.Conn) {
 	t.Helper()
-	// Unknown PD ID — exercises the UpdateFromFIE error log.
-	if err := enc.Encode(&api.ForwardingInfoElement{
-		ProbingDirectiveID: 999,
-	}); err != nil {
+
+	unknown := validWireFIE(999)
+	if err := framing.Send(conn, 0, unknown); err != nil {
 		t.Fatalf("cannot send unknown FIE: %v", err)
 	}
-	// Incomplete FIE (nil FarInfo) — exercises the continue branch.
-	if err := enc.Encode(&api.ForwardingInfoElement{
-		ProbingDirectiveID: 1,
-		NearInfo:           &api.Info{},
-	}); err != nil {
+
+	incomplete := validWireFIE(1)
+	incomplete.NearInfo = validWireInfo()
+	if err := framing.Send(conn, 0, incomplete); err != nil {
 		t.Fatalf("cannot send incomplete FIE: %v", err)
 	}
-	// Complete FIE — exercises the ring buffer push.
-	if err := enc.Encode(&api.ForwardingInfoElement{
-		ProbingDirectiveID: 1,
-		NearInfo:           &api.Info{},
-		FarInfo:            &api.Info{},
-	}); err != nil {
+
+	complete := validWireFIE(1)
+	complete.NearInfo = validWireInfo()
+	complete.FarInfo = validWireInfo()
+	if err := framing.Send(conn, 0, complete); err != nil {
 		t.Fatalf("cannot send complete FIE: %v", err)
 	}
 }
@@ -240,8 +279,8 @@ func TestRunScheduler_ContextCancelled(t *testing.T) {
 	cancel()
 
 	err = o.runScheduler(ctx)
-	if err != context.Canceled {
-		t.Fatalf("expected context.Canceled, got %v", err)
+	if err != nil {
+		t.Fatalf("expected nil (clean shutdown), got %v", err)
 	}
 }
 
@@ -255,9 +294,8 @@ func TestRunScheduler_SkipsNilPD(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	err = o.runScheduler(ctx)
-	if err != context.DeadlineExceeded && err != context.Canceled {
-		t.Fatalf("expected context error, got %v", err)
+	if err := o.runScheduler(ctx); err != nil {
+		t.Fatalf("expected nil (clean shutdown), got %v", err)
 	}
 }
 
@@ -271,9 +309,8 @@ func TestRunScheduler_DropsWhenNoQueue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err = o.runScheduler(ctx)
-	if err != context.DeadlineExceeded && err != context.Canceled {
-		t.Fatalf("expected context error, got %v", err)
+	if err := o.runScheduler(ctx); err != nil {
+		t.Fatalf("expected nil (clean shutdown), got %v", err)
 	}
 }
 
@@ -285,7 +322,7 @@ func TestRunScheduler_PushesToExistingQueue(t *testing.T) {
 	}
 
 	// Register a consumer for the agent ID used in the PD file (empty string
-	// since writePDFile sets no AgentID).
+	// since writePDFile sets no AgentId).
 	consumer, err := o.pdQueue.NewConsumer("")
 	if err != nil {
 		t.Fatalf("unexpected error creating consumer: %v", err)
@@ -295,9 +332,8 @@ func TestRunScheduler_PushesToExistingQueue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err = o.runScheduler(ctx)
-	if err != context.DeadlineExceeded && err != context.Canceled {
-		t.Fatalf("expected context error, got %v", err)
+	if err := o.runScheduler(ctx); err != nil {
+		t.Fatalf("expected nil (clean shutdown), got %v", err)
 	}
 }
 
@@ -339,6 +375,12 @@ func TestRunAgentServer_StartsAndStops(t *testing.T) {
 
 // -- fieStreamHandler ---------------------------------------------------------
 
+// TestFieStreamHandler_SendsAndStops pushes directly onto the ring buffer,
+// bypassing wire serialization entirely (Push takes a plain
+// *model.ForwardingInfoElement, no ToProto/FromProto involved) — so unlike
+// sendFIEs above, a minimal literal is fine here; nothing validates it on
+// this path. modelFIEToAPIv1 (called inside fieStreamHandler) is a plain
+// field copy with no validation either.
 func TestFieStreamHandler_SendsAndStops(t *testing.T) {
 	t.Parallel()
 	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
@@ -355,10 +397,10 @@ func TestFieStreamHandler_SendsAndStops(t *testing.T) {
 		encoder: json.NewEncoder(&buf),
 	}
 
-	fie := &api.ForwardingInfoElement{
+	fie := &model.ForwardingInfoElement{
 		ProbingDirectiveID: 1,
-		NearInfo:           &api.Info{},
-		FarInfo:            &api.Info{},
+		NearInfo:           &model.Info{},
+		FarInfo:            &model.Info{},
 	}
 
 	done := make(chan struct{})
@@ -400,10 +442,10 @@ func TestFieStreamHandler_SendFIEError(t *testing.T) {
 		encoder: json.NewEncoder(&failWriter{}),
 	}
 
-	fie := &api.ForwardingInfoElement{
+	fie := &model.ForwardingInfoElement{
 		ProbingDirectiveID: 1,
-		NearInfo:           &api.Info{},
-		FarInfo:            &api.Info{},
+		NearInfo:           &model.Info{},
+		FarInfo:            &model.Info{},
 	}
 
 	done := make(chan struct{})
@@ -468,11 +510,9 @@ func TestAgentHandler_ReceivesAndForwardsPD(t *testing.T) {
 	defer cancel()
 
 	stream := &agentStream{
-		conn:    serverConn,
-		ctx:     ctx,
-		cancel:  cancel,
-		encoder: json.NewEncoder(serverConn),
-		decoder: json.NewDecoder(serverConn),
+		conn:   serverConn,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	status := &agentAuthStatus{agentID: "agent-1"}
@@ -486,18 +526,21 @@ func TestAgentHandler_ReceivesAndForwardsPD(t *testing.T) {
 	// Wait for agentHandler to register its consumer before pushing.
 	time.Sleep(20 * time.Millisecond)
 
-	pd := &api.ProbingDirective{ProbingDirectiveID: 1, AgentID: "agent-1"}
+	pd := &model.ProbingDirective{
+		ProbingDirectiveID: 1,
+		AgentID:            "agent-1",
+		DestinationAddress: net.ParseIP("192.0.2.1"),
+	}
 	if err := o.pdQueue.TryPush("agent-1", pd); err != nil {
 		t.Fatalf("unexpected push error: %v", err)
 	}
 
-	var received api.ProbingDirective
-	_ = clientConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	if err := json.NewDecoder(clientConn).Decode(&received); err != nil {
+	var received wire.ProbingDirective
+	if err := framing.Receive(clientConn, 500*time.Millisecond, &received); err != nil {
 		t.Fatalf("cannot decode PD: %v", err)
 	}
-	if received.ProbingDirectiveID != 1 {
-		t.Errorf("expected PD ID 1, got %d", received.ProbingDirectiveID)
+	if received.ProbingDirectiveId != 1 {
+		t.Errorf("expected PD ID 1, got %d", received.ProbingDirectiveId)
 	}
 
 	cancel()
@@ -525,11 +568,9 @@ func TestAgentHandler_ReceivesFIE(t *testing.T) {
 	defer cancel()
 
 	stream := &agentStream{
-		conn:    serverConn,
-		ctx:     ctx,
-		cancel:  cancel,
-		encoder: json.NewEncoder(serverConn),
-		decoder: json.NewDecoder(serverConn),
+		conn:   serverConn,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	status := &agentAuthStatus{agentID: "agent-2"}
@@ -542,7 +583,7 @@ func TestAgentHandler_ReceivesFIE(t *testing.T) {
 
 	// Give agentHandler time to start its goroutines.
 	time.Sleep(20 * time.Millisecond)
-	sendFIEs(t, json.NewEncoder(clientConn))
+	sendFIEs(t, clientConn)
 	time.Sleep(50 * time.Millisecond)
 
 	cancel()
@@ -569,11 +610,9 @@ func TestAgentHandler_SendPDError(t *testing.T) {
 	defer cancel()
 
 	stream := &agentStream{
-		conn:    serverConn,
-		ctx:     ctx,
-		cancel:  cancel,
-		encoder: json.NewEncoder(serverConn),
-		decoder: json.NewDecoder(serverConn),
+		conn:   serverConn,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	status := &agentAuthStatus{agentID: "agent-3"}
@@ -589,8 +628,15 @@ func TestAgentHandler_SendPDError(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	_ = serverConn.Close()
 
-	// Push a PD — sendPD will fail on the closed connection.
-	pd := &api.ProbingDirective{ProbingDirectiveID: 1, AgentID: "agent-3"}
+	// Push a PD with a valid DestinationAddress — so sendPD reaches the
+	// actual network write (and fails there, on the closed connection)
+	// rather than failing earlier at ToProto()'s required-field check,
+	// which would test a different code path than intended here.
+	pd := &model.ProbingDirective{
+		ProbingDirectiveID: 1,
+		AgentID:            "agent-3",
+		DestinationAddress: net.ParseIP("192.0.2.1"),
+	}
 	_ = o.pdQueue.TryPush("agent-3", pd)
 
 	select {
@@ -601,6 +647,13 @@ func TestAgentHandler_SendPDError(t *testing.T) {
 }
 
 // -- filterFIE ----------------------------------------------------------------
+//
+// filterFIE no longer returns an error (see orchestrator.go) — the policy
+// is validated once in Config.Validate() against an immutable config copy,
+// so there's no longer a reachable invalid-policy case to test. The old
+// TestFilterFIE_InvalidPolicy, which forced FIEFilterPolicy to "invalid"
+// after construction to trigger that error path, has no equivalent anymore
+// and is removed rather than repurposed.
 
 func TestFilterFIE_PolicyAny(t *testing.T) {
 	t.Parallel()
@@ -610,11 +663,7 @@ func TestFilterFIE_PolicyAny(t *testing.T) {
 	}
 	o.config.FIEFilterPolicy = "any"
 
-	allow, err := o.filterFIE(&api.ForwardingInfoElement{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !allow {
+	if !o.filterFIE(&model.ForwardingInfoElement{}) {
 		t.Error("expected policy 'any' to allow all FIEs")
 	}
 }
@@ -629,77 +678,22 @@ func TestFilterFIE_PolicyOne(t *testing.T) {
 
 	tests := []struct {
 		name string
-		fie  *api.ForwardingInfoElement
+		fie  *model.ForwardingInfoElement
 		want bool
 	}{
-		{"both nil", &api.ForwardingInfoElement{}, false},
-		{"near only", &api.ForwardingInfoElement{NearInfo: &api.Info{}}, true},
-		{"far only", &api.ForwardingInfoElement{FarInfo: &api.Info{}}, true},
-		{"both set", &api.ForwardingInfoElement{NearInfo: &api.Info{}, FarInfo: &api.Info{}}, true},
+		{"both nil", &model.ForwardingInfoElement{}, false},
+		{"near only", &model.ForwardingInfoElement{NearInfo: &model.Info{}}, true},
+		{"far only", &model.ForwardingInfoElement{FarInfo: &model.Info{}}, true},
+		{"both set", &model.ForwardingInfoElement{NearInfo: &model.Info{}, FarInfo: &model.Info{}}, true},
 	}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			allow, err := o.filterFIE(tt.fie)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if allow != tt.want {
-				t.Errorf("filterFIE(%s) = %v, want %v", tt.name, allow, tt.want)
+			if got := o.filterFIE(tt.fie); got != tt.want {
+				t.Errorf("filterFIE(%s) = %v, want %v", tt.name, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestFilterFIE_InvalidPolicy(t *testing.T) {
-	// Not parallel — uses real TCP connections.
-	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Force an invalid policy after construction to trigger the filterFIE error path.
-	o.config.FIEFilterPolicy = "invalid"
-
-	clientConn, serverConn := newTCPPair(t)
-	defer func() { _ = clientConn.Close() }()
-	defer func() { _ = serverConn.Close() }()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-
-	stream := &agentStream{
-		conn:    serverConn,
-		ctx:     ctx,
-		cancel:  cancel,
-		encoder: json.NewEncoder(serverConn),
-		decoder: json.NewDecoder(serverConn),
-	}
-
-	status := &agentAuthStatus{agentID: "agent-filter"}
-
-	done := make(chan struct{})
-	go func() {
-		o.agentHandler(status, stream)
-		close(done)
-	}()
-
-	time.Sleep(20 * time.Millisecond)
-
-	// Send a complete FIE — filterFIE will fail on the invalid policy.
-	if err := json.NewEncoder(clientConn).Encode(&api.ForwardingInfoElement{
-		ProbingDirectiveID: 1,
-		NearInfo:           &api.Info{},
-		FarInfo:            &api.Info{},
-	}); err != nil {
-		t.Fatalf("cannot send FIE: %v", err)
-	}
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("agentHandler did not return after filterFIE error")
 	}
 }
 
@@ -713,7 +707,7 @@ func TestAgentAuthHandler_ValidSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resp := o.agentAuthHandler(api.AuthRequest{Secret: "mysecret"})
+	resp := o.agentAuthHandler(&wire.AuthRequest{Secret: "mysecret"})
 	if !resp.Authenticated {
 		t.Errorf("expected authenticated, got: %s", resp.Message)
 	}
@@ -727,8 +721,100 @@ func TestAgentAuthHandler_InvalidSecret(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	resp := o.agentAuthHandler(api.AuthRequest{Secret: "wrong"})
+	resp := o.agentAuthHandler(&wire.AuthRequest{Secret: "wrong"})
 	if resp.Authenticated {
 		t.Fatal("expected not authenticated")
+	}
+}
+
+// -- modelFIEToAPIv1 -----------------------------------------------------------
+
+func TestModelFIEToAPIv1_IPVersionOutOfRange(t *testing.T) {
+	t.Parallel()
+	fie := &model.ForwardingInfoElement{IPVersion: wire.IPVersion(256)}
+	if _, err := modelFIEToAPIv1(fie); err == nil {
+		t.Fatal("expected error for out-of-range IPVersion, got nil")
+	}
+}
+
+func TestModelFIEToAPIv1_ProtocolOutOfRange(t *testing.T) {
+	t.Parallel()
+	fie := &model.ForwardingInfoElement{Protocol: wire.Protocol(256)}
+	if _, err := modelFIEToAPIv1(fie); err == nil {
+		t.Fatal("expected error for out-of-range Protocol, got nil")
+	}
+}
+
+// TestFieStreamHandler_ConvertFIEError covers the new error branch added
+// to fieStreamHandler alongside modelFIEToAPIv1's fallibility (see G115
+// fix) — nothing previously pushed a FIE with an out-of-range enum value
+// through the full ring-buffer-to-HTTP-client flow.
+func TestFieStreamHandler_ConvertFIEError(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var buf bytes.Buffer
+	client := &fieClient{
+		ctx:     ctx,
+		flusher: nopFlusher{},
+		encoder: json.NewEncoder(&buf),
+	}
+
+	fie := &model.ForwardingInfoElement{
+		ProbingDirectiveID: 1,
+		IPVersion:          wire.IPVersion(256),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		o.fieStreamHandler(client)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	_ = o.ringBuffer.Push(fie)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fieStreamHandler did not return on FIE conversion error")
+	}
+}
+
+// TestRunScheduler_ContinuesOnNilPDWithValidContext exercises runScheduler's
+// `if pd == nil { continue }` line specifically — distinct from the
+// already-documented TryPush race, and from every other runScheduler test,
+// which only produces a nil pd via context cancellation (caught earlier by
+// runScheduler's own ctx.Err() check, so continue is never reached there).
+//
+// Emptying pdMap directly makes NextPD's selection nil while ctx stays
+// valid: a fresh scheduler's zero-value lastIssuance means the first
+// wait fires almost instantly (nextTime is already in the past, not
+// because of cancellation), so pd==nil and ctx is still valid when
+// runScheduler checks it. The second loop iteration then faces a real
+// ~1s wait (lastIssuance was just updated), which the short test timeout
+// cancels normally — but by then, continue already ran once.
+func TestRunScheduler_ContinuesOnNilPDWithValidContext(t *testing.T) {
+	t.Parallel()
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	for id := range o.scheduler.pdMap {
+		delete(o.scheduler.pdMap, id)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	if err := o.runScheduler(ctx); err != nil {
+		t.Fatalf("expected nil (clean shutdown), got %v", err)
 	}
 }

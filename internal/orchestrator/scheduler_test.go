@@ -3,28 +3,39 @@
 package orchestrator
 
 import (
-	"encoding/json"
+	"context"
 	"net"
 	"os"
 	"testing"
+	"time"
 
-	api "github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// Coverage is ~99%: the only uncovered branch is the `newRandomizer` error path
-// in NewScheduler, which is unreachable — indices is guaranteed non-empty by the
-// `len(v4pds) == 0 && len(v6pds) == 0` guard directly above it.
+// Coverage is ~99%: the only uncovered branches are:
+//   - NewScheduler's `newRandomizer` error path, unreachable — indices is
+//     guaranteed non-empty by the `len(v4pds) == 0 && len(v6pds) == 0`
+//     guard directly above it.
+//   - NextPD's busy-wait loop's runtime.Gosched() branch (the sub-100µs
+//     tail of the Sleep-vs-Gosched split). Deterministically landing
+//     `remaining` inside that narrow window isn't reliably testable —
+//     time.Sleep only guarantees sleeping at least the requested
+//     duration, not precisely it — and the branch itself is a pure
+//     scheduling hint with no behavioral effect, unlike the rest of
+//     NextPD's wait/cancellation/stale-pd logic, which is covered.
 
 // -- helpers ------------------------------------------------------------------
 
-func writeSchedulerPDFile(t *testing.T, pds []*api.ProbingDirective) string {
+func writeSchedulerPDFile(t *testing.T, pds []*wire.ProbingDirective) string {
 	t.Helper()
 	f, err := os.CreateTemp(t.TempDir(), "pds-*.jsonl")
 	if err != nil {
 		t.Fatalf("cannot create temp file: %v", err)
 	}
 	for _, pd := range pds {
-		b, err := json.Marshal(pd)
+		b, err := protojson.Marshal(pd)
 		if err != nil {
 			t.Fatalf("cannot marshal directive: %v", err)
 		}
@@ -38,40 +49,51 @@ func writeSchedulerPDFile(t *testing.T, pds []*api.ProbingDirective) string {
 	return f.Name()
 }
 
-func makePD(id uint64) *api.ProbingDirective {
-	return &api.ProbingDirective{ProbingDirectiveID: id, IPVersion: api.IPv4}
+// makePD/makePDV4/makePDV6 return *wire.ProbingDirective (not *model) since
+// their only use is being written to a file and read back through
+// readPDs() — no need to round-trip through model's net.IP/uint8 typing
+// for that. DestinationAddress is required now: model.ProbingDirectiveFromProto
+// (called inside readPDs) rejects an empty one, unlike the old api.ProbingDirective.
+func makePD(id uint64) *wire.ProbingDirective {
+	return &wire.ProbingDirective{ProbingDirectiveId: id, IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"}
 }
 
 //nolint:unparam // id is always 1 in current tests but is a meaningful parameter
-func makePDV4(id uint64) *api.ProbingDirective {
-	return &api.ProbingDirective{ProbingDirectiveID: id, IPVersion: api.IPv4}
+func makePDV4(id uint64) *wire.ProbingDirective {
+	return &wire.ProbingDirective{ProbingDirectiveId: id, IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"}
 }
 
 //nolint:unparam // id is always 1 in current tests but is a meaningful parameter
-func makePDV6(id uint64) *api.ProbingDirective {
-	return &api.ProbingDirective{ProbingDirectiveID: id, IPVersion: api.IPv6}
+func makePDV6(id uint64) *wire.ProbingDirective {
+	return &wire.ProbingDirective{ProbingDirectiveId: id, IpVersion: wire.IPVersion_IP_VERSION_IPV6, DestinationAddress: "2001:db8::1"}
 }
+
+// makeFIEFull/makeFIETimeout return *model.ForwardingInfoElement, since
+// they're passed directly to UpdateFromFIE — a plain in-memory function
+// call that reads struct fields directly, with no ToProto/FromProto
+// conversion involved. Unlike the PD helpers above, no required-field
+// validation applies here, so these stay minimal, matching the originals.
 
 // makeFIEFull creates a FIE with both near and far replies — considered yielding.
-func makeFIEFull(id uint64, near, far net.IP) *api.ForwardingInfoElement {
-	return &api.ForwardingInfoElement{
+func makeFIEFull(id uint64, near, far net.IP) *model.ForwardingInfoElement {
+	return &model.ForwardingInfoElement{
 		ProbingDirectiveID: id,
-		NearInfo:           &api.Info{ReplyAddress: near},
-		FarInfo:            &api.Info{ReplyAddress: far},
+		NearInfo:           &model.Info{ReplyAddress: near},
+		FarInfo:            &model.Info{ReplyAddress: far},
 	}
 }
 
 // makeFIETimeout creates a FIE with no replies — considered a miss.
-func makeFIETimeout(id uint64) *api.ForwardingInfoElement {
-	return &api.ForwardingInfoElement{ProbingDirectiveID: id}
+func makeFIETimeout(id uint64) *model.ForwardingInfoElement {
+	return &model.ForwardingInfoElement{ProbingDirectiveID: id}
 }
 
-func newTestSchedulerConfig(t *testing.T, pds []*api.ProbingDirective) *SchedulerConfig {
+func newTestSchedulerConfig(t *testing.T, pds []*wire.ProbingDirective) *SchedulerConfig {
 	t.Helper()
 	// Split pds by IP version for the two-file approach.
-	var v4pds, v6pds []*api.ProbingDirective
+	var v4pds, v6pds []*wire.ProbingDirective
 	for _, pd := range pds {
-		if pd.IPVersion == api.IPv6 {
+		if pd.IpVersion == wire.IPVersion_IP_VERSION_IPV6 {
 			v6pds = append(v6pds, pd)
 		} else {
 			v4pds = append(v4pds, pd)
@@ -91,7 +113,7 @@ func newTestSchedulerConfig(t *testing.T, pds []*api.ProbingDirective) *Schedule
 	}
 }
 
-func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
+func newTestScheduler(t *testing.T, pds []*wire.ProbingDirective) *Scheduler {
 	t.Helper()
 	s, err := NewScheduler(newTestSchedulerConfig(t, pds), testLogger(), testMetrics())
 	if err != nil {
@@ -104,7 +126,7 @@ func newTestScheduler(t *testing.T, pds []*api.ProbingDirective) *Scheduler {
 // V6 pool is empty — use newTestScheduler for mixed protocol tests.
 //
 //nolint:unparam // activeSetSize is always 1 in current tests but is a meaningful parameter
-func newTestSchedulerWithConfig(t *testing.T, v4pds []*api.ProbingDirective, activeSetSize, missingThreshold, maxEvictions int) *Scheduler {
+func newTestSchedulerWithConfig(t *testing.T, v4pds []*wire.ProbingDirective, activeSetSize, missingThreshold, maxEvictions int) *Scheduler {
 	t.Helper()
 	s, err := NewScheduler(&SchedulerConfig{
 		Seed:                       42,
@@ -169,8 +191,8 @@ func TestNewScheduler_DuplicatePDID(t *testing.T) {
 	_, err := NewScheduler(&SchedulerConfig{
 		Seed:                       0,
 		IssuanceRate:               1.0,
-		PDPathV4:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV4(1)}),
-		PDPathV6:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV6(1)}),
+		PDPathV4:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{makePDV4(1)}),
+		PDPathV6:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{makePDV6(1)}),
 		ActiveSetSize:              2,
 		ImpactThreshold:            1.0,
 		ConsecutiveMissesThreshold: 3,
@@ -187,7 +209,7 @@ func TestNewScheduler_DuplicatePDIDWithinFile(t *testing.T) {
 	_, err := NewScheduler(&SchedulerConfig{
 		Seed:                       0,
 		IssuanceRate:               1.0,
-		PDPathV4:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV4(1), makePDV4(1)}),
+		PDPathV4:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{makePDV4(1), makePDV4(1)}),
 		ActiveSetSize:              2,
 		ImpactThreshold:            1.0,
 		ConsecutiveMissesThreshold: 3,
@@ -219,7 +241,7 @@ func TestNewScheduler_V6UnusedPool(t *testing.T) {
 	// This exercises ipVersionLabel("6") in the PDsUnusedTotal metric initialization.
 	s, err := NewScheduler(&SchedulerConfig{
 		Seed: 0, IssuanceRate: 1.0,
-		PDPathV6: writeSchedulerPDFile(t, []*api.ProbingDirective{
+		PDPathV6: writeSchedulerPDFile(t, []*wire.ProbingDirective{
 			makePDV6(1),
 			makePDV6(2),
 			makePDV6(3),
@@ -242,7 +264,7 @@ func TestNewScheduler_OnlyV4(t *testing.T) {
 	s, err := NewScheduler(&SchedulerConfig{
 		Seed:                       0,
 		IssuanceRate:               1.0,
-		PDPathV4:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV4(1)}),
+		PDPathV4:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{makePDV4(1)}),
 		PDPathV6:                   "",
 		ActiveSetSize:              1,
 		ImpactThreshold:            1.0,
@@ -263,7 +285,7 @@ func TestNewScheduler_OnlyV6(t *testing.T) {
 		Seed:                       0,
 		IssuanceRate:               1.0,
 		PDPathV4:                   "",
-		PDPathV6:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV6(1)}),
+		PDPathV6:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{makePDV6(1)}),
 		ActiveSetSize:              1,
 		ImpactThreshold:            1.0,
 		ConsecutiveMissesThreshold: 3,
@@ -279,7 +301,7 @@ func TestNewScheduler_OnlyV6(t *testing.T) {
 
 func TestNewScheduler_Valid(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1), makePD(2)})
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1), makePD(2)})
 	if s == nil {
 		t.Fatal("expected non-nil scheduler")
 	}
@@ -289,7 +311,7 @@ func TestNewScheduler_NilLogger(t *testing.T) {
 	t.Parallel()
 	s, err := NewScheduler(&SchedulerConfig{
 		Seed: 0, IssuanceRate: 1.0,
-		PDPathV4:                   writeSchedulerPDFile(t, []*api.ProbingDirective{makePDV4(1)}),
+		PDPathV4:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{makePDV4(1)}),
 		ActiveSetSize:              1,
 		ImpactThreshold:            1.0,
 		ConsecutiveMissesThreshold: 3,
@@ -343,9 +365,10 @@ func TestReadPDs_ScannerError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cannot create temp file: %v", err)
 	}
-	// Write a line longer than bufio.MaxScanTokenSize (64 KiB) to trigger
-	// scanner.Err() = bufio.ErrTooLong.
-	if _, err := f.Write(make([]byte, 64*1024+1)); err != nil {
+	// Write a line longer than the scanner's configured max (4 MiB, set in
+	// scheduler.go's readPDs to accommodate legitimately large directives —
+	// raised from bufio.Scanner's 64 KiB default) to trigger scanner.Err().
+	if _, err := f.Write(make([]byte, 4*1024*1024+1)); err != nil {
 		t.Fatalf("cannot write to temp file: %v", err)
 	}
 	if err := f.Close(); err != nil {
@@ -367,7 +390,7 @@ func TestReadPDs_SkipsBlankLines(t *testing.T) {
 		t.Fatalf("cannot create temp file: %v", err)
 	}
 	pd := makePDV4(1)
-	b, _ := json.Marshal(pd)
+	b, _ := protojson.Marshal(pd)
 	// Write blank line before and after a valid PD.
 	if _, err := f.WriteString("\n"); err != nil {
 		t.Fatalf("cannot write to temp file: %v", err)
@@ -423,11 +446,23 @@ func TestIpKey_IPv4MappedIPv6AreEqual(t *testing.T) {
 	}
 }
 
+// TestIpKey_MalformedLength covers the ipKey fix where a non-nil net.IP
+// of an invalid length (neither 4 nor 16 bytes, so To16() returns nil)
+// is treated as absent rather than stringifying To16()'s nil result.
+// Nothing in the original test set exercised this case.
+func TestIpKey_MalformedLength(t *testing.T) {
+	t.Parallel()
+	garbage := net.IP{1, 2, 3}
+	if ipKey(garbage) != "" {
+		t.Error("expected empty string for malformed-length IP")
+	}
+}
+
 // -- recordImpact -------------------------------------------------------------
 
 func TestRecordImpact_NilAddressAfterNonNil(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
 	addr := net.ParseIP("10.0.0.1")
 
 	// Use a full FIE to avoid incrementing consecutiveMisses.
@@ -436,10 +471,10 @@ func TestRecordImpact_NilAddressAfterNonNil(t *testing.T) {
 	}
 	// NearInfo present but ReplyAddress nil: triggers recordImpact(nil, pd),
 	// covering its nil address guard.
-	fie := &api.ForwardingInfoElement{
+	fie := &model.ForwardingInfoElement{
 		ProbingDirectiveID: 1,
-		NearInfo:           &api.Info{ReplyAddress: nil},
-		FarInfo:            &api.Info{ReplyAddress: net.ParseIP("10.0.0.2")},
+		NearInfo:           &model.Info{ReplyAddress: nil},
+		FarInfo:            &model.Info{ReplyAddress: net.ParseIP("10.0.0.2")},
 	}
 	if err := s.UpdateFromFIE(fie); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -453,7 +488,7 @@ func TestRecordImpact_NilAddressAfterNonNil(t *testing.T) {
 
 func TestUpdateFromFIE_UnknownID(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
 	// Unknown PD ID is treated as a stale FIE from a replaced directive — not an error.
 	if err := s.UpdateFromFIE(makeFIETimeout(99)); err != nil {
 		t.Fatalf("expected nil for unknown directive ID, got: %v", err)
@@ -462,7 +497,7 @@ func TestUpdateFromFIE_UnknownID(t *testing.T) {
 
 func TestUpdateFromFIE_NilNearAndFar(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
 	if err := s.UpdateFromFIE(makeFIETimeout(1)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -476,7 +511,7 @@ func TestUpdateFromFIE_NilNearAndFar(t *testing.T) {
 
 func TestUpdateFromFIE_SingleDirectiveSingleAddress(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
 	// Use full FIE so the directive is considered yielding.
 	if err := s.UpdateFromFIE(makeFIEFull(1, net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.2"))); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -490,7 +525,7 @@ func TestUpdateFromFIE_SingleDirectiveSingleAddress(t *testing.T) {
 func TestUpdateFromFIE_AddressImpactsProb(t *testing.T) {
 	t.Parallel()
 	// Test near address sharing; far address follows the same logic symmetrically.
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1), makePD(2)})
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1), makePD(2)})
 	addr := net.ParseIP("10.0.0.1")
 
 	if err := s.UpdateFromFIE(makeFIEFull(1, addr, net.ParseIP("10.0.1.1"))); err != nil {
@@ -500,7 +535,12 @@ func TestUpdateFromFIE_AddressImpactsProb(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// Two directives share addr: maxImpacts=2, prob = min(1, impactThreshold * cycleDuration / 2).
-	cycleDuration := float64(s.config.ActiveSetSize) / s.config.IssuanceRate
+	// cycleDuration uses the actual active-set size (len(s.pdMap)), not the
+	// configured target (s.config.ActiveSetSize) — see UpdateFromFIE. Here
+	// they differ: ActiveSetSize is len(pds)*2, but both PDs are the same
+	// protocol, so the half-split logic gives all slots to that protocol and
+	// both PDs load — len(s.pdMap) is 2, not the configured 4.
+	cycleDuration := float64(len(s.pdMap)) / s.config.IssuanceRate
 	wantProb := min(1.0, s.config.ImpactThreshold*cycleDuration/2.0)
 	if s.pdMap[2].issuanceProb != wantProb {
 		t.Errorf("expected issuance prob %.6f, got %v", wantProb, s.pdMap[2].issuanceProb)
@@ -509,7 +549,7 @@ func TestUpdateFromFIE_AddressImpactsProb(t *testing.T) {
 
 func TestUpdateFromFIE_AddressChange(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
 	addr1 := net.ParseIP("10.0.0.1")
 	addr2 := net.ParseIP("10.0.0.2")
 	far := net.ParseIP("10.0.0.3")
@@ -530,7 +570,7 @@ func TestUpdateFromFIE_AddressChange(t *testing.T) {
 
 func TestUpdateFromFIE_MaxOfNearAndFarImpacts(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1), makePD(2), makePD(3)})
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1), makePD(2), makePD(3)})
 	nearAddr := net.ParseIP("10.0.0.1")
 	farAddr := net.ParseIP("10.0.0.2")
 
@@ -546,7 +586,9 @@ func TestUpdateFromFIE_MaxOfNearAndFarImpacts(t *testing.T) {
 	if err := s.UpdateFromFIE(makeFIEFull(1, nearAddr, farAddr)); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	cycleDuration := float64(s.config.ActiveSetSize) / s.config.IssuanceRate
+	// cycleDuration uses the actual active-set size (len(s.pdMap)), not the
+	// configured target — same reasoning as TestUpdateFromFIE_AddressImpactsProb.
+	cycleDuration := float64(len(s.pdMap)) / s.config.IssuanceRate
 	want := min(1.0, s.config.ImpactThreshold*cycleDuration/3.0)
 	if s.pdMap[1].issuanceProb != want {
 		t.Errorf("expected issuance prob %.6f, got %.6f", want, s.pdMap[1].issuanceProb)
@@ -557,9 +599,9 @@ func TestUpdateFromFIE_ConsecutiveMissesTriggersReplacement(t *testing.T) {
 	t.Parallel()
 	// Active set: pd1 (V4). Unused pool: pd2 (V4, same agent).
 	s := newTestSchedulerWithConfig(t,
-		[]*api.ProbingDirective{
-			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
-			{ProbingDirectiveID: 2, AgentID: "agent-a", IPVersion: api.IPv4},
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
 		},
 		1, 3, 3)
 
@@ -584,10 +626,10 @@ func TestReplacePD_PermanentEviction(t *testing.T) {
 	// Active set: pd1 (V4). Unused pool: pd2, pd3 (V4, same agent).
 	// MaxEvictions=1: a PD is permanently evicted after one recycling.
 	s := newTestSchedulerWithConfig(t,
-		[]*api.ProbingDirective{
-			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
-			{ProbingDirectiveID: 2, AgentID: "agent-a", IPVersion: api.IPv4},
-			{ProbingDirectiveID: 3, AgentID: "agent-a", IPVersion: api.IPv4},
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+			{ProbingDirectiveId: 3, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.3"},
 		},
 		1, 3, 1)
 
@@ -619,8 +661,8 @@ func TestReplacePD_PoolExhausted(t *testing.T) {
 	t.Parallel()
 	// Active set: pd1 only, no unused pool.
 	s := newTestSchedulerWithConfig(t,
-		[]*api.ProbingDirective{
-			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
 		},
 		1, 3, 3)
 
@@ -630,7 +672,7 @@ func TestReplacePD_PoolExhausted(t *testing.T) {
 	}
 	// pd1 moved to unused pool, active set is empty — NextPD returns nil.
 	s.issuancePeriod = 0
-	pd := s.NextPD()
+	pd := s.NextPD(context.Background())
 	if pd != nil {
 		t.Errorf("expected nil from NextPD when pool exhausted, got pd %d", pd.ProbingDirectiveID)
 	}
@@ -642,15 +684,15 @@ func TestNextPD_PoolExhaustedOnBernoulli(t *testing.T) {
 	t.Parallel()
 	// Single PD, no unused pool — Bernoulli failure with nothing to replace from.
 	s := newTestSchedulerWithConfig(t,
-		[]*api.ProbingDirective{
-			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
 		},
 		1, 100, 3)
 
 	// Force Bernoulli failure — unused pool is empty so replacePD returns nil.
 	s.pdMap[1].issuanceProb = 0.0
 	s.issuancePeriod = 0
-	pd := s.NextPD()
+	pd := s.NextPD(context.Background())
 	if pd != nil {
 		t.Errorf("expected nil when pool exhausted on Bernoulli failure, got pd %d", pd.ProbingDirectiveID)
 	}
@@ -658,8 +700,8 @@ func TestNextPD_PoolExhaustedOnBernoulli(t *testing.T) {
 
 func TestNextPD_ReturnsDirective(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
-	if pd := s.NextPD(); pd == nil {
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	if pd := s.NextPD(context.Background()); pd == nil {
 		t.Fatal("expected non-nil directive (issuance prob is 1.0)")
 	}
 }
@@ -668,15 +710,15 @@ func TestNextPD_ReplacesOnLowProbability(t *testing.T) {
 	t.Parallel()
 	// Active set: pd1 (V4). Unused pool: pd2 (V4, same agent).
 	s := newTestSchedulerWithConfig(t,
-		[]*api.ProbingDirective{
-			{ProbingDirectiveID: 1, AgentID: "agent-a", IPVersion: api.IPv4},
-			{ProbingDirectiveID: 2, AgentID: "agent-a", IPVersion: api.IPv4},
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
 		},
 		1, 3, 3)
 
 	// Force issuance prob to 0 to guarantee Bernoulli failure and replacement.
 	s.pdMap[1].issuanceProb = 0.0
-	pd := s.NextPD()
+	pd := s.NextPD(context.Background())
 	// Should return the replacement (pd2), not nil.
 	if pd == nil || pd.ProbingDirectiveID != 2 {
 		t.Errorf("expected replacement pd2, got %v", pd)
@@ -685,10 +727,10 @@ func TestNextPD_ReplacesOnLowProbability(t *testing.T) {
 
 func TestNextPD_CycleDurationObserved(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
 	s.issuancePeriod = 0
 	for range 3 {
-		s.NextPD()
+		s.NextPD(context.Background())
 	}
 }
 
@@ -697,24 +739,24 @@ func TestUpdateFromFIE_TimeoutClearsStaleAddress(t *testing.T) {
 
 	tests := []struct {
 		name     string
-		firstFIE func(net.IP) *api.ForwardingInfoElement
-		resetFIE func(net.IP) *api.ForwardingInfoElement
+		firstFIE func(net.IP) *model.ForwardingInfoElement
+		resetFIE func(net.IP) *model.ForwardingInfoElement
 	}{
 		{
 			name: "near address",
-			firstFIE: func(addr net.IP) *api.ForwardingInfoElement {
+			firstFIE: func(addr net.IP) *model.ForwardingInfoElement {
 				return makeFIEFull(1, addr, net.ParseIP("10.0.0.99"))
 			},
-			resetFIE: func(addr net.IP) *api.ForwardingInfoElement {
+			resetFIE: func(addr net.IP) *model.ForwardingInfoElement {
 				return makeFIEFull(1, nil, net.ParseIP("10.0.0.99"))
 			},
 		},
 		{
 			name: "far address",
-			firstFIE: func(addr net.IP) *api.ForwardingInfoElement {
+			firstFIE: func(addr net.IP) *model.ForwardingInfoElement {
 				return makeFIEFull(1, net.ParseIP("10.0.0.99"), addr)
 			},
-			resetFIE: func(addr net.IP) *api.ForwardingInfoElement {
+			resetFIE: func(addr net.IP) *model.ForwardingInfoElement {
 				return makeFIEFull(1, net.ParseIP("10.0.0.99"), nil)
 			},
 		},
@@ -724,7 +766,7 @@ func TestUpdateFromFIE_TimeoutClearsStaleAddress(t *testing.T) {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			s := newTestScheduler(t, []*api.ProbingDirective{makePD(1)})
+			s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
 			addr := net.ParseIP("10.0.0.1")
 
 			if err := s.UpdateFromFIE(tt.firstFIE(addr)); err != nil {
@@ -746,5 +788,164 @@ func TestUpdateFromFIE_TimeoutClearsStaleAddress(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// -- Additional coverage -------------------------------------------------------
+
+func TestNewScheduler_NilConfig(t *testing.T) {
+	t.Parallel()
+	if _, err := NewScheduler(nil, testLogger(), testMetrics()); err == nil {
+		t.Fatal("expected error for nil config, got nil")
+	}
+}
+
+// TestReadPDs_InvalidDirective covers a line that's syntactically valid
+// protojson but semantically rejected by model.ProbingDirectiveFromProto
+// (missing destination_address) — distinct from TestReadPDs_InvalidJSON,
+// which fails earlier, at the protojson syntax level.
+func TestReadPDs_InvalidDirective(t *testing.T) {
+	t.Parallel()
+	f, err := os.CreateTemp(t.TempDir(), "pds-*.jsonl")
+	if err != nil {
+		t.Fatalf("cannot create temp file: %v", err)
+	}
+	pd := &wire.ProbingDirective{ProbingDirectiveId: 1} // no destination_address
+	b, err := protojson.Marshal(pd)
+	if err != nil {
+		t.Fatalf("cannot marshal PD: %v", err)
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		t.Fatalf("cannot write to temp file: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("cannot close temp file: %v", err)
+	}
+	_, err = NewScheduler(&SchedulerConfig{
+		Seed: 0, IssuanceRate: 1.0, PDPathV4: f.Name(),
+		ImpactThreshold: 1.0, ActiveSetSize: 1, ConsecutiveMissesThreshold: 3, MaxEvictions: 3,
+	}, testLogger(), testMetrics())
+	if err == nil {
+		t.Fatal("expected error for PD missing destination_address, got nil")
+	}
+}
+
+// TestNextPD_TimerBasedWait exercises NextPD's timer/select branch
+// (issuancePeriod >= 10ms) — every other NextPD test uses IssuanceRate
+// high enough (or issuancePeriod set directly to 0) to take the busy-wait
+// branch instead, leaving this one entirely uncovered otherwise. A fresh
+// scheduler's zero-value lastIssuance puts nextTime in the past, so the
+// timer fires immediately — this exercises the timer.C success case
+// without an actual multi-millisecond test.
+func TestNextPD_TimerBasedWait(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{makePD(1)},
+		1, 3, 3)
+	s.issuancePeriod = 20 * time.Millisecond
+
+	if pd := s.NextPD(context.Background()); pd == nil {
+		t.Fatal("expected non-nil directive")
+	}
+}
+
+// TestNextPD_ContextCanceledDuringTimerWait exercises the ctx.Done() case
+// of the same branch. lastIssuance is set to now (not left at its
+// zero-value default) so nextTime is genuinely in the future — otherwise
+// the timer would fire immediately regardless of issuancePeriod, racing
+// with ctx.Done() instead of deterministically testing cancellation.
+func TestNextPD_ContextCanceledDuringTimerWait(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{makePD(1)},
+		1, 3, 3)
+	s.issuancePeriod = time.Second
+	s.lastIssuance = time.Now()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	if pd := s.NextPD(ctx); pd != nil {
+		t.Errorf("expected nil after context cancellation, got pd %d", pd.ProbingDirectiveID)
+	}
+}
+
+// TestNextPD_BusyWaitBranches exercises the inner Sleep-vs-Gosched split
+// inside the busy-wait loop. Every other busy-wait test uses
+// issuancePeriod=0, where remaining<=0 is true on the first iteration and
+// the loop breaks before ever reaching this split — this needs a genuinely
+// positive, sub-10ms remaining duration to reach it at all.
+func TestNextPD_BusyWaitBranches(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{makePD(1)},
+		1, 3, 3)
+	s.issuancePeriod = 2 * time.Millisecond // < 10ms: busy-wait branch
+	s.lastIssuance = time.Now()             // nextTime genuinely in the future
+
+	if pd := s.NextPD(context.Background()); pd == nil {
+		t.Fatal("expected non-nil directive")
+	}
+}
+
+// TestNextPD_StalePDDuringWait exercises the actual race-condition guard
+// the earlier concurrency fix added: pd is selected, then replaced by a
+// concurrent call (simulating UpdateFromFIE's consecutive-miss
+// replacement) while NextPD is still waiting — NextPD must detect this
+// and return nil rather than acting on a stale pdState. This needs real
+// goroutine timing, unlike everything else in this file.
+func TestNextPD_StalePDDuringWait(t *testing.T) {
+	t.Parallel()
+	// Active set: pd1. Unused pool: pd2 (same agent/protocol) for replacePD
+	// to draw from.
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		1, 3, 3)
+
+	// Force Bernoulli failure once the wait completes, so NextPD takes the
+	// replace path and reaches the stale-pd check.
+	s.pdMap[1].issuanceProb = 0.0
+	s.issuancePeriod = 100 * time.Millisecond
+	s.lastIssuance = time.Now()
+
+	resultCh := make(chan *model.ProbingDirective, 1)
+	go func() {
+		resultCh <- s.NextPD(context.Background())
+	}()
+
+	// Let NextPD pass selection and enter its wait, then replace pd1 out
+	// from under it — the same effect a concurrent UpdateFromFIE call
+	// would have.
+	time.Sleep(20 * time.Millisecond)
+	s.mutex.Lock()
+	s.replacePD(s.pdMap[1])
+	s.mutex.Unlock()
+
+	if pd := <-resultCh; pd != nil {
+		t.Errorf("expected nil (pd already replaced concurrently), got pd %d", pd.ProbingDirectiveID)
+	}
+}
+
+// TestNextPD_ContextCanceledDuringBusyWait exercises the busy-wait loop's
+// ctx.Err() check specifically — distinct from TestNextPD_BusyWaitBranches,
+// which lets the loop run to natural completion and never cancels mid-loop.
+// A 1ms deadline against a 5ms period gives comfortable margin for the
+// loop to observe the expired context before remaining<=0 would anyway.
+func TestNextPD_ContextCanceledDuringBusyWait(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{makePD(1)},
+		1, 3, 3)
+	s.issuancePeriod = 5 * time.Millisecond // < 10ms: busy-wait branch
+	s.lastIssuance = time.Now()             // nextTime genuinely in the future
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	if pd := s.NextPD(ctx); pd != nil {
+		t.Errorf("expected nil after context cancellation, got pd %d", pd.ProbingDirectiveID)
 	}
 }
