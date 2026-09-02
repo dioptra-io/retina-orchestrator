@@ -109,6 +109,8 @@ func (c *Config) validateSchedulerConfig() error {
 	if c.MaxEvictions <= 0 {
 		return fmt.Errorf("MaxEvictions must be greater than zero: got %d", c.MaxEvictions)
 	}
+	// PDDiffPath is intentionally unvalidated here: it's optional, and an
+	// empty value simply disables hot-reload (see watchPDDiffReload).
 	return nil
 }
 
@@ -157,6 +159,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		ImpactThreshold:            config.ImpactThreshold,
 		PDPathV4:                   config.PDPathV4,
 		PDPathV6:                   config.PDPathV6,
+		PDDiffPath:                 config.PDDiffPath,
 		ActiveSetSize:              config.ActiveSetSize,
 		ConsecutiveMissesThreshold: config.ConsecutiveMissesThreshold,
 		MaxEvictions:               config.MaxEvictions,
