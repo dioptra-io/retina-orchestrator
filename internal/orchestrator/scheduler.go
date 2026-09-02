@@ -7,13 +7,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/model"
@@ -25,11 +28,15 @@ import (
 // All fields are validated by Config.Validate() in orchestrator.go before
 // NewScheduler is called.
 type SchedulerConfig struct {
-	Seed                       uint64
-	IssuanceRate               float64
-	ImpactThreshold            float64
-	PDPathV4                   string
-	PDPathV6                   string
+	Seed            uint64
+	IssuanceRate    float64
+	ImpactThreshold float64
+	PDPathV4        string
+	PDPathV6        string
+	// PDDiffPath is the path to a PD diff file (insert/remove ops, one per
+	// line) applied via ApplyDiff on reload. Not read by NewScheduler
+	// itself — only used by the orchestrator's SIGHUP reload watcher.
+	PDDiffPath                 string
 	ActiveSetSize              int
 	ConsecutiveMissesThreshold int
 	MaxEvictions               int
@@ -45,17 +52,20 @@ type pdState struct {
 	consecutiveMisses  int
 	evictionCount      int
 	directive          *model.ProbingDirective
+	// markedForRemoval: set by ApplyDiff for a PD that's active but slated
+	// for removal. Forces issuanceProb to 0 so the next Bernoulli draw
+	// fails and the PD replaces on its natural cycle; recycleOrEvict then
+	// evicts it permanently instead of recycling it.
+	markedForRemoval bool
 }
 
-// unusedPD is a lightweight representation of a ProbingDirective in the unused
-// pool. It omits scheduling state (addresses, probability, miss count) that is
-// only meaningful for active directives, reducing memory usage at scale.
+// unusedPD is a lightweight ProbingDirective in the unused pool, omitting
+// scheduling state only meaningful for active directives.
 type unusedPD struct {
 	evictionCount int
 	directive     *model.ProbingDirective
 }
 
-// promote converts an unusedPD to a pdState ready for insertion into the active set.
 func (u *unusedPD) promote() *pdState {
 	return &pdState{
 		issuanceProb:  1.0,
@@ -83,7 +93,6 @@ func ipVersionLabel(ipVersion wire.IPVersion) string {
 
 // impactRecord stores the current impact state for a single address.
 type impactRecord struct {
-	// pds is the set of ProbingDirective IDs currently impacting this address.
 	pds map[uint64]*pdState
 }
 
@@ -96,26 +105,20 @@ type Scheduler struct {
 	metrics *Metrics
 	config  *SchedulerConfig
 
-	// pdMap maps each ProbingDirective ID to its scheduling state, which holds
-	// the directive itself, its issuance probability, and last hit addresses.
-	pdMap map[uint64]*pdState
-	// impactRecords maps each address to the set of directives impacting it.
+	pdMap         map[uint64]*pdState
 	impactRecords map[string]*impactRecord
 	// unusedByAgent maps each agent ID to a 2-element array of unused PD pools,
 	// indexed by IP version (0=IPv4, 1=IPv6). Replacement is protocol-matched
 	// to maintain a stable IPv4/IPv6 distribution in the active set.
 	unusedByAgent map[string][2][]*unusedPD
 
-	// lastIssuance is the time of the last issued directive, used for rate limiting.
 	lastIssuance   time.Time
 	lastCycleBegin time.Time
-	// issuancePeriod is the minimum time between two directive issuances,
-	// derived from issuanceRate as time.Second / issuanceRate.
+	// issuancePeriod is derived from issuanceRate as time.Second / issuanceRate.
 	issuancePeriod time.Duration
 
 	randomizer *randomizer
-	// random is used for the Bernoulli experiment in NextPD.
-	random *rand.Rand
+	random     *rand.Rand // used for the Bernoulli experiment in NextPD
 }
 
 // loadPDsIntoPool fills the active set and unused pool from a slice of PDs.
@@ -371,11 +374,12 @@ func (s *Scheduler) waitUntil(ctx context.Context, nextTime time.Time) bool {
 }
 
 // recycleOrEvict returns the PD to the unused pool or permanently evicts it
-// if MaxEvictions has been reached. Must be called with s.mutex held.
+// if MaxEvictions has been reached, or if the PD has been marked for removal
+// by a PD diff (see ApplyDiff). Must be called with s.mutex held.
 func (s *Scheduler) recycleOrEvict(pd *pdState) {
 	agentID := pd.directive.AgentID
 	ipVersion := ipIdx(pd.directive.IPVersion)
-	if pd.evictionCount < s.config.MaxEvictions {
+	if !pd.markedForRemoval && pd.evictionCount < s.config.MaxEvictions {
 		pools := s.unusedByAgent[agentID]
 		pools[ipVersion] = append(pools[ipVersion], &unusedPD{
 			evictionCount: pd.evictionCount + 1,
@@ -395,14 +399,12 @@ func (s *Scheduler) recycleOrEvict(pd *pdState) {
 // replacePD replaces the given PD in the active set with a random draw from
 // the unused pool for the same agent and protocol. Must be called with s.mutex held.
 func (s *Scheduler) replacePD(pd *pdState) *pdState {
-	// Clean up impact records
 	s.removeImpact(pd.lastHitNearAddress, pd)
 	s.removeImpact(pd.lastHitFarAddress, pd)
 
 	agentID := pd.directive.AgentID
 	ipVersion := ipIdx(pd.directive.IPVersion)
 
-	// Remove from active set
 	delete(s.pdMap, pd.directive.ProbingDirectiveID)
 	s.metrics.PDsActiveTotal.Dec()
 
@@ -429,7 +431,6 @@ func (s *Scheduler) replacePD(pd *pdState) *pdState {
 	pools[ipVersion] = unused[:len(unused)-1]
 	s.unusedByAgent[agentID] = pools
 	s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(pd.directive.IPVersion)).Dec()
-	// Promote replacement to active pdState and add to active set
 	replacement := rawReplacement.promote()
 	s.pdMap[replacement.directive.ProbingDirectiveID] = replacement
 	s.randomizer.Replace(pd.directive.ProbingDirectiveID, replacement.directive.ProbingDirectiveID)
@@ -439,6 +440,97 @@ func (s *Scheduler) replacePD(pd *pdState) *pdState {
 	s.recycleOrEvict(pd)
 
 	return replacement
+}
+
+// ApplyDiff applies an incremental PD refresh without a restart. Inserts
+// are appended to the unused pool (assumed pre-deduplicated by the caller).
+// Removals in the unused pool are dropped immediately; removals in the
+// active set can't be yanked mid-cycle, so they're tombstoned
+// (markedForRemoval + issuanceProb = 0) to fail on their next Bernoulli
+// draw and be evicted permanently by recycleOrEvict instead of recycled.
+func (s *Scheduler) ApplyDiff(toInsert []*model.ProbingDirective, toRemove []uint64) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	removeKeys := make(map[uint64]struct{}, len(toRemove))
+	for _, id := range toRemove {
+		removeKeys[id] = struct{}{}
+	}
+
+	removedFromUnused := 0
+	for agentID, pools := range s.unusedByAgent {
+		for v := range pools {
+			kept := pools[v][:0]
+			for _, u := range pools[v] {
+				if _, drop := removeKeys[u.directive.ProbingDirectiveID]; drop {
+					s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(u.directive.IPVersion)).Dec()
+					removedFromUnused++
+					continue
+				}
+				kept = append(kept, u)
+			}
+			pools[v] = kept
+		}
+		s.unusedByAgent[agentID] = pools
+	}
+
+	tombstoned := 0
+	for id, pd := range s.pdMap {
+		if _, drop := removeKeys[id]; drop {
+			pd.markedForRemoval = true
+			pd.issuanceProb = 0
+			tombstoned++
+		}
+	}
+
+	// Guard against a redelivered diff (operator retry, reapplied file)
+	// creating duplicate entries: build the set of PD IDs already known to
+	// the scheduler — active (including just-tombstoned) or unused — and
+	// skip any insert that collides with it or with an earlier PD in this
+	// same batch.
+	existingIDs := make(map[uint64]struct{}, len(s.pdMap))
+	for id := range s.pdMap {
+		existingIDs[id] = struct{}{}
+	}
+	for _, pools := range s.unusedByAgent {
+		for v := range pools {
+			for _, u := range pools[v] {
+				existingIDs[u.directive.ProbingDirectiveID] = struct{}{}
+			}
+		}
+	}
+
+	inserted, skippedDuplicate, skippedInvalid := 0, 0, 0
+	for _, d := range toInsert {
+		if d.AgentID == "" {
+			s.logger.Debug("Skipping PD insert with empty AgentID",
+				slog.Uint64("pd_id", d.ProbingDirectiveID))
+			skippedInvalid++
+			continue
+		}
+		if _, exists := existingIDs[d.ProbingDirectiveID]; exists {
+			s.logger.Debug("Skipping duplicate PD insert",
+				slog.Uint64("pd_id", d.ProbingDirectiveID))
+			skippedDuplicate++
+			continue
+		}
+		existingIDs[d.ProbingDirectiveID] = struct{}{}
+
+		pools := s.unusedByAgent[d.AgentID]
+		v := ipIdx(d.IPVersion)
+		pools[v] = append(pools[v], &unusedPD{directive: d})
+		s.unusedByAgent[d.AgentID] = pools
+		s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(d.IPVersion)).Inc()
+		inserted++
+	}
+
+	s.logger.Info("Applied PD diff",
+		slog.Int("inserted", inserted),
+		slog.Int("skipped_duplicate", skippedDuplicate),
+		slog.Int("skipped_invalid", skippedInvalid),
+		slog.Int("removed_from_unused", removedFromUnused),
+		slog.Int("tombstoned_active", tombstoned),
+		slog.Int("remove_ids_total", len(toRemove)))
 }
 
 // UpdateFromFIE updates the scheduling state of a directive based on an
@@ -608,4 +700,107 @@ func readPDs(filepath string) ([]*model.ProbingDirective, error) {
 	}
 
 	return results, nil
+}
+
+// diffOpPeek reads just "op" and "probing_directive_id" via plain
+// encoding/json — ordinary JSON fields, not part of the ProbingDirective
+// proto, so protojson isn't needed for this narrow read.
+type diffOpPeek struct {
+	Op                 string `json:"op"`
+	ProbingDirectiveID uint64 `json:"probing_directive_id"`
+}
+
+// readPDDiff reads a combined insert/remove PD diff file (JSONL, one op
+// per line) into an insert slice and a bare-ID remove slice for
+// Scheduler.ApplyDiff. Insert lines carry a full protojson-encoded
+// ProbingDirective plus "op", which protojson.Unmarshal would otherwise
+// reject as an unknown field — DiscardUnknown handles that. Remove lines
+// only need the ID, read via diffOpPeek.
+func readPDDiff(filepath string) (toInsert []*model.ProbingDirective, toRemove []uint64, err error) {
+	f, err := os.Open(filepath) //nolint:gosec
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot open diff file: %w", err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	unmarshalOpts := protojson.UnmarshalOptions{DiscardUnknown: true}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue // skip blank or whitespace-only lines
+		}
+
+		var peek diffOpPeek
+		if err := json.Unmarshal(line, &peek); err != nil {
+			return nil, nil, fmt.Errorf("cannot unmarshal op on line %d: %w", lineNum, err)
+		}
+
+		switch peek.Op {
+		case "insert":
+			var wirePD wire.ProbingDirective
+			if err := unmarshalOpts.Unmarshal(line, &wirePD); err != nil {
+				return nil, nil, fmt.Errorf("cannot unmarshal insert directive on line %d: %w", lineNum, err)
+			}
+			pd, err := model.ProbingDirectiveFromProto(&wirePD)
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid PD on line %d: %w", lineNum, err)
+			}
+			toInsert = append(toInsert, &pd)
+		case "remove":
+			toRemove = append(toRemove, peek.ProbingDirectiveID)
+		default:
+			return nil, nil, fmt.Errorf("line %d: unknown op %q", lineNum, peek.Op)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("scanner error: %w", err)
+	}
+
+	return toInsert, toRemove, nil
+}
+
+// watchPDDiffReload listens for SIGHUP and applies the PD diff file at
+// diffPath to scheduler on each signal, without restarting the process —
+// SIGHUP is intercepted here before its default terminating action fires.
+// Returns nil on ctx.Done, so it can join Run's errgroup like the other
+// subsystems. If diffPath is empty, hot-reload is disabled and this just
+// blocks until ctx is done.
+//
+// Trigger externally once a fresh diff file is written:
+//
+//	kill -HUP $(pidof retina-orchestrator)
+//	systemctl reload retina-orchestrator  # if ExecReload=... is set
+func watchPDDiffReload(ctx context.Context, scheduler *Scheduler, diffPath string, logger *slog.Logger) error {
+	if diffPath == "" {
+		logger.Info("No PD diff path configured, PD hot-reload via SIGHUP disabled")
+		<-ctx.Done()
+		return nil
+	}
+
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+	defer signal.Stop(sighup)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-sighup:
+			toInsert, toRemove, err := readPDDiff(diffPath)
+			if err != nil {
+				logger.Error("Failed to read PD diff on reload",
+					slog.String("path", diffPath),
+					slog.Any("error", err))
+				continue
+			}
+			scheduler.ApplyDiff(toInsert, toRemove)
+		}
+	}
 }
