@@ -503,13 +503,13 @@ func (s *Scheduler) ApplyDiff(toInsert []*model.ProbingDirective, toRemove []uin
 	inserted, skippedDuplicate, skippedInvalid := 0, 0, 0
 	for _, d := range toInsert {
 		if d.AgentID == "" {
-			s.logger.Warn("Skipping PD insert with empty AgentID",
+			s.logger.Debug("Skipping PD insert with empty AgentID",
 				slog.Uint64("pd_id", d.ProbingDirectiveID))
 			skippedInvalid++
 			continue
 		}
 		if _, exists := existingIDs[d.ProbingDirectiveID]; exists {
-			s.logger.Warn("Skipping duplicate PD insert",
+			s.logger.Debug("Skipping duplicate PD insert",
 				slog.Uint64("pd_id", d.ProbingDirectiveID))
 			skippedDuplicate++
 			continue
