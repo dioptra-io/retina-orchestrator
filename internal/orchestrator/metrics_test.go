@@ -68,20 +68,14 @@ func TestNewMetrics_WithRegistry(t *testing.T) {
 	if m.PDsActiveTotal == nil {
 		t.Error("expected PDsActiveTotal to be non-nil")
 	}
-	if m.StreamClientsConnected == nil {
-		t.Error("expected StreamClientsConnected to be non-nil")
+	if m.APIClientFIEsPushedTotal == nil {
+		t.Error("expected APIClientFIEsPushedTotal to be non-nil")
 	}
-	if m.StreamConnectionsTotal == nil {
-		t.Error("expected StreamConnectionsTotal to be non-nil")
+	if m.APIClientFIEsDroppedTotal == nil {
+		t.Error("expected APIClientFIEsDroppedTotal to be non-nil")
 	}
-	if m.StreamDisconnectionsTotal == nil {
-		t.Error("expected StreamDisconnectionsTotal to be non-nil")
-	}
-	if m.FIEsStreamedTotal == nil {
-		t.Error("expected FIEsStreamedTotal to be non-nil")
-	}
-	if m.StreamLagSeconds == nil {
-		t.Error("expected StreamLagSeconds to be non-nil")
+	if m.APIClientConnectionUp == nil {
+		t.Error("expected APIClientConnectionUp to be non-nil")
 	}
 }
 

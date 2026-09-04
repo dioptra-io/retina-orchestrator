@@ -5,6 +5,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -16,6 +17,10 @@ import (
 	"github.com/dioptra-io/retina-commons/model"
 	wire "github.com/dioptra-io/retina-commons/wire/v2"
 )
+
+// ErrServerShutdown is returned by agentServer.listenAndServe once close
+// has been called.
+var ErrServerShutdown = errors.New("server shutdown")
 
 // agentKeepalivePeriod is the interval between TCP keepalive probes
 // for agent connections.

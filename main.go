@@ -1,11 +1,5 @@
 // Copyright (c) 2025 Sorbonne Université
 // SPDX-License-Identifier: MIT
-
-// @title			IP Routes Live API
-// @version		1.0.0
-// @description	Streams forwarding info elements from connected Retina agents.
-// @host			iprl.dioptra.io
-// @BasePath		/api/v1
 package main
 
 import (
@@ -41,17 +35,17 @@ func main() {
 //nolint:funlen
 func run() error {
 	var (
-		apiAddr                    = flag.String("api-addr", envOrDefault("RETINA_API_ADDR", "localhost:8080"), "Listening address for the HTTP API server")
+		apiURL                     = flag.String("api-url", envOrDefault("RETINA_API_URL", ""), "retina-api ingest endpoint, e.g. https://retina0.lip6.fr:8090/api/v1/ingest")
+		apiBufferSize              = flag.Int("api-buffer-size", envOrDefaultInt("RETINA_API_BUFFER_SIZE", 10_000), "Outbound FIE buffer capacity toward retina-api")
+		apiReconnectDelay          = flag.Duration("api-reconnect-delay", envOrDefaultDuration("RETINA_API_RECONNECT_DELAY", 5*time.Second), "Delay before retrying a dropped retina-api connection")
 		agentAddr                  = flag.String("agent-addr", envOrDefault("RETINA_AGENT_ADDR", "localhost:50050"), "Listening address for agent connections")
 		pdQueueSize                = flag.Int("pd-queue-size", envOrDefaultInt("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
-		ringBufferSize             = flag.Int("ring-buffer-size", envOrDefaultInt("RETINA_RING_BUFFER_SIZE", 100), "The size of the ring buffer")
 		pdPathV4                   = flag.String("pd-path-v4", envOrDefault("RETINA_PD_PATH_V4", ""), "Path to the IPv4 probing directives file")
 		pdPathV6                   = flag.String("pd-path-v6", envOrDefault("RETINA_PD_PATH_V6", ""), "Path to the IPv6 probing directives file")
 		pdDiffPath                 = flag.String("pd-diff-path", envOrDefault("RETINA_PD_DIFF_PATH", ""), "Path to the PD diff file (insert/remove ops), reloaded on SIGHUP")
 		issuanceRate               = flag.Float64("issuance-rate", envOrDefaultFloat64("RETINA_ISSUANCE_RATE", 1.0), "Target global issuance rate of probing directives (PDs per second, approximate)")
 		impactThreshold            = flag.Float64("impact-threshold", envOrDefaultFloat64("RETINA_IMPACT_THRESHOLD", 1.0), "Maximum impact threshold per address for the responsible probing algorithm")
 		seed                       = flag.Uint64("seed", envOrDefaultUInt64("RETINA_SEED", 42), "Seed for the randomizer")
-		apiReadHeaderTimeout       = flag.Duration("api-read-header-timeout", envOrDefaultDuration("RETINA_API_READ_HEADER_TIMEOUT", 5*time.Second), "Timeout for reading HTTP request headers")
 		fieFilterPolicy            = flag.String("fie-filter-policy", envOrDefault("RETINA_FIE_FILTER_POLICY", ""), "FIE filtering policy (any, one, both)")
 		logLevel                   = flag.String("log-level", envOrDefault("RETINA_LOG_LEVEL", "info"), "Log level (debug, info, warn, error)")
 		metricsAddr                = flag.String("metrics-addr", envOrDefault("RETINA_METRICS_ADDR", ":9312"), "Address to expose Prometheus metrics on")
@@ -83,10 +77,10 @@ func run() error {
 	orch, err := orchestrator.NewOrch(&orchestrator.Config{
 		AgentAddress:               *agentAddr,
 		PDQueueSize:                *pdQueueSize,
-		RingBufferSize:             *ringBufferSize,
 		AgentBufferLength:          defaultAgentBufferLength,
-		APIAddress:                 *apiAddr,
-		APIReadHeaderTimeout:       *apiReadHeaderTimeout,
+		APIURL:                     *apiURL,
+		APIBufferSize:              *apiBufferSize,
+		APIReconnectDelay:          *apiReconnectDelay,
 		PDPathV4:                   *pdPathV4,
 		PDPathV6:                   *pdPathV6,
 		PDDiffPath:                 *pdDiffPath,
@@ -104,7 +98,7 @@ func run() error {
 	}
 
 	logger.Info("Starting orchestrator",
-		"api_addr", *apiAddr,
+		"api_url", *apiURL,
 		"agent_addr", *agentAddr,
 		"pd_path_v4", *pdPathV4,
 		"pd_path_v6", *pdPathV6,
@@ -118,7 +112,7 @@ func run() error {
 		"metrics_addr", *metricsAddr,
 	)
 
-	// Reload watcher runs inside orch.Run alongside the API/agent/scheduler
+	// Reload watcher runs inside orch.Run alongside the agent/scheduler
 	// subsystems, sharing the same shutdown context — no separate goroutine
 	// needed here. If pdDiffPath is empty, hot-reload via SIGHUP is disabled.
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {

@@ -32,12 +32,10 @@ type Metrics struct {
 	// PDsActiveTotal is not per-agent since the active set is shared across agents.
 	PDsActiveTotal prometheus.Gauge
 
-	// Streaming endpoint
-	StreamClientsConnected    prometheus.Gauge
-	StreamConnectionsTotal    prometheus.Counter
-	StreamDisconnectionsTotal *prometheus.CounterVec
-	FIEsStreamedTotal         prometheus.Counter
-	StreamLagSeconds          prometheus.Histogram
+	// apiClient (push connection to retina-api)
+	APIClientFIEsPushedTotal  prometheus.Counter
+	APIClientFIEsDroppedTotal prometheus.Counter
+	APIClientConnectionUp     prometheus.Gauge
 }
 
 // NewMetrics creates and registers all orchestrator metrics with the given registry.
@@ -110,27 +108,18 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 			Help: "Current number of probing directives in the active set.",
 		}),
 
-		// Streaming endpoint
-		StreamClientsConnected: factory.NewGauge(prometheus.GaugeOpts{
-			Name: "retina_orchestrator_stream_clients_connected",
-			Help: "Number of currently active streaming clients.",
+		// Streaming to retina-api
+		APIClientFIEsPushedTotal: factory.NewCounter(prometheus.CounterOpts{
+			Name: "retina_orchestrator_api_client_fies_pushed_total",
+			Help: "Total number of FIEs pushed to retina-api.",
 		}),
-		StreamConnectionsTotal: factory.NewCounter(prometheus.CounterOpts{
-			Name: "retina_orchestrator_stream_connections_total",
-			Help: "Total number of streaming connections opened.",
+		APIClientFIEsDroppedTotal: factory.NewCounter(prometheus.CounterOpts{
+			Name: "retina_orchestrator_api_client_fies_dropped_total",
+			Help: "Total number of FIEs dropped because the outbound buffer to retina-api was full.",
 		}),
-		StreamDisconnectionsTotal: factory.NewCounterVec(prometheus.CounterOpts{
-			Name: "retina_orchestrator_stream_disconnections_total",
-			Help: "Total number of streaming disconnections, labeled by reason.",
-		}, []string{"reason"}),
-		FIEsStreamedTotal: factory.NewCounter(prometheus.CounterOpts{
-			Name: "retina_orchestrator_fies_streamed_total",
-			Help: "Total number of FIEs pushed to streaming clients.",
-		}),
-		StreamLagSeconds: factory.NewHistogram(prometheus.HistogramOpts{
-			Name:    "retina_orchestrator_stream_lag_seconds",
-			Help:    "Time between receiving a FIE from an agent and delivering it to streaming clients.",
-			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
+		APIClientConnectionUp: factory.NewGauge(prometheus.GaugeOpts{
+			Name: "retina_orchestrator_api_client_connection_up",
+			Help: "1 if the push connection to retina-api is currently established, 0 otherwise.",
 		}),
 	}
 }
