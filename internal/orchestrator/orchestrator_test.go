@@ -3,9 +3,7 @@
 package orchestrator
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -23,14 +21,13 @@ import (
 
 // Intentionally uncovered:
 //
-//   - NewOrch: newQueue/newRingBuffer errors are unreachable (hardcoded safe
-//     values); newAPIServer only fails on nil fieHandler, never nil here.
+//   - NewOrch: newQueue's error is unreachable (hardcoded safe value).
 //   - runScheduler: PD drop branch requires a consumer to vanish between
 //     TryPush and send — not reproducible in unit tests.
-//   - runAPIServer/runAgentServer: non-context error branches require server
-//     failure unrelated to shutdown — not injectable without refactoring.
-//   - fieStreamHandler: internal_error on Pop requires a non-context error
-//     from RingBuffer, which has no injectable trigger.
+//   - runAgentServer: non-context error branches require server failure
+//     unrelated to shutdown — not injectable without refactoring. apiClient's
+//     own connect/retry/failure branches are covered directly in
+//     api_client_test.go, not re-tested here.
 //   - agentHandler: the o.scheduler.UpdateFromFIE error-log branch is
 //     unreachable with the real *Scheduler — UpdateFromFIE's only two
 //     return points both return nil, so the error path exists on the
@@ -76,18 +73,23 @@ func writePDFile(t *testing.T) string {
 	return f.Name()
 }
 
+// validConfig returns a Config that passes Validate() as-is. APIURL points
+// at a closed local port — fast, guaranteed connection refusal, since
+// nothing here needs a real retina-api.
 func validConfig(t *testing.T) *Config {
 	t.Helper()
 	return &Config{
 		AgentAddress:               "127.0.0.1:0",
 		AgentBufferLength:          8192,
 		PDQueueSize:                100,
-		RingBufferSize:             100,
-		APIAddress:                 "127.0.0.1:0",
+		APIURL:                     "http://127.0.0.1:1/api/v1/ingest",
+		APIBufferSize:              10_000,
+		APIReconnectDelay:          5 * time.Second,
 		PDPathV4:                   writePDFile(t),
 		Seed:                       0,
 		IssuanceRate:               1.0,
 		ImpactThreshold:            1.0,
+		FIEFilterPolicy:            "both",
 		Secret:                     "secret",
 		ActiveSetSize:              1,
 		ConsecutiveMissesThreshold: 3,
@@ -110,10 +112,10 @@ func validWireInfo() *wire.Info {
 
 // sendFIEs sends a sequence of FIEs over conn to exercise agentHandler FIE
 // receive paths: one with an unknown PD ID (UpdateFromFIE error log), one
-// incomplete (continue branch), and one complete (ring buffer push). Each
-// FIE is otherwise fully valid — see validWireFIE's doc comment for why a
-// bare/empty literal no longer works here the way api.ForwardingInfoElement
-// allowed.
+// incomplete (continue branch), and one complete (pushed to apiClient).
+// Each FIE is otherwise fully valid — see validWireFIE's doc comment for
+// why a bare/empty literal no longer works here the way
+// api.ForwardingInfoElement allowed.
 func sendFIEs(t *testing.T, conn net.Conn) {
 	t.Helper()
 
@@ -145,23 +147,87 @@ func TestConfig_Validate_Valid(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_DefaultsAPIReadHeaderTimeout(t *testing.T) {
-	t.Parallel()
-	c := validConfig(t)
-	c.APIReadHeaderTimeout = 0
-	_ = c.Validate()
-	if c.APIReadHeaderTimeout != 5*time.Second {
-		t.Errorf("expected default 5s, got %v", c.APIReadHeaderTimeout)
-	}
-}
-
-func TestConfig_Validate_DefaultsFIEFilterPolicy(t *testing.T) {
+func TestConfig_ApplyDefaults_FIEFilterPolicy(t *testing.T) {
 	t.Parallel()
 	c := validConfig(t)
 	c.FIEFilterPolicy = ""
-	_ = c.Validate()
+	c.applyDefaults()
 	if c.FIEFilterPolicy != "both" {
 		t.Errorf("expected default 'both', got %q", c.FIEFilterPolicy)
+	}
+}
+
+func TestConfig_ApplyDefaults_APIBufferSize(t *testing.T) {
+	t.Parallel()
+	c := validConfig(t)
+	c.APIBufferSize = 0
+	c.applyDefaults()
+	if c.APIBufferSize != 10_000 {
+		t.Errorf("expected default 10000, got %d", c.APIBufferSize)
+	}
+}
+
+func TestConfig_ApplyDefaults_APIReconnectDelay(t *testing.T) {
+	t.Parallel()
+	c := validConfig(t)
+	c.APIReconnectDelay = 0
+	c.applyDefaults()
+	if c.APIReconnectDelay != 5*time.Second {
+		t.Errorf("expected default 5s, got %v", c.APIReconnectDelay)
+	}
+}
+
+func TestConfig_ApplyDefaults_DoesNotOverrideExplicitValues(t *testing.T) {
+	t.Parallel()
+	c := validConfig(t)
+	c.APIBufferSize = 500
+	c.APIReconnectDelay = 3 * time.Second
+	c.FIEFilterPolicy = "any"
+	c.applyDefaults()
+	if c.APIBufferSize != 500 {
+		t.Errorf("expected explicit APIBufferSize 500 preserved, got %d", c.APIBufferSize)
+	}
+	if c.APIReconnectDelay != 3*time.Second {
+		t.Errorf("expected explicit APIReconnectDelay preserved, got %v", c.APIReconnectDelay)
+	}
+	if c.FIEFilterPolicy != "any" {
+		t.Errorf("expected explicit FIEFilterPolicy preserved, got %q", c.FIEFilterPolicy)
+	}
+}
+
+// TestConfig_Validate_DoesNotMutate documents the contract directly:
+// Validate no longer applies defaults (that's applyDefaults' job) — calling
+// it on a config with zero-valued optional fields must leave them zero.
+func TestConfig_Validate_DoesNotMutate(t *testing.T) {
+	t.Parallel()
+	c := validConfig(t)
+	c.APIBufferSize = 0
+	c.APIReconnectDelay = 0
+
+	// APIBufferSize/APIReconnectDelay at zero don't fail Validate on their
+	// own (see TestConfig_Validate_AcceptsZeroOptionalNumericFields) — this
+	// test only cares that Validate leaves them exactly as given either way.
+	_ = c.Validate()
+
+	if c.APIBufferSize != 0 {
+		t.Errorf("expected Validate to leave APIBufferSize untouched, got %d", c.APIBufferSize)
+	}
+	if c.APIReconnectDelay != 0 {
+		t.Errorf("expected Validate to leave APIReconnectDelay untouched, got %v", c.APIReconnectDelay)
+	}
+}
+
+// TestConfig_Validate_AcceptsZeroOptionalNumericFields: unlike
+// FIEFilterPolicy, zero isn't out-of-bounds for these fields, so Validate
+// alone can't tell "unset" from "meant zero" — applyDefaults is what
+// actually resolves it, and NewOrch always calls that first.
+func TestConfig_Validate_AcceptsZeroOptionalNumericFields(t *testing.T) {
+	t.Parallel()
+	c := validConfig(t)
+	c.APIBufferSize = 0
+	c.APIReconnectDelay = 0
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected zero-valued optional numeric fields to pass Validate, got: %v", err)
 	}
 }
 
@@ -175,8 +241,15 @@ func TestConfig_Validate_Errors(t *testing.T) {
 		{"empty AgentAddress", func(c *Config) { c.AgentAddress = "" }},
 		{"small AgentBufferLength", func(c *Config) { c.AgentBufferLength = 100 }},
 		{"zero PDQueueSize", func(c *Config) { c.PDQueueSize = 0 }},
-		{"zero RingBufferSize", func(c *Config) { c.RingBufferSize = 0 }},
-		{"empty APIAddress", func(c *Config) { c.APIAddress = "" }},
+		{"empty APIURL", func(c *Config) { c.APIURL = "" }},
+		{"APIURL unsupported scheme", func(c *Config) { c.APIURL = "ftp://retina0.lip6.fr:8090" }},
+		{"APIURL missing host", func(c *Config) { c.APIURL = "https://" }},
+		{"APIURL malformed host", func(c *Config) { c.APIURL = "http://[::1:8090" }},
+		{"APIURL root path", func(c *Config) { c.APIURL = "https://retina0.lip6.fr:8090/" }},
+		{"APIURL fragment", func(c *Config) { c.APIURL = "https://retina0.lip6.fr:8090/api/v1/ingest#frag" }},
+		{"negative APIBufferSize", func(c *Config) { c.APIBufferSize = -1 }},
+		{"APIBufferSize implausibly large", func(c *Config) { c.APIBufferSize = 6_000_000 }},
+		{"negative APIReconnectDelay", func(c *Config) { c.APIReconnectDelay = -time.Second }},
 		{"both PD paths empty", func(c *Config) { c.PDPathV4 = ""; c.PDPathV6 = "" }},
 		{"zero IssuanceRate", func(c *Config) { c.IssuanceRate = 0 }},
 		{"negative IssuanceRate", func(c *Config) { c.IssuanceRate = -1 }},
@@ -337,21 +410,26 @@ func TestRunScheduler_PushesToExistingQueue(t *testing.T) {
 	}
 }
 
-// -- runAPIServer -------------------------------------------------------------
-
-func TestRunAPIServer_StartsAndStops(t *testing.T) {
+// TestRunScheduler_ContinuesOnNilPDWithValidContext covers the `if pd ==
+// nil { continue }` branch specifically — every other test here only gets
+// pd==nil via ctx cancellation, which returns before continue is reached.
+// Emptying pdMap makes NextPD return nil while ctx is still valid instead.
+func TestRunScheduler_ContinuesOnNilPDWithValidContext(t *testing.T) {
 	t.Parallel()
 	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	for id := range o.scheduler.pdMap {
+		delete(o.scheduler.pdMap, id)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
-	err = o.runAPIServer(ctx)
-	if err != nil {
-		t.Fatalf("unexpected runAPIServer error: %v", err)
+	if err := o.runScheduler(ctx); err != nil {
+		t.Fatalf("expected nil (clean shutdown), got %v", err)
 	}
 }
 
@@ -370,98 +448,6 @@ func TestRunAgentServer_StartsAndStops(t *testing.T) {
 	err = o.runAgentServer(ctx)
 	if err != nil {
 		t.Fatalf("unexpected runAgentServer error: %v", err)
-	}
-}
-
-// -- fieStreamHandler ---------------------------------------------------------
-
-// TestFieStreamHandler_SendsAndStops pushes directly onto the ring buffer,
-// bypassing wire serialization entirely (Push takes a plain
-// *model.ForwardingInfoElement, no ToProto/FromProto involved) — so unlike
-// sendFIEs above, a minimal literal is fine here; nothing validates it on
-// this path. modelFIEToAPIv1 (called inside fieStreamHandler) is a plain
-// field copy with no validation either.
-func TestFieStreamHandler_SendsAndStops(t *testing.T) {
-	t.Parallel()
-	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	var buf bytes.Buffer
-	client := &fieClient{
-		ctx:     ctx,
-		flusher: nopFlusher{},
-		encoder: json.NewEncoder(&buf),
-	}
-
-	fie := &model.ForwardingInfoElement{
-		ProbingDirectiveID: 1,
-		NearInfo:           &model.Info{},
-		FarInfo:            &model.Info{},
-	}
-
-	done := make(chan struct{})
-	go func() {
-		o.fieStreamHandler(client)
-		close(done)
-	}()
-
-	time.Sleep(50 * time.Millisecond)
-	_ = o.ringBuffer.Push(fie)
-
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("fieStreamHandler did not return after context cancel")
-	}
-
-	if buf.Len() == 0 {
-		t.Error("expected FIE to be written to buffer")
-	}
-}
-
-func TestFieStreamHandler_SendFIEError(t *testing.T) {
-	t.Parallel()
-	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	client := &fieClient{
-		ctx:     ctx,
-		flusher: nopFlusher{},
-		encoder: json.NewEncoder(&failWriter{}),
-	}
-
-	fie := &model.ForwardingInfoElement{
-		ProbingDirectiveID: 1,
-		NearInfo:           &model.Info{},
-		FarInfo:            &model.Info{},
-	}
-
-	done := make(chan struct{})
-	go func() {
-		o.fieStreamHandler(client)
-		close(done)
-	}()
-
-	// Wait for consumer to be created before pushing.
-	time.Sleep(20 * time.Millisecond)
-	_ = o.ringBuffer.Push(fie)
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("fieStreamHandler did not return on sendFIE error")
 	}
 }
 
@@ -596,6 +582,59 @@ func TestAgentHandler_ReceivesFIE(t *testing.T) {
 	}
 }
 
+// TestAgentHandler_ConvertFIEError covers the inline modelFIEToAPIv1-then-continue
+// branch in agentHandler's FIE loop (replaces the deleted fieStreamHandler
+// coverage). Proto3 enums accept any int32 on the wire, so an out-of-range
+// IPVersion round-trips fine and only fails at our own range check.
+func TestAgentHandler_ConvertFIEError(t *testing.T) {
+	// Not parallel — uses real TCP connections.
+	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	clientConn, serverConn := newTCPPair(t)
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	stream := &agentStream{
+		conn:   serverConn,
+		ctx:    ctx,
+		cancel: cancel,
+	}
+
+	status := &agentAuthStatus{agentID: "agent-bad-fie"}
+
+	done := make(chan struct{})
+	go func() {
+		o.agentHandler(status, stream)
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	badFIE := validWireFIE(1)
+	badFIE.IpVersion = wire.IPVersion(256) // out of uint8 range
+	badFIE.NearInfo = validWireInfo()
+	badFIE.FarInfo = validWireInfo()
+	if err := framing.Send(clientConn, 0, badFIE); err != nil {
+		t.Fatalf("cannot send bad FIE: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+	_ = serverConn.Close()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("agentHandler did not return after a FIE conversion error (expected log-and-continue, not a hang)")
+	}
+}
+
 func TestAgentHandler_SendPDError(t *testing.T) {
 	// Not parallel — uses real TCP connections.
 	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
@@ -647,13 +686,8 @@ func TestAgentHandler_SendPDError(t *testing.T) {
 }
 
 // -- filterFIE ----------------------------------------------------------------
-//
-// filterFIE no longer returns an error (see orchestrator.go) — the policy
-// is validated once in Config.Validate() against an immutable config copy,
-// so there's no longer a reachable invalid-policy case to test. The old
-// TestFilterFIE_InvalidPolicy, which forced FIEFilterPolicy to "invalid"
-// after construction to trigger that error path, has no equivalent anymore
-// and is removed rather than repurposed.
+// TestFilterFIE_InvalidPolicy is gone — filterFIE no longer returns an
+// error, since Config.Validate() rejects an invalid policy before construction.
 
 func TestFilterFIE_PolicyAny(t *testing.T) {
 	t.Parallel()
@@ -742,79 +776,5 @@ func TestModelFIEToAPIv1_ProtocolOutOfRange(t *testing.T) {
 	fie := &model.ForwardingInfoElement{Protocol: wire.Protocol(256)}
 	if _, err := modelFIEToAPIv1(fie); err == nil {
 		t.Fatal("expected error for out-of-range Protocol, got nil")
-	}
-}
-
-// TestFieStreamHandler_ConvertFIEError covers the new error branch added
-// to fieStreamHandler alongside modelFIEToAPIv1's fallibility (see G115
-// fix) — nothing previously pushed a FIE with an out-of-range enum value
-// through the full ring-buffer-to-HTTP-client flow.
-func TestFieStreamHandler_ConvertFIEError(t *testing.T) {
-	t.Parallel()
-	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var buf bytes.Buffer
-	client := &fieClient{
-		ctx:     ctx,
-		flusher: nopFlusher{},
-		encoder: json.NewEncoder(&buf),
-	}
-
-	fie := &model.ForwardingInfoElement{
-		ProbingDirectiveID: 1,
-		IPVersion:          wire.IPVersion(256),
-	}
-
-	done := make(chan struct{})
-	go func() {
-		o.fieStreamHandler(client)
-		close(done)
-	}()
-
-	time.Sleep(20 * time.Millisecond)
-	_ = o.ringBuffer.Push(fie)
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("fieStreamHandler did not return on FIE conversion error")
-	}
-}
-
-// TestRunScheduler_ContinuesOnNilPDWithValidContext exercises runScheduler's
-// `if pd == nil { continue }` line specifically — distinct from the
-// already-documented TryPush race, and from every other runScheduler test,
-// which only produces a nil pd via context cancellation (caught earlier by
-// runScheduler's own ctx.Err() check, so continue is never reached there).
-//
-// Emptying pdMap directly makes NextPD's selection nil while ctx stays
-// valid: a fresh scheduler's zero-value lastIssuance means the first
-// wait fires almost instantly (nextTime is already in the past, not
-// because of cancellation), so pd==nil and ctx is still valid when
-// runScheduler checks it. The second loop iteration then faces a real
-// ~1s wait (lastIssuance was just updated), which the short test timeout
-// cancels normally — but by then, continue already ran once.
-func TestRunScheduler_ContinuesOnNilPDWithValidContext(t *testing.T) {
-	t.Parallel()
-	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	for id := range o.scheduler.pdMap {
-		delete(o.scheduler.pdMap, id)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-
-	if err := o.runScheduler(ctx); err != nil {
-		t.Fatalf("expected nil (clean shutdown), got %v", err)
 	}
 }
