@@ -11,11 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"slices"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
 	"github.com/dioptra-io/retina-commons/model"
 	wire "github.com/dioptra-io/retina-commons/wire/v2"
 	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
@@ -33,12 +31,14 @@ type Config struct {
 	// Increase this value if agents are slow to consume directives.
 	PDQueueSize int
 
-	// APIURL is retina-api's ingest endpoint, e.g. "https://retina0.lip6.fr:8090/api/v1/ingest".
-	APIURL string
+	// APIAddress is retina-api's ingest listener address, e.g. "retina0.lip6.fr:8123".
+	APIAddress string
 	// APIBufferSize is the outbound FIE buffer capacity. Defaults to 10,000 if zero.
 	APIBufferSize int
 	// APIReconnectDelay is the wait before retrying a dropped connection. Defaults to 5s if zero.
 	APIReconnectDelay time.Duration
+	// APISendTimeout is the deadline for sending one FIE. Defaults to 5s if zero.
+	APISendTimeout time.Duration
 
 	FIEFilterPolicy string
 	Seed            uint64
@@ -73,6 +73,9 @@ func (c *Config) applyDefaults() {
 	if c.APIReconnectDelay == 0 {
 		c.APIReconnectDelay = 5 * time.Second
 	}
+	if c.APISendTimeout == 0 {
+		c.APISendTimeout = 5 * time.Second
+	}
 	if c.FIEFilterPolicy == "" {
 		c.FIEFilterPolicy = "both"
 	}
@@ -102,26 +105,10 @@ func (c *Config) Validate() error {
 }
 
 // validateAPIConfig checks the fields governing the connection to
-// retina-api: APIURL, APIBufferSize, APIReconnectDelay.
+// retina-api: APIAddress, APIBufferSize, APIReconnectDelay, APISendTimeout.
 func (c *Config) validateAPIConfig() error {
-	if c.APIURL == "" {
-		return fmt.Errorf("APIURL cannot be empty")
-	}
-	parsedURL, err := url.Parse(c.APIURL)
-	if err != nil {
-		return fmt.Errorf("APIURL is not a valid URL: %w", err)
-	}
-	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
-		return fmt.Errorf("APIURL must use http or https, got %q", parsedURL.Scheme)
-	}
-	if parsedURL.Host == "" {
-		return fmt.Errorf("APIURL must include a host")
-	}
-	if parsedURL.Path == "" || parsedURL.Path == "/" {
-		return fmt.Errorf("APIURL must include a non-root path")
-	}
-	if parsedURL.Fragment != "" {
-		return fmt.Errorf("APIURL must not include a fragment")
+	if c.APIAddress == "" {
+		return fmt.Errorf("APIAddress cannot be empty")
 	}
 	if c.APIBufferSize < 0 {
 		return fmt.Errorf("APIBufferSize cannot be negative: got %d", c.APIBufferSize)
@@ -131,6 +118,9 @@ func (c *Config) validateAPIConfig() error {
 	}
 	if c.APIReconnectDelay < 0 {
 		return fmt.Errorf("APIReconnectDelay cannot be negative: got %s", c.APIReconnectDelay)
+	}
+	if c.APISendTimeout < 0 {
+		return fmt.Errorf("APISendTimeout cannot be negative: got %s", c.APISendTimeout)
 	}
 	return nil
 }
@@ -216,9 +206,10 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	o.scheduler = scheduler
 
 	ac, err := newAPIClient(&apiClientConfig{
-		url:            config.APIURL,
+		address:        config.APIAddress,
 		bufferSize:     config.APIBufferSize,
 		reconnectDelay: config.APIReconnectDelay,
+		sendTimeout:    config.APISendTimeout,
 		logger:         logger.With("component", "api_client"),
 		metrics:        metrics,
 	})
@@ -321,52 +312,6 @@ func (o *orch) runAgentServer(parentCtx context.Context) error {
 	return nil
 }
 
-// modelFIEToAPIv1 converts a model.ForwardingInfoElement to the api/v1 wire
-// type pushed to retina-api. Fallible: wire.IPVersion/wire.Protocol are
-// int32-based (protobuf enums) but api.IPVersion/api.Protocol are
-// uint8-based (confirmed against api/v1's real source) — a blind numeric
-// cast would be a genuine narrowing conversion, even though both enums'
-// legitimate values (0, 4, 6 for IPVersion; 0-58 for Protocol) fit
-// comfortably in a uint8 in practice. Explicit range checks here, rather
-// than a bare cast, so a corrupted/unexpected value errors instead of
-// silently wrapping — same reasoning as this codebase's other narrowing
-// conversions (e.g. model's TTL narrowing).
-func modelFIEToAPIv1(fie *model.ForwardingInfoElement) (api.ForwardingInfoElement, error) {
-	if fie.IPVersion < 0 || fie.IPVersion > 255 {
-		return api.ForwardingInfoElement{}, fmt.Errorf("ip_version %d exceeds uint8 range", fie.IPVersion)
-	}
-	if fie.Protocol < 0 || fie.Protocol > 255 {
-		return api.ForwardingInfoElement{}, fmt.Errorf("protocol %d exceeds uint8 range", fie.Protocol)
-	}
-
-	out := api.ForwardingInfoElement{
-		Agent:               api.Agent{AgentID: fie.Agent.ID},
-		ProbingDirectiveID:  fie.ProbingDirectiveID,
-		IPVersion:           api.IPVersion(fie.IPVersion), //nolint:gosec // range-checked above
-		Protocol:            api.Protocol(fie.Protocol),   //nolint:gosec // range-checked above
-		SourceAddress:       fie.SourceAddress,
-		DestinationAddress:  fie.DestinationAddress,
-		ProductionTimestamp: fie.ProductionTimestamp,
-	}
-	if fie.NearInfo != nil {
-		out.NearInfo = &api.Info{
-			ProbeTTL:          fie.NearInfo.ProbeTTL,
-			ReplyAddress:      fie.NearInfo.ReplyAddress,
-			SentTimestamp:     fie.NearInfo.SentTimestamp,
-			ReceivedTimestamp: fie.NearInfo.ReceivedTimestamp,
-		}
-	}
-	if fie.FarInfo != nil {
-		out.FarInfo = &api.Info{
-			ProbeTTL:          fie.FarInfo.ProbeTTL,
-			ReplyAddress:      fie.FarInfo.ReplyAddress,
-			SentTimestamp:     fie.FarInfo.SentTimestamp,
-			ReceivedTimestamp: fie.FarInfo.ReceivedTimestamp,
-		}
-	}
-	return out, nil
-}
-
 //nolint:funlen
 func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 	consumer, err := o.pdQueue.NewConsumer(status.agentID)
@@ -402,17 +347,11 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.agentID, "err", err)
 			}
 
-			allow := o.filterFIE(fie)
-			if !allow {
+			if !o.filterFIE(fie) {
 				continue
 			}
 
-			apiFIE, err := modelFIEToAPIv1(fie)
-			if err != nil {
-				o.logger.Error("Failed to convert FIE for retina-api", slog.Any("err", err))
-				continue
-			}
-			o.apiClient.push(&apiFIE)
+			o.apiClient.push(fie)
 			o.metrics.APIClientFIEsPushedTotal.Inc()
 		}
 	})
