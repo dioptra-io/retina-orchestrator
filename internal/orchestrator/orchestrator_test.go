@@ -73,18 +73,19 @@ func writePDFile(t *testing.T) string {
 	return f.Name()
 }
 
-// validConfig returns a Config that passes Validate() as-is. APIURL points
-// at a closed local port — fast, guaranteed connection refusal, since
-// nothing here needs a real retina-api.
+// validConfig returns a Config that passes Validate() as-is. APIAddress
+// points at a closed local port — fast, guaranteed connection refusal,
+// since nothing here needs a real retina-api.
 func validConfig(t *testing.T) *Config {
 	t.Helper()
 	return &Config{
 		AgentAddress:               "127.0.0.1:0",
 		AgentBufferLength:          8192,
 		PDQueueSize:                100,
-		APIURL:                     "http://127.0.0.1:1/api/v1/ingest",
+		APIAddress:                 "127.0.0.1:1",
 		APIBufferSize:              10_000,
 		APIReconnectDelay:          5 * time.Second,
+		APISendTimeout:             5 * time.Second,
 		PDPathV4:                   writePDFile(t),
 		Seed:                       0,
 		IssuanceRate:               1.0,
@@ -177,11 +178,22 @@ func TestConfig_ApplyDefaults_APIReconnectDelay(t *testing.T) {
 	}
 }
 
+func TestConfig_ApplyDefaults_APISendTimeout(t *testing.T) {
+	t.Parallel()
+	c := validConfig(t)
+	c.APISendTimeout = 0
+	c.applyDefaults()
+	if c.APISendTimeout != 5*time.Second {
+		t.Errorf("expected default 5s, got %v", c.APISendTimeout)
+	}
+}
+
 func TestConfig_ApplyDefaults_DoesNotOverrideExplicitValues(t *testing.T) {
 	t.Parallel()
 	c := validConfig(t)
 	c.APIBufferSize = 500
 	c.APIReconnectDelay = 3 * time.Second
+	c.APISendTimeout = 2 * time.Second
 	c.FIEFilterPolicy = "any"
 	c.applyDefaults()
 	if c.APIBufferSize != 500 {
@@ -189,6 +201,9 @@ func TestConfig_ApplyDefaults_DoesNotOverrideExplicitValues(t *testing.T) {
 	}
 	if c.APIReconnectDelay != 3*time.Second {
 		t.Errorf("expected explicit APIReconnectDelay preserved, got %v", c.APIReconnectDelay)
+	}
+	if c.APISendTimeout != 2*time.Second {
+		t.Errorf("expected explicit APISendTimeout preserved, got %v", c.APISendTimeout)
 	}
 	if c.FIEFilterPolicy != "any" {
 		t.Errorf("expected explicit FIEFilterPolicy preserved, got %q", c.FIEFilterPolicy)
@@ -226,6 +241,7 @@ func TestConfig_Validate_AcceptsZeroOptionalNumericFields(t *testing.T) {
 	c := validConfig(t)
 	c.APIBufferSize = 0
 	c.APIReconnectDelay = 0
+	c.APISendTimeout = 0
 	if err := c.Validate(); err != nil {
 		t.Fatalf("expected zero-valued optional numeric fields to pass Validate, got: %v", err)
 	}
@@ -241,15 +257,11 @@ func TestConfig_Validate_Errors(t *testing.T) {
 		{"empty AgentAddress", func(c *Config) { c.AgentAddress = "" }},
 		{"small AgentBufferLength", func(c *Config) { c.AgentBufferLength = 100 }},
 		{"zero PDQueueSize", func(c *Config) { c.PDQueueSize = 0 }},
-		{"empty APIURL", func(c *Config) { c.APIURL = "" }},
-		{"APIURL unsupported scheme", func(c *Config) { c.APIURL = "ftp://retina0.lip6.fr:8090" }},
-		{"APIURL missing host", func(c *Config) { c.APIURL = "https://" }},
-		{"APIURL malformed host", func(c *Config) { c.APIURL = "http://[::1:8090" }},
-		{"APIURL root path", func(c *Config) { c.APIURL = "https://retina0.lip6.fr:8090/" }},
-		{"APIURL fragment", func(c *Config) { c.APIURL = "https://retina0.lip6.fr:8090/api/v1/ingest#frag" }},
+		{"empty APIAddress", func(c *Config) { c.APIAddress = "" }},
 		{"negative APIBufferSize", func(c *Config) { c.APIBufferSize = -1 }},
 		{"APIBufferSize implausibly large", func(c *Config) { c.APIBufferSize = 6_000_000 }},
 		{"negative APIReconnectDelay", func(c *Config) { c.APIReconnectDelay = -time.Second }},
+		{"negative APISendTimeout", func(c *Config) { c.APISendTimeout = -time.Second }},
 		{"both PD paths empty", func(c *Config) { c.PDPathV4 = ""; c.PDPathV6 = "" }},
 		{"zero IssuanceRate", func(c *Config) { c.IssuanceRate = 0 }},
 		{"negative IssuanceRate", func(c *Config) { c.IssuanceRate = -1 }},
@@ -582,59 +594,6 @@ func TestAgentHandler_ReceivesFIE(t *testing.T) {
 	}
 }
 
-// TestAgentHandler_ConvertFIEError covers the inline modelFIEToAPIv1-then-continue
-// branch in agentHandler's FIE loop (replaces the deleted fieStreamHandler
-// coverage). Proto3 enums accept any int32 on the wire, so an out-of-range
-// IPVersion round-trips fine and only fails at our own range check.
-func TestAgentHandler_ConvertFIEError(t *testing.T) {
-	// Not parallel — uses real TCP connections.
-	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	clientConn, serverConn := newTCPPair(t)
-	defer func() { _ = clientConn.Close() }()
-	defer func() { _ = serverConn.Close() }()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-
-	stream := &agentStream{
-		conn:   serverConn,
-		ctx:    ctx,
-		cancel: cancel,
-	}
-
-	status := &agentAuthStatus{agentID: "agent-bad-fie"}
-
-	done := make(chan struct{})
-	go func() {
-		o.agentHandler(status, stream)
-		close(done)
-	}()
-
-	time.Sleep(20 * time.Millisecond)
-
-	badFIE := validWireFIE(1)
-	badFIE.IpVersion = wire.IPVersion(256) // out of uint8 range
-	badFIE.NearInfo = validWireInfo()
-	badFIE.FarInfo = validWireInfo()
-	if err := framing.Send(clientConn, 0, badFIE); err != nil {
-		t.Fatalf("cannot send bad FIE: %v", err)
-	}
-	time.Sleep(50 * time.Millisecond)
-
-	cancel()
-	_ = serverConn.Close()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("agentHandler did not return after a FIE conversion error (expected log-and-continue, not a hang)")
-	}
-}
-
 func TestAgentHandler_SendPDError(t *testing.T) {
 	// Not parallel — uses real TCP connections.
 	o, err := NewOrch(validConfig(t), testLogger(), testMetrics())
@@ -758,23 +717,5 @@ func TestAgentAuthHandler_InvalidSecret(t *testing.T) {
 	resp := o.agentAuthHandler(&wire.AuthRequest{Secret: "wrong"})
 	if resp.Authenticated {
 		t.Fatal("expected not authenticated")
-	}
-}
-
-// -- modelFIEToAPIv1 -----------------------------------------------------------
-
-func TestModelFIEToAPIv1_IPVersionOutOfRange(t *testing.T) {
-	t.Parallel()
-	fie := &model.ForwardingInfoElement{IPVersion: wire.IPVersion(256)}
-	if _, err := modelFIEToAPIv1(fie); err == nil {
-		t.Fatal("expected error for out-of-range IPVersion, got nil")
-	}
-}
-
-func TestModelFIEToAPIv1_ProtocolOutOfRange(t *testing.T) {
-	t.Parallel()
-	fie := &model.ForwardingInfoElement{Protocol: wire.Protocol(256)}
-	if _, err := modelFIEToAPIv1(fie); err == nil {
-		t.Fatal("expected error for out-of-range Protocol, got nil")
 	}
 }

@@ -35,9 +35,10 @@ func main() {
 //nolint:funlen
 func run() error {
 	var (
-		apiURL                     = flag.String("api-url", envOrDefault("RETINA_API_URL", ""), "retina-api ingest endpoint, e.g. https://retina0.lip6.fr:8090/api/v1/ingest")
+		apiAddr                    = flag.String("api-addr", envOrDefault("RETINA_API_ADDR", ""), "retina-api ingest listener address, e.g. retina0.lip6.fr:8123")
 		apiBufferSize              = flag.Int("api-buffer-size", envOrDefaultInt("RETINA_API_BUFFER_SIZE", 10_000), "Outbound FIE buffer capacity toward retina-api")
 		apiReconnectDelay          = flag.Duration("api-reconnect-delay", envOrDefaultDuration("RETINA_API_RECONNECT_DELAY", 5*time.Second), "Delay before retrying a dropped retina-api connection")
+		apiSendTimeout             = flag.Duration("api-send-timeout", envOrDefaultDuration("RETINA_API_SEND_TIMEOUT", 5*time.Second), "Deadline for sending one FIE to retina-api")
 		agentAddr                  = flag.String("agent-addr", envOrDefault("RETINA_AGENT_ADDR", "localhost:50050"), "Listening address for agent connections")
 		pdQueueSize                = flag.Int("pd-queue-size", envOrDefaultInt("RETINA_PD_QUEUE_SIZE", 100), "The size of the agent queue")
 		pdPathV4                   = flag.String("pd-path-v4", envOrDefault("RETINA_PD_PATH_V4", ""), "Path to the IPv4 probing directives file")
@@ -78,9 +79,10 @@ func run() error {
 		AgentAddress:               *agentAddr,
 		PDQueueSize:                *pdQueueSize,
 		AgentBufferLength:          defaultAgentBufferLength,
-		APIURL:                     *apiURL,
+		APIAddress:                 *apiAddr,
 		APIBufferSize:              *apiBufferSize,
 		APIReconnectDelay:          *apiReconnectDelay,
+		APISendTimeout:             *apiSendTimeout,
 		PDPathV4:                   *pdPathV4,
 		PDPathV6:                   *pdPathV6,
 		PDDiffPath:                 *pdDiffPath,
@@ -98,7 +100,7 @@ func run() error {
 	}
 
 	logger.Info("Starting orchestrator",
-		"api_url", *apiURL,
+		"api_addr", *apiAddr,
 		"agent_addr", *agentAddr,
 		"pd_path_v4", *pdPathV4,
 		"pd_path_v6", *pdPathV6,
@@ -138,7 +140,7 @@ func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr
 	srv := &http.Server{Handler: mux}
 
 	go func() {
-		logger.Info("Starting metrics server", slog.String("addr", addr))
+		logger.Info("Starting metrics server", slog.String("addr", ln.Addr().String()))
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("Metrics server failed", slog.Any("err", err))
 		}
@@ -147,8 +149,6 @@ func startMetricsServer(logger *slog.Logger, registry *prometheus.Registry, addr
 	return srv, nil
 }
 
-// newLogger creates a JSON logger writing to stdout at the given level.
-// Falls back to info if the level string is unrecognized.
 func newLogger(level string) *slog.Logger {
 	var l slog.Level
 	if err := l.UnmarshalText([]byte(level)); err != nil {

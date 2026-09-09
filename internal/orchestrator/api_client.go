@@ -4,42 +4,44 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
+	"net"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/framing"
+	"github.com/dioptra-io/retina-commons/model"
 )
 
-// apiClientConfig.url is retina-api's ingest endpoint, e.g.
-// "https://retina0.lip6.fr:8090/api/v1/ingest".
+// apiClientKeepalivePeriod matches agentKeepalivePeriod (agent_server.go).
+const apiClientKeepalivePeriod = 10 * time.Second
+
+// apiClientConfig.address is retina-api's ingest listener address, e.g.
+// "retina0.lip6.fr:8123".
 type apiClientConfig struct {
-	url            string
+	address        string
 	bufferSize     int
 	reconnectDelay time.Duration
-	httpClient     *http.Client
-	logger         *slog.Logger
-	metrics        *Metrics
+	// sendTimeout is the deadline for sending one FIE. Defaults to 5s if zero.
+	sendTimeout time.Duration
+	logger      *slog.Logger
+	metrics     *Metrics
 }
 
-// apiClient pushes FIEs to retina-api over a single long-lived NDJSON POST
-// connection, reconnecting on failure. No sequence numbers are assigned
-// here — retina-api assigns those per subscriber on the way out.
+// apiClient pushes FIEs to retina-api over one long-lived TCP connection,
+// reconnecting on failure. Sequence numbers are assigned by retina-api,
+// not here.
 type apiClient struct {
 	config  *apiClientConfig
-	fieChan chan *api.ForwardingInfoElement
+	fieChan chan *model.ForwardingInfoElement
 }
 
-// newAPIClient trusts url/bufferSize/reconnectDelay to already be valid —
-// Config.Validate() is the single place those are checked, since NewOrch
-// is the only real caller. What's left here is what Validate() can't cover:
-// defaults for fields outside Config, and metrics as a required dependency.
+// newAPIClient trusts address/bufferSize/reconnectDelay as already valid
+// (Config.Validate() owns that); it only defaults sendTimeout/logger and
+// requires metrics.
 func newAPIClient(config *apiClientConfig) (*apiClient, error) {
-	if config.httpClient == nil {
-		config.httpClient = &http.Client{}
+	if config.sendTimeout <= 0 {
+		config.sendTimeout = 5 * time.Second
 	}
 	if config.logger == nil {
 		config.logger = slog.Default()
@@ -49,14 +51,14 @@ func newAPIClient(config *apiClientConfig) (*apiClient, error) {
 	}
 	return &apiClient{
 		config:  config,
-		fieChan: make(chan *api.ForwardingInfoElement, config.bufferSize),
+		fieChan: make(chan *model.ForwardingInfoElement, config.bufferSize),
 	}, nil
 }
 
-// push is non-blocking: a full buffer means the connection is down or slow,
-// so the FIE is dropped and counted rather than stalling the caller. A nil
-// FIE is also dropped and counted rather than being encoded as JSON null.
-func (c *apiClient) push(fie *api.ForwardingInfoElement) {
+// push is non-blocking: a full buffer means the connection is down or
+// slow, so the FIE is dropped and counted rather than stalling the
+// caller. A nil FIE is also dropped and counted.
+func (c *apiClient) push(fie *model.ForwardingInfoElement) {
 	if fie == nil {
 		c.config.metrics.APIClientFIEsDroppedTotal.Inc()
 		return
@@ -68,8 +70,7 @@ func (c *apiClient) push(fie *api.ForwardingInfoElement) {
 	}
 }
 
-// run drives the reconnect loop; start it in its own goroutine. Fixed
-// retry delay, not backoff — not worth it for two orchestrators total.
+// run drives the reconnect loop; start it in its own goroutine.
 func (c *apiClient) run(ctx context.Context) {
 	for {
 		if ctx.Err() != nil {
@@ -88,55 +89,55 @@ func (c *apiClient) run(ctx context.Context) {
 	}
 }
 
-// streamOnce opens one POST connection and encodes FIEs into it as NDJSON
-// as they arrive, until the connection drops or ctx is canceled.
-//
-// retina-api's ingest handler doesn't respond until the connection ends
-// (it's a long-lived stream, not a request/response exchange), so Do()
-// normally only returns once something has gone wrong — deliberately not
-// inspecting a response here: a server replying while the request body is
-// still being streamed is a fragile pattern in Go's http stack (an early
-// response can race with the still-open body write in ways that are hard
-// to reason about), so retina-api and this client both avoid it rather
-// than trying to make it work.
+// streamOnce dials retina-api and sends FIEs as length-prefixed protobuf
+// (retina-commons/framing).
 func (c *apiClient) streamOnce(ctx context.Context) error {
-	pr, pw := io.Pipe()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.config.url, pr)
+	dialer := net.Dialer{}
+	rawConn, err := dialer.DialContext(ctx, "tcp", c.config.address)
 	if err != nil {
-		pw.Close()
-		return fmt.Errorf("failed to build request: %w", err)
+		return fmt.Errorf("failed to connect to retina-api: %w", err)
 	}
-	req.Header.Set("Content-Type", "application/x-ndjson")
+	conn, ok := rawConn.(*net.TCPConn)
+	if !ok {
+		rawConn.Close()
+		return fmt.Errorf("expected TCP connection, got %T", rawConn)
+	}
+	defer conn.Close()
 
-	respCh := make(chan error, 1)
-	go func() {
-		resp, err := c.config.httpClient.Do(req)
-		if resp != nil {
-			resp.Body.Close()
-		}
-		respCh <- err
-	}()
+	if err := conn.SetKeepAlive(true); err != nil {
+		return fmt.Errorf("failed to enable keepalive: %w", err)
+	}
+	if err := conn.SetKeepAlivePeriod(apiClientKeepalivePeriod); err != nil {
+		return fmt.Errorf("failed to set keepalive period: %w", err)
+	}
+
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
 	c.config.metrics.APIClientConnectionUp.Set(1)
 	defer c.config.metrics.APIClientConnectionUp.Set(0)
-	c.config.logger.Info("Connected to retina-api", slog.String("url", c.config.url))
+	c.config.logger.Info("Connected to retina-api", slog.String("address", c.config.address))
 
-	enc := json.NewEncoder(pw)
 	for {
 		select {
 		case fie := <-c.fieChan:
-			if err := enc.Encode(fie); err != nil {
-				pw.CloseWithError(err)
-				return fmt.Errorf("failed to encode FIE: %w", err)
-			}
-		case err := <-respCh:
-			pw.Close()
+			wireFIE, err := fie.ToProto()
 			if err != nil {
-				return fmt.Errorf("retina-api connection failed: %w", err)
+				c.config.logger.Error("Dropping FIE: failed to convert to wire format",
+					slog.String("error", err.Error()))
+				c.config.metrics.APIClientFIEsDroppedTotal.Inc()
+				continue
 			}
-			return fmt.Errorf("retina-api connection closed unexpectedly")
+			// AfterFunc (above) closes conn on cancellation, which
+			// unblocks this Send — ctx.Err() then tells a clean
+			// shutdown apart from a genuine failure.
+			if err := framing.Send(conn, c.config.sendTimeout, wireFIE); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("failed to send FIE: %w", err)
+			}
 		case <-ctx.Done():
-			pw.Close()
 			return nil
 		}
 	}

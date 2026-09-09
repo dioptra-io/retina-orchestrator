@@ -4,34 +4,28 @@ package orchestrator
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
+	"github.com/dioptra-io/retina-commons/framing"
+	"github.com/dioptra-io/retina-commons/model"
+	wire "github.com/dioptra-io/retina-commons/wire/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // Intentionally uncovered in streamOnce (api_client.go):
 //
-//   - The NewRequestWithContext error branch is unreachable in practice —
-//     Config.Validate() already guarantees a valid URL upstream.
-//   - resp.Body.Close() and "connection closed unexpectedly" only run on a
-//     clean server response/close while the client's write side is still
-//     open — reproducing that deterministically risks the same flakiness
-//     this suite spent a while debugging, so it's left untested.
-//   - TestStreamOnce_MidStreamDisconnectIsDetected hits either the
-//     encode-error or respCh-error branch, whichever goroutine notices
-//     first — which one shows covered can vary between runs.
+//   - The *net.TCPConn type assertion failure is unreachable in practice —
+//     DialContext with network "tcp" always returns *net.TCPConn (same
+//     reasoning as agent_server.go's equivalent assertion).
+//   - SetKeepAlive/SetKeepAlivePeriod error branches are unreachable on a
+//     freshly dialed, valid TCP connection.
 
 func newTestMetrics() *Metrics {
 	return &Metrics{
@@ -61,15 +55,28 @@ func waitForGauge(t *testing.T, g prometheus.Gauge, want float64) {
 	t.Fatalf("gauge did not reach %v within %s (last value %v)", want, timeout, testutil.ToFloat64(g))
 }
 
-// fakeIngestServer mimics retina-api's handleIngest: no response until the
-// stream ends, plus a mid-stream disconnect for failure-detection tests.
+// testFIE returns a minimal but valid FIE — DestinationAddress and
+// ProductionTimestamp are required by ToProto(), so a bare zero-value
+// literal would be dropped rather than sent.
+func testFIE(id uint64) *model.ForwardingInfoElement {
+	return &model.ForwardingInfoElement{
+		ProbingDirectiveID:  id,
+		DestinationAddress:  net.ParseIP("192.0.2.1"),
+		ProductionTimestamp: time.Now(),
+	}
+}
+
+// fakeIngestServer mimics retina-api's ingest listener: a raw TCP server
+// decoding length-prefixed protobuf FIEs (see retina-commons/framing),
+// plus a mid-stream disconnect for failure-detection tests.
 type fakeIngestServer struct {
-	server *httptest.Server
+	listener net.Listener
+	addr     string
 
 	mu       sync.Mutex
-	received []api.ForwardingInfoElement
+	received []*wire.ForwardingInfoElement
 
-	closeAfterN int // hijack + hard-reset the connection after N decoded FIEs; 0 = never
+	closeAfterN int // hard-reset the connection after N received FIEs; 0 = never
 
 	receivedCh chan struct{}
 	attempts   atomic.Int64
@@ -77,24 +84,42 @@ type fakeIngestServer struct {
 
 func newFakeIngestServer(t *testing.T) *fakeIngestServer {
 	t.Helper()
-	f := &fakeIngestServer{receivedCh: make(chan struct{}, 100_000)}
-	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
-	t.Cleanup(f.server.Close)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	f := &fakeIngestServer{
+		listener:   ln,
+		addr:       ln.Addr().String(),
+		receivedCh: make(chan struct{}, 100_000),
+	}
+	go f.acceptLoop()
+	t.Cleanup(func() { _ = ln.Close() })
 	return f
 }
 
-func (f *fakeIngestServer) handle(w http.ResponseWriter, r *http.Request) {
+func (f *fakeIngestServer) acceptLoop() {
+	for {
+		conn, err := f.listener.Accept()
+		if err != nil {
+			return // listener closed
+		}
+		go f.handle(conn)
+	}
+}
+
+func (f *fakeIngestServer) handle(conn net.Conn) {
+	defer conn.Close()
 	f.attempts.Add(1)
 
-	dec := json.NewDecoder(r.Body)
 	count := 0
 	for {
-		var fie api.ForwardingInfoElement
-		if err := dec.Decode(&fie); err != nil {
-			break
+		var fie wire.ForwardingInfoElement
+		if err := framing.Receive(conn, 0, &fie); err != nil {
+			return
 		}
 		f.mu.Lock()
-		f.received = append(f.received, fie)
+		f.received = append(f.received, &fie)
 		f.mu.Unlock()
 		select {
 		case f.receivedCh <- struct{}{}:
@@ -103,22 +128,15 @@ func (f *fakeIngestServer) handle(w http.ResponseWriter, r *http.Request) {
 		count++
 
 		if f.closeAfterN > 0 && count >= f.closeAfterN {
-			if hj, ok := w.(http.Hijacker); ok {
-				if conn, _, err := hj.Hijack(); err == nil {
-					// SetLinger(0) forces a hard RST instead of a graceful
-					// FIN: an ordinary close can leave the client's next
-					// write indefinitely unacknowledged rather than
-					// failing, which is what caused this test to hang.
-					if tcpConn, ok := conn.(*net.TCPConn); ok {
-						_ = tcpConn.SetLinger(0)
-					}
-					conn.Close()
-				}
+			// SetLinger(0) forces a hard RST instead of a graceful FIN, so
+			// the client's next send fails immediately rather than
+			// hanging indefinitely.
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				_ = tcpConn.SetLinger(0)
 			}
 			return
 		}
 	}
-	fmt.Fprintf(w, `{"received": %d}`, count)
 }
 
 func (f *fakeIngestServer) count() int {
@@ -144,12 +162,12 @@ func (f *fakeIngestServer) waitForCount(t *testing.T, n int, timeout time.Durati
 // ---- newAPIClient / config validation ----
 
 // TestNewAPIClient_Validation covers only what newAPIClient itself checks —
-// url/bufferSize/reconnectDelay validation lives in Config.Validate() now
-// (see orchestrator_test.go's TestConfig_Validate_* tests).
+// address/bufferSize/reconnectDelay validation lives in Config.Validate()
+// now (see orchestrator_test.go's TestConfig_Validate_* tests).
 func TestNewAPIClient_Validation(t *testing.T) {
 	t.Parallel()
 	baseConfig := func() *apiClientConfig {
-		return &apiClientConfig{url: "http://example.invalid", bufferSize: 100, metrics: newTestMetrics()}
+		return &apiClientConfig{address: "127.0.0.1:1", bufferSize: 100, metrics: newTestMetrics()}
 	}
 
 	tests := []struct {
@@ -177,17 +195,17 @@ func TestNewAPIClient_Validation(t *testing.T) {
 }
 
 // TestNewAPIClient_Defaults covers only what newAPIClient itself defaults
-// (httpClient, logger) — bufferSize/reconnectDelay default in
+// (sendTimeout, logger) — bufferSize/reconnectDelay default in
 // Config.applyDefaults() now (orchestrator_test.go).
 func TestNewAPIClient_Defaults(t *testing.T) {
 	t.Parallel()
-	cfg := &apiClientConfig{url: "http://example.invalid", bufferSize: 100, metrics: newTestMetrics()}
+	cfg := &apiClientConfig{address: "127.0.0.1:1", bufferSize: 100, metrics: newTestMetrics()}
 	c, err := newAPIClient(cfg)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.httpClient == nil {
-		t.Error("expected default httpClient to be set")
+	if cfg.sendTimeout != 5*time.Second {
+		t.Errorf("expected default sendTimeout 5s, got %s", cfg.sendTimeout)
 	}
 	if cfg.logger == nil {
 		t.Error("expected default logger to be set")
@@ -202,7 +220,7 @@ func TestNewAPIClient_Defaults(t *testing.T) {
 // produces an unbuffered channel.
 func TestNewAPIClient_UnbufferedIfBufferSizeUnset(t *testing.T) {
 	t.Parallel()
-	c, err := newAPIClient(&apiClientConfig{url: "http://example.invalid", metrics: newTestMetrics()})
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", metrics: newTestMetrics()})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -213,15 +231,14 @@ func TestNewAPIClient_UnbufferedIfBufferSizeUnset(t *testing.T) {
 
 func TestNewAPIClient_PreservesExplicitValues(t *testing.T) {
 	t.Parallel()
-	httpClient := &http.Client{Timeout: time.Minute}
 	logger := discardLogger()
 	metrics := newTestMetrics()
 
 	cfg := &apiClientConfig{
-		url:            "http://example.invalid",
+		address:        "127.0.0.1:1",
 		bufferSize:     42,
 		reconnectDelay: 3 * time.Second,
-		httpClient:     httpClient,
+		sendTimeout:    2 * time.Second,
 		logger:         logger,
 		metrics:        metrics,
 	}
@@ -235,8 +252,8 @@ func TestNewAPIClient_PreservesExplicitValues(t *testing.T) {
 	if cfg.reconnectDelay != 3*time.Second {
 		t.Errorf("expected explicit reconnectDelay preserved, got %s", cfg.reconnectDelay)
 	}
-	if cfg.httpClient != httpClient {
-		t.Error("expected explicit httpClient preserved")
+	if cfg.sendTimeout != 2*time.Second {
+		t.Errorf("expected explicit sendTimeout preserved, got %s", cfg.sendTimeout)
 	}
 }
 
@@ -245,7 +262,7 @@ func TestNewAPIClient_PreservesExplicitValues(t *testing.T) {
 func TestPush_NilFIEIsDroppedAndCounted(t *testing.T) {
 	t.Parallel()
 	metrics := newTestMetrics()
-	c, err := newAPIClient(&apiClientConfig{url: "http://example.invalid", bufferSize: 1, metrics: metrics})
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", bufferSize: 1, metrics: metrics})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -263,12 +280,12 @@ func TestPush_NilFIEIsDroppedAndCounted(t *testing.T) {
 func TestPush_SucceedsWhenSpaceAvailable(t *testing.T) {
 	t.Parallel()
 	metrics := newTestMetrics()
-	c, err := newAPIClient(&apiClientConfig{url: "http://example.invalid", bufferSize: 2, metrics: metrics})
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", bufferSize: 2, metrics: metrics})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	fie := &api.ForwardingInfoElement{ProbingDirectiveID: 42}
+	fie := testFIE(42)
 	c.push(fie)
 
 	if got := testutil.ToFloat64(metrics.APIClientFIEsDroppedTotal); got != 0 {
@@ -287,13 +304,13 @@ func TestPush_SucceedsWhenSpaceAvailable(t *testing.T) {
 func TestPush_FullBufferDropsAndCounts(t *testing.T) {
 	t.Parallel()
 	metrics := newTestMetrics()
-	c, err := newAPIClient(&apiClientConfig{url: "http://example.invalid", bufferSize: 1, metrics: metrics})
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", bufferSize: 1, metrics: metrics})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	fie1 := &api.ForwardingInfoElement{ProbingDirectiveID: 1}
-	fie2 := &api.ForwardingInfoElement{ProbingDirectiveID: 2}
+	fie1 := testFIE(1)
+	fie2 := testFIE(2)
 
 	c.push(fie1) // fills the buffer (size 1)
 	c.push(fie2) // must be dropped
@@ -319,7 +336,7 @@ func TestStreamOnce_SuccessfulStreamingAndCleanShutdown(t *testing.T) {
 	metrics := newTestMetrics()
 
 	c, err := newAPIClient(&apiClientConfig{
-		url:        fake.server.URL,
+		address:    fake.addr,
 		bufferSize: 100,
 		metrics:    metrics,
 		logger:     discardLogger(),
@@ -336,26 +353,11 @@ func TestStreamOnce_SuccessfulStreamingAndCleanShutdown(t *testing.T) {
 
 	waitForGauge(t, metrics.APIClientConnectionUp, 1)
 
-	// Push continuously rather than a fixed handful: a small number of
-	// small writes can sit buffered indefinitely (see api_client.go's
-	// streamOnce doc comment) — sustained traffic, as in real production
-	// load, reliably forces a flush.
-	stopPushing := make(chan struct{})
-	go func() {
-		var i uint64
-		for {
-			select {
-			case <-stopPushing:
-				return
-			default:
-				c.push(&api.ForwardingInfoElement{ProbingDirectiveID: i})
-				i++
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}()
-	fake.waitForCount(t, 5, 5*time.Second)
-	close(stopPushing)
+	const n = 5
+	for i := uint64(0); i < n; i++ {
+		c.push(testFIE(i))
+	}
+	fake.waitForCount(t, n, 2*time.Second)
 
 	cancel()
 	select {
@@ -379,7 +381,7 @@ func TestStreamOnce_CanceledBeforeAnyFIE(t *testing.T) {
 	fake := newFakeIngestServer(t)
 
 	metrics := newTestMetrics()
-	c, err := newAPIClient(&apiClientConfig{url: fake.server.URL, bufferSize: 100, metrics: metrics, logger: discardLogger()})
+	c, err := newAPIClient(&apiClientConfig{address: fake.addr, bufferSize: 100, metrics: metrics, logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,7 +400,7 @@ func TestStreamOnce_MidStreamDisconnectIsDetected(t *testing.T) {
 	fake.closeAfterN = 2
 
 	metrics := newTestMetrics()
-	c, err := newAPIClient(&apiClientConfig{url: fake.server.URL, bufferSize: 100, metrics: metrics, logger: discardLogger()})
+	c, err := newAPIClient(&apiClientConfig{address: fake.addr, bufferSize: 100, metrics: metrics, logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -411,37 +413,63 @@ func TestStreamOnce_MidStreamDisconnectIsDetected(t *testing.T) {
 
 	waitForGauge(t, metrics.APIClientConnectionUp, 1)
 
-	// Push continuously rather than a one-off burst: a handful of small
-	// writes can sit buffered in the connection's write buffer
-	// indefinitely (see api_client.go's streamOnce doc comment) — only
-	// sustained traffic reliably forces a flush, same as real production
-	// load would.
-	stopPushing := make(chan struct{})
-	defer close(stopPushing)
-	go func() {
-		var i uint64
-		for {
-			select {
-			case <-stopPushing:
-				return
-			default:
-				c.push(&api.ForwardingInfoElement{ProbingDirectiveID: i})
-				i++
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}()
+	// Push more than closeAfterN so a later send lands on the closed connection.
+	for i := uint64(0); i < 10; i++ {
+		c.push(testFIE(i))
+	}
 
 	select {
 	case err := <-done:
 		if err == nil {
 			t.Fatal("expected an error after the server closed the connection mid-stream")
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("streamOnce did not detect the mid-stream disconnect in time")
 	}
 
 	waitForGauge(t, metrics.APIClientConnectionUp, 0)
+}
+
+// TestStreamOnce_InvalidFIEIsDroppedNotSent covers the fie.ToProto()
+// error branch: a FIE missing its required DestinationAddress is dropped
+// and counted, without breaking the connection or blocking later,
+// well-formed FIEs from being sent normally.
+func TestStreamOnce_InvalidFIEIsDroppedNotSent(t *testing.T) {
+	t.Parallel()
+	fake := newFakeIngestServer(t)
+	metrics := newTestMetrics()
+
+	c, err := newAPIClient(&apiClientConfig{address: fake.addr, bufferSize: 100, metrics: metrics, logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- c.streamOnce(ctx) }()
+
+	waitForGauge(t, metrics.APIClientConnectionUp, 1)
+
+	invalid := &model.ForwardingInfoElement{ProbingDirectiveID: 1} // no DestinationAddress
+	c.push(invalid)
+	c.push(testFIE(2))
+	fake.waitForCount(t, 1, 2*time.Second)
+
+	if got := testutil.ToFloat64(metrics.APIClientFIEsDroppedTotal); got != 1 {
+		t.Errorf("expected the invalid FIE to be dropped and counted, got %v", got)
+	}
+	if fake.count() != 1 {
+		t.Errorf("expected only the valid FIE to reach the server, got %d", fake.count())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("streamOnce did not return after context cancellation")
+	}
 }
 
 // ---- run ----
@@ -452,7 +480,7 @@ func TestStreamOnce_MidStreamDisconnectIsDetected(t *testing.T) {
 func TestRun_ReturnsImmediatelyIfAlreadyCanceled(t *testing.T) {
 	t.Parallel()
 	metrics := newTestMetrics()
-	c, err := newAPIClient(&apiClientConfig{url: "http://example.invalid", bufferSize: 100, metrics: metrics, logger: discardLogger()})
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", bufferSize: 100, metrics: metrics, logger: discardLogger()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,17 +502,13 @@ func TestRun_ReturnsImmediatelyIfAlreadyCanceled(t *testing.T) {
 }
 
 // TestRun_RetriesOnFailureAndStopsOnCancel points at an address nothing is
-// listening on — a real, common failure mode (retina-api down, wrong port)
-// — rather than simulating server-side rejection, since retina-api's
-// ingest handler doesn't reject early in the current design (see
-// api_client.go's streamOnce doc comment on why an early response isn't
-// used at all).
+// listening on — a real, common failure mode (retina-api down, wrong port).
 func TestRun_RetriesOnFailureAndStopsOnCancel(t *testing.T) {
 	t.Parallel()
 
 	metrics := newTestMetrics()
 	c, err := newAPIClient(&apiClientConfig{
-		url:            "http://127.0.0.1:1/api/v1/ingest", // port 1: nothing listens here
+		address:        "127.0.0.1:1", // port 1: nothing listens here
 		bufferSize:     100,
 		metrics:        metrics,
 		reconnectDelay: 10 * time.Millisecond,
@@ -518,7 +542,7 @@ func TestRun_SuccessfulSessionDoesNotRetry(t *testing.T) {
 
 	metrics := newTestMetrics()
 	c, err := newAPIClient(&apiClientConfig{
-		url:            fake.server.URL,
+		address:        fake.addr,
 		bufferSize:     100,
 		metrics:        metrics,
 		reconnectDelay: 10 * time.Millisecond,
@@ -536,26 +560,8 @@ func TestRun_SuccessfulSessionDoesNotRetry(t *testing.T) {
 	}()
 
 	waitForGauge(t, metrics.APIClientConnectionUp, 1)
-
-	// Push continuously rather than once: a single small write can sit
-	// buffered indefinitely (see api_client.go's streamOnce doc comment) —
-	// sustained traffic, as in real production load, reliably forces a flush.
-	stopPushing := make(chan struct{})
-	go func() {
-		var i uint64
-		for {
-			select {
-			case <-stopPushing:
-				return
-			default:
-				c.push(&api.ForwardingInfoElement{ProbingDirectiveID: i})
-				i++
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}()
-	fake.waitForCount(t, 1, 5*time.Second)
-	close(stopPushing)
+	c.push(testFIE(7))
+	fake.waitForCount(t, 1, 2*time.Second)
 
 	cancel()
 	select {
