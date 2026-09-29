@@ -3,10 +3,11 @@
 package orchestrator
 
 import (
+	"math/rand/v2"
 	"testing"
 )
 
-// 100% coverage: every branch in newRandomizer, Next, Cycle, and Replace is exercised.
+// 100% coverage: every branch in newRandomizer, Next, Cycle, Replace, Remove, and Len is exercised.
 
 // -- newRandomizer ------------------------------------------------------------
 
@@ -266,5 +267,210 @@ func TestRandomizer_IndexPDConsistency(t *testing.T) {
 	for range len(indices) * 2 {
 		r.Next()
 		checkConsistency()
+	}
+}
+
+// -- Remove / Len -------------------------------------------------------------
+
+func removeTestRandomizer(t *testing.T, seed uint64, ids ...uint64) *randomizer {
+	t.Helper()
+	r, err := newRandomizer(seed, append([]uint64(nil), ids...))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return r
+}
+
+// assertRandomizerInvariants checks what Remove must preserve: indices,
+// indexPD, and length agree, every ID's recorded position is its real
+// position, and the cycle boundary stays in range.
+func assertRandomizerInvariants(t *testing.T, r *randomizer) {
+	t.Helper()
+	if len(r.indices) != r.length || len(r.indexPD) != r.length {
+		t.Fatalf("size mismatch: len(indices)=%d length=%d len(indexPD)=%d",
+			len(r.indices), r.length, len(r.indexPD))
+	}
+	for pos, id := range r.indices {
+		if got, ok := r.indexPD[id]; !ok || got != pos {
+			t.Fatalf("indexPD[%d] = %d (present=%v), want position %d", id, got, ok, pos)
+		}
+	}
+	if r.i < -1 || r.i > r.length-1 {
+		t.Fatalf("boundary i=%d out of range for length %d", r.i, r.length)
+	}
+}
+
+func drawIDs(r *randomizer, n int) []uint64 {
+	out := make([]uint64, 0, n)
+	for range n {
+		out = append(out, r.Next())
+	}
+	return out
+}
+
+// assertSameIDs checks got holds exactly the wanted IDs, each once.
+func assertSameIDs(t *testing.T, got []uint64, want ...uint64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want the set %v", got, want)
+	}
+	seen := make(map[uint64]bool, len(got))
+	for _, id := range got {
+		if seen[id] {
+			t.Fatalf("got %v: %d drawn twice, want the set %v", got, id, want)
+		}
+		seen[id] = true
+	}
+	for _, id := range want {
+		if !seen[id] {
+			t.Fatalf("got %v: missing %d, want the set %v", got, id, want)
+		}
+	}
+}
+
+func TestRandomizer_RemoveUndrawn(t *testing.T) {
+	t.Parallel()
+	r := removeTestRandomizer(t, 1, 1, 2, 3, 4, 5)
+
+	r.Remove(3)
+
+	assertRandomizerInvariants(t, r)
+	if r.Len() != 4 {
+		t.Fatalf("expected Len() 4, got %d", r.Len())
+	}
+	assertSameIDs(t, drawIDs(r, 4), 1, 2, 4, 5)
+	if r.Cycle() != 0 {
+		t.Errorf("expected the cycle not to advance within the first pass, got %d", r.Cycle())
+	}
+}
+
+func TestRandomizer_RemoveDrawnMidCycle(t *testing.T) {
+	t.Parallel()
+	r := removeTestRandomizer(t, 2, 1, 2, 3, 4, 5)
+	first, second := r.Next(), r.Next()
+
+	r.Remove(first)
+
+	assertRandomizerInvariants(t, r)
+	// The three still-undrawn IDs finish the current cycle, once each.
+	var undrawn []uint64
+	for _, id := range []uint64{1, 2, 3, 4, 5} {
+		if id != first && id != second {
+			undrawn = append(undrawn, id)
+		}
+	}
+	assertSameIDs(t, drawIDs(r, 3), undrawn...)
+	if r.Cycle() != 0 {
+		t.Errorf("expected cycle 0 until the pass completes, got %d", r.Cycle())
+	}
+	// The next cycle covers every survivor (all but the removed one).
+	var survivors []uint64
+	for _, id := range []uint64{1, 2, 3, 4, 5} {
+		if id != first {
+			survivors = append(survivors, id)
+		}
+	}
+	assertSameIDs(t, drawIDs(r, 4), survivors...)
+	if r.Cycle() != 1 {
+		t.Errorf("expected cycle 1, got %d", r.Cycle())
+	}
+}
+
+// TestRandomizer_RemoveWhenCycleFullyDrawn covers removal at the moment
+// i == -1 (everything drawn, wrap not yet triggered).
+func TestRandomizer_RemoveWhenCycleFullyDrawn(t *testing.T) {
+	t.Parallel()
+	r := removeTestRandomizer(t, 1, 1, 2, 3)
+	drawIDs(r, 3)
+
+	r.Remove(2)
+
+	assertRandomizerInvariants(t, r)
+	assertSameIDs(t, drawIDs(r, 2), 1, 3)
+	if r.Cycle() != 1 {
+		t.Errorf("expected the next draws to start cycle 1, got %d", r.Cycle())
+	}
+}
+
+func TestRandomizer_RemoveUnknownIsNoOp(t *testing.T) {
+	t.Parallel()
+	r := removeTestRandomizer(t, 1, 1, 2, 3)
+
+	r.Remove(99)
+
+	assertRandomizerInvariants(t, r)
+	if r.Len() != 3 {
+		t.Errorf("expected Len() 3 after removing an unknown ID, got %d", r.Len())
+	}
+}
+
+func TestRandomizer_RemoveDownToEmpty(t *testing.T) {
+	t.Parallel()
+	r := removeTestRandomizer(t, 1, 0, 1, 2) // 0 is a legitimate PD ID
+	r.Next()
+
+	for _, id := range []uint64{1, 0, 2} {
+		r.Remove(id)
+		assertRandomizerInvariants(t, r)
+	}
+	if r.Len() != 0 {
+		t.Fatalf("expected Len() 0, got %d", r.Len())
+	}
+	r.Remove(1) // removing from an empty randomizer is a no-op
+	assertRandomizerInvariants(t, r)
+}
+
+// TestRandomizer_RemoveRandomOps interleaves Next and Remove at random and
+// checks the properties that matter: only live IDs are drawn, none twice in
+// a cycle, and a cycle never wraps until every live ID has been drawn —
+// which fails if Remove ever leaves an ID on the wrong side of the boundary.
+func TestRandomizer_RemoveRandomOps(t *testing.T) {
+	t.Parallel()
+	for seed := uint64(0); seed < 300; seed++ {
+		ids := make([]uint64, 0, 24)
+		alive := make(map[uint64]bool, 24)
+		for id := uint64(0); id < 24; id++ {
+			ids = append(ids, id)
+			alive[id] = true
+		}
+		r := removeTestRandomizer(t, seed, ids...)
+		rng := rand.New(rand.NewPCG(seed, 1)) // #nosec G404
+		drawn := make(map[uint64]bool)
+
+		for step := 0; step < 300 && r.Len() > 0; step++ {
+			if rng.IntN(3) == 0 {
+				var candidates []uint64
+				for _, id := range ids {
+					if alive[id] {
+						candidates = append(candidates, id)
+					}
+				}
+				victim := candidates[rng.IntN(len(candidates))]
+				r.Remove(victim)
+				delete(alive, victim)
+				delete(drawn, victim)
+			} else {
+				before := r.Cycle()
+				id := r.Next()
+				if r.Cycle() != before {
+					if len(drawn) != len(alive) {
+						t.Fatalf("seed %d step %d: cycle advanced with %d of %d live IDs drawn",
+							seed, step, len(drawn), len(alive))
+					}
+					drawn = make(map[uint64]bool)
+				}
+				if !alive[id] {
+					t.Fatalf("seed %d step %d: drew removed ID %d", seed, step, id)
+				}
+				if drawn[id] {
+					t.Fatalf("seed %d step %d: ID %d drawn twice in one cycle", seed, step, id)
+				}
+				drawn[id] = true
+			}
+			assertRandomizerInvariants(t, r)
+			if r.Len() != len(alive) {
+				t.Fatalf("seed %d step %d: Len() = %d, want %d", seed, step, r.Len(), len(alive))
+			}
+		}
 	}
 }

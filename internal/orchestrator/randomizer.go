@@ -13,13 +13,13 @@ import (
 // within the current cycle; once all indices have been returned, a new cycle
 // begins and the sequence is reshuffled.
 //
-// randomizer is not safe for concurrent use. All calls to Next, Replace, and
-// Cycle must be made under the scheduler mutex.
+// randomizer is not safe for concurrent use. All calls to Next, Replace,
+// Remove, Len, and Cycle must be made under the scheduler mutex.
 type randomizer struct {
 	random  *rand.Rand
 	indices []uint64
 	// indexPD is a reverse map from PD ID to its current position in indices,
-	// kept in sync with every swap performed by Next and Replace.
+	// kept in sync with every swap performed by Next, Replace, and Remove.
 	indexPD map[uint64]int
 	i       int
 	length  int
@@ -54,6 +54,8 @@ func newRandomizer(seed uint64, indices []uint64) (*randomizer, error) {
 // new permutation begins. The cycle increment happens before the first element
 // of the new cycle is returned, so Cycle() reflects the cycle of the element
 // about to be returned, not the one just returned.
+//
+// Next must not be called when Len() == 0 (every ID has been removed).
 func (r *randomizer) Next() uint64 {
 	if r.i < 0 {
 		r.cycle++
@@ -90,6 +92,41 @@ func (r *randomizer) Replace(oldID, newID uint64) {
 	delete(r.indexPD, oldID)
 	r.indices[pos] = newID
 	r.indexPD[newID] = pos
+}
+
+// Remove deletes id in O(1), shrinking the cycle by one; a no-op if id is
+// absent. Within a cycle, indices is [undrawn: 0..i][drawn: i+1..end], so an
+// undrawn ID's hole is first moved to the boundary (lowering i), and the hole
+// is then refilled from the end of the slice, which is always a drawn slot.
+// After the last ID is removed, Len() == 0 and Next must not be called.
+func (r *randomizer) Remove(id uint64) {
+	pos, ok := r.indexPD[id]
+	if !ok {
+		return
+	}
+	last := r.length - 1
+
+	if pos <= r.i {
+		boundary := r.indices[r.i]
+		r.indices[pos] = boundary
+		r.indexPD[boundary] = pos
+		pos = r.i
+		r.i--
+	}
+
+	if pos != last {
+		end := r.indices[last]
+		r.indices[pos] = end
+		r.indexPD[end] = pos
+	}
+	r.indices = r.indices[:last]
+	r.length--
+	delete(r.indexPD, id)
+}
+
+// Len returns the number of IDs currently in the randomizer.
+func (r *randomizer) Len() int {
+	return r.length
 }
 
 // Cycle returns the current cycle count. The count is incremented at the start

@@ -3,14 +3,23 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net"
 	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/model"
 	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -141,6 +150,81 @@ func newTestSchedulerWithConfig(t *testing.T, v4pds []*wire.ProbingDirective, ac
 		t.Fatalf("unexpected error: %v", err)
 	}
 	return s
+}
+
+// diffInsertLine returns an insert-op line: a protojson PD plus "op":"insert".
+func diffInsertLine(t *testing.T, pd *wire.ProbingDirective) []byte {
+	t.Helper()
+	b, err := protojson.Marshal(pd)
+	if err != nil {
+		t.Fatalf("cannot marshal directive: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		t.Fatalf("cannot unmarshal directive fields: %v", err)
+	}
+	fields["op"] = json.RawMessage(`"insert"`)
+	out, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("cannot marshal insert line: %v", err)
+	}
+	return out
+}
+
+func diffRemoveLine(id uint64) []byte {
+	return []byte(fmt.Sprintf(`{"op":"remove","probing_directive_id":%d}`, id))
+}
+
+func writeDiffFile(t *testing.T, lines [][]byte) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "pds-diff-*.jsonl")
+	if err != nil {
+		t.Fatalf("cannot create temp file: %v", err)
+	}
+	for _, line := range lines {
+		if _, err := f.Write(append(line, '\n')); err != nil {
+			t.Fatalf("cannot write to temp file: %v", err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("cannot close temp file: %v", err)
+	}
+	return f.Name()
+}
+
+// makeModelPD builds a *model.ProbingDirective as readPDDiff would.
+//
+//nolint:unparam // ipVersion is always IPv4 in current tests but is a meaningful parameter
+func makeModelPD(t *testing.T, id uint64, agentID string, ipVersion wire.IPVersion, addr string) *model.ProbingDirective {
+	t.Helper()
+	pd, err := model.ProbingDirectiveFromProto(&wire.ProbingDirective{
+		ProbingDirectiveId: id,
+		AgentId:            agentID,
+		IpVersion:          ipVersion,
+		DestinationAddress: addr,
+	})
+	if err != nil {
+		t.Fatalf("cannot build test directive: %v", err)
+	}
+	return &pd
+}
+
+// syncBuffer is a goroutine-safe log sink.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // -- NewScheduler -------------------------------------------------------------
@@ -416,6 +500,159 @@ func TestReadPDs_SkipsBlankLines(t *testing.T) {
 	}
 }
 
+// -- readPDDiff -----------------------------------------------------------------
+
+func TestReadPDDiff_InsertAndRemove(t *testing.T) {
+	t.Parallel()
+	path := writeDiffFile(t, [][]byte{
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 1, DestinationAddress: "192.0.2.1"}),
+		diffRemoveLine(2),
+	})
+
+	toInsert, toRemove, skipped, err := readPDDiff(path, testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("expected no skipped lines, got %d", skipped)
+	}
+	if len(toInsert) != 1 || toInsert[0].ProbingDirectiveID != 1 {
+		t.Errorf("expected one inserted PD with ID 1, got %+v", toInsert)
+	}
+	if len(toRemove) != 1 || toRemove[0] != 2 {
+		t.Errorf("expected one removed ID (2), got %v", toRemove)
+	}
+}
+
+// TestReadPDDiff_DiscardsOpField makes explicit that DiscardUnknown tolerates
+// the non-proto "op" field.
+func TestReadPDDiff_DiscardsOpField(t *testing.T) {
+	t.Parallel()
+	path := writeDiffFile(t, [][]byte{
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 1, DestinationAddress: "192.0.2.1"}),
+	})
+	toInsert, _, skipped, err := readPDDiff(path, testLogger())
+	if err != nil || skipped != 0 || len(toInsert) != 1 {
+		t.Fatalf("expected \"op\" to be discarded via DiscardUnknown, got inserts=%d skipped=%d err=%v",
+			len(toInsert), skipped, err)
+	}
+}
+
+// assertOneLineSkipped checks readPDDiff skips the single malformed line in
+// path without failing the file or applying anything from it.
+func assertOneLineSkipped(t *testing.T, path string) {
+	t.Helper()
+	toInsert, toRemove, skipped, err := readPDDiff(path, testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if skipped != 1 {
+		t.Errorf("expected 1 skipped line, got %d", skipped)
+	}
+	if len(toInsert) != 0 || len(toRemove) != 0 {
+		t.Errorf("expected nothing applied, got inserts=%v removes=%v", toInsert, toRemove)
+	}
+}
+
+func TestReadPDDiff_UnknownOp(t *testing.T) {
+	t.Parallel()
+	assertOneLineSkipped(t, writeDiffFile(t, [][]byte{[]byte(`{"op":"replace","probing_directive_id":1}`)}))
+}
+
+func TestReadPDDiff_InvalidOpJSON(t *testing.T) {
+	t.Parallel()
+	assertOneLineSkipped(t, writeDiffFile(t, [][]byte{[]byte(`not valid json`)}))
+}
+
+// TestReadPDDiff_InvalidInsertDirective covers an insert that protojson
+// accepts but model.ProbingDirectiveFromProto rejects (no destination_address).
+func TestReadPDDiff_InvalidInsertDirective(t *testing.T) {
+	t.Parallel()
+	assertOneLineSkipped(t, writeDiffFile(t, [][]byte{
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 1}), // no destination_address
+	}))
+}
+
+// TestReadPDDiff_InvalidInsertProtojson covers protojson itself failing, via a
+// type mismatch. DiscardUnknown also zero-values unknown enum strings, so a
+// bad ip_version would not fail here.
+func TestReadPDDiff_InvalidInsertProtojson(t *testing.T) {
+	t.Parallel()
+	assertOneLineSkipped(t, writeDiffFile(t, [][]byte{
+		[]byte(`{"op":"insert","probing_directive_id":1,"destination_address":"192.0.2.1","agent_id":123}`),
+	}))
+}
+
+// TestReadPDDiff_SkipsMalformedLineKeepsTheRest checks a bad line costs only
+// itself, not the rest of the file.
+func TestReadPDDiff_SkipsMalformedLineKeepsTheRest(t *testing.T) {
+	t.Parallel()
+	path := writeDiffFile(t, [][]byte{
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 1, DestinationAddress: "192.0.2.1"}),
+		[]byte(`not valid json`),
+		diffRemoveLine(2),
+	})
+
+	toInsert, toRemove, skipped, err := readPDDiff(path, testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if skipped != 1 {
+		t.Errorf("expected 1 skipped line, got %d", skipped)
+	}
+	if len(toInsert) != 1 || toInsert[0].ProbingDirectiveID != 1 {
+		t.Errorf("expected the valid insert to survive, got %+v", toInsert)
+	}
+	if len(toRemove) != 1 || toRemove[0] != 2 {
+		t.Errorf("expected the valid remove to survive, got %v", toRemove)
+	}
+}
+
+func TestReadPDDiff_SkipsBlankLines(t *testing.T) {
+	t.Parallel()
+	path := writeDiffFile(t, [][]byte{
+		[]byte(""),
+		diffRemoveLine(1),
+		[]byte(""),
+	})
+	toInsert, toRemove, skipped, err := readPDDiff(path, testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("blank lines should not count as malformed, got %d skipped", skipped)
+	}
+	if len(toInsert) != 0 || len(toRemove) != 1 {
+		t.Errorf("expected only the single remove op, got toInsert=%v toRemove=%v", toInsert, toRemove)
+	}
+}
+
+func TestReadPDDiff_FileNotFound(t *testing.T) {
+	t.Parallel()
+	if _, _, _, err := readPDDiff("/nonexistent/diff.jsonl", testLogger()); err == nil {
+		t.Fatal("expected error for missing file, got nil")
+	}
+}
+
+func TestReadPDDiff_ScannerError(t *testing.T) {
+	t.Parallel()
+	f, err := os.CreateTemp(t.TempDir(), "pds-diff-*.jsonl")
+	if err != nil {
+		t.Fatalf("cannot create temp file: %v", err)
+	}
+	// Same oversized-line technique as TestReadPDs_ScannerError: a line
+	// longer than the scanner's configured 4MiB max triggers scanner.Err().
+	if _, err := f.Write(make([]byte, 4*1024*1024+1)); err != nil {
+		t.Fatalf("cannot write to temp file: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("cannot close temp file: %v", err)
+	}
+	if _, _, _, err := readPDDiff(f.Name(), testLogger()); err == nil {
+		t.Fatal("expected scanner error for oversized line, got nil")
+	}
+}
+
 // -- ipKey --------------------------------------------------------------------
 
 func TestIpKey_Nil(t *testing.T) {
@@ -675,6 +912,464 @@ func TestReplacePD_PoolExhausted(t *testing.T) {
 	pd := s.NextPD(context.Background())
 	if pd != nil {
 		t.Errorf("expected nil from NextPD when pool exhausted, got pd %d", pd.ProbingDirectiveID)
+	}
+}
+
+// TestReplacePD_PoolExhaustedRemovesDeadSlot checks the randomizer stops
+// yielding a PD removed from pdMap, which would waste an issuance slot per draw.
+func TestReplacePD_PoolExhaustedRemovesDeadSlot(t *testing.T) {
+	t.Parallel()
+	// Active: pd1, pd2 (agent-a). No unused pool, so replacing either
+	// one exhausts it.
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		2, 3, 3)
+
+	for range s.config.ConsecutiveMissesThreshold {
+		_ = s.UpdateFromFIE(makeFIETimeout(1))
+	}
+	if _, ok := s.pdMap[1]; ok {
+		t.Fatal("expected pd1 to be out of the active set")
+	}
+	if got := s.randomizer.Len(); got != 1 {
+		t.Fatalf("expected the randomizer to hold only pd2, got Len() = %d", got)
+	}
+
+	s.issuancePeriod = 0
+	for i := range 20 {
+		pd := s.NextPD(context.Background())
+		if pd == nil || pd.ProbingDirectiveID != 2 {
+			t.Fatalf("draw %d: expected pd2, got %v", i, pd)
+		}
+	}
+}
+
+// -- ApplyDiff --------------------------------------------------------------
+
+func TestApplyDiff_InsertAddsToUnusedPool(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	newPD := makeModelPD(t, 2, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.9")
+
+	s.ApplyDiff([]*model.ProbingDirective{newPD}, nil)
+
+	found := false
+	for _, u := range s.unusedByAgent["agent-b"][0] {
+		if u.directive.ProbingDirectiveID == 2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected new PD to be inserted into agent-b's unused pool")
+	}
+}
+
+func TestApplyDiff_RemovesFromUnusedPoolImmediately(t *testing.T) {
+	t.Parallel()
+	// Active set: pd1. Unused pool: pd2, both agent-a.
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		1, 3, 3)
+	if len(s.unusedByAgent["agent-a"][0]) != 1 {
+		t.Fatalf("expected pd2 in unused pool before diff, got %d entries", len(s.unusedByAgent["agent-a"][0]))
+	}
+
+	s.ApplyDiff(nil, []uint64{2})
+
+	if len(s.unusedByAgent["agent-a"][0]) != 0 {
+		t.Errorf("expected pd2 removed from unused pool, got %d entries", len(s.unusedByAgent["agent-a"][0]))
+	}
+}
+
+// TestApplyDiff_TombstonedActivePDIsPermanentlyEvicted is the core removal
+// test: ApplyDiff tombstones an active PD, and recycleOrEvict then evicts it
+// instead of recycling. MaxEvictions is generous so the cap can't explain it.
+func TestApplyDiff_TombstonedActivePDIsPermanentlyEvicted(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		1, 3, 3)
+
+	s.ApplyDiff(nil, []uint64{1})
+
+	pd1, ok := s.pdMap[1]
+	if !ok {
+		t.Fatal("expected pd1 to still be active immediately after ApplyDiff — can't yank mid-flight")
+	}
+	if !pd1.markedForRemoval {
+		t.Error("expected pd1 to be marked for removal")
+	}
+	if pd1.issuanceProb != 0 {
+		t.Errorf("expected issuanceProb forced to 0, got %v", pd1.issuanceProb)
+	}
+
+	// Simulate pd1's next natural replacement cycle.
+	s.mutex.Lock()
+	s.replacePD(pd1)
+	s.mutex.Unlock()
+
+	if _, ok := s.pdMap[1]; ok {
+		t.Error("expected pd1 to be gone from the active set after replacement")
+	}
+	for _, u := range s.unusedByAgent["agent-a"][0] {
+		if u.directive.ProbingDirectiveID == 1 {
+			t.Error("expected pd1 to be permanently evicted, not recycled back into the unused pool")
+		}
+	}
+}
+
+func TestApplyDiff_SkipsDuplicateOfActivePD(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	original := s.pdMap[1].directive
+
+	dup := makeModelPD(t, 1, "agent-other", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.55")
+	s.ApplyDiff([]*model.ProbingDirective{dup}, nil)
+
+	if s.pdMap[1].directive != original {
+		t.Error("expected active pd1 to be untouched by a duplicate insert")
+	}
+	if len(s.unusedByAgent["agent-other"][0]) != 0 {
+		t.Error("expected duplicate insert to be skipped, not added to unused pool")
+	}
+}
+
+func TestApplyDiff_SkipsDuplicateOfUnusedPD(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		1, 3, 3)
+
+	dup := makeModelPD(t, 2, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.2")
+	s.ApplyDiff([]*model.ProbingDirective{dup}, nil)
+
+	if len(s.unusedByAgent["agent-a"][0]) != 1 {
+		t.Errorf("expected unused pool to still have exactly 1 entry, got %d", len(s.unusedByAgent["agent-a"][0]))
+	}
+}
+
+func TestApplyDiff_SkipsIntraBatchDuplicate(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+
+	pdA := makeModelPD(t, 2, "agent-x", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.5")
+	pdB := makeModelPD(t, 2, "agent-x", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.6")
+	s.ApplyDiff([]*model.ProbingDirective{pdA, pdB}, nil)
+
+	if len(s.unusedByAgent["agent-x"][0]) != 1 {
+		t.Errorf("expected exactly 1 entry from a same-batch duplicate insert, got %d", len(s.unusedByAgent["agent-x"][0]))
+	}
+}
+
+func TestApplyDiff_SkipsEmptyAgentID(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+
+	invalid := makeModelPD(t, 2, "", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.7")
+	s.ApplyDiff([]*model.ProbingDirective{invalid}, nil)
+
+	if pools, ok := s.unusedByAgent[""]; ok && (len(pools[0]) != 0 || len(pools[1]) != 0) {
+		t.Error("expected PD with empty AgentID to be skipped, not inserted")
+	}
+}
+
+func TestApplyDiff_NoOpWhenBothEmpty(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	before := len(s.pdMap)
+
+	s.ApplyDiff(nil, nil)
+
+	if len(s.pdMap) != before {
+		t.Errorf("expected ApplyDiff with no inserts/removes to be a no-op, active set size changed from %d to %d", before, len(s.pdMap))
+	}
+}
+
+// TestUpdateFromFIE_DoesNotResurrectTombstonedPD checks an FIE for a
+// tombstoned PD doesn't raise issuanceProb above 0 (the path the replacePD-
+// based tombstone test never exercises).
+func TestUpdateFromFIE_DoesNotResurrectTombstonedPD(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+
+	s.ApplyDiff(nil, []uint64{1})
+	if err := s.UpdateFromFIE(makeFIEFull(1, net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.2"))); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	pd, ok := s.pdMap[1]
+	if !ok {
+		t.Fatal("expected pd1 to still be active")
+	}
+	if !pd.markedForRemoval {
+		t.Error("expected pd1 to remain marked for removal")
+	}
+	if pd.issuanceProb != 0 {
+		t.Errorf("expected issuanceProb to stay 0 after an FIE, got %v", pd.issuanceProb)
+	}
+}
+
+// TestApplyDiff_PDsTotalTracksDiff checks PDsTotal follows the diff: inserts
+// add, unused removals subtract at once, a tombstoned PD only once evicted.
+func TestApplyDiff_PDsTotalTracksDiff(t *testing.T) {
+	t.Parallel()
+	// Active: pd1. Unused: pd2. Both agent-a. PDsTotal starts at 2.
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		1, 3, 3)
+	if got := testutil.ToFloat64(s.metrics.PDsTotal); got != 2 {
+		t.Fatalf("expected PDsTotal 2 at startup, got %v", got)
+	}
+
+	// +2 inserts, -1 unused removal (pd2).
+	s.ApplyDiff([]*model.ProbingDirective{
+		makeModelPD(t, 3, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.3"),
+		makeModelPD(t, 4, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.4"),
+	}, []uint64{2})
+	if got := testutil.ToFloat64(s.metrics.PDsTotal); got != 3 {
+		t.Errorf("expected PDsTotal 3 after +2/-1, got %v", got)
+	}
+
+	// Tombstoning active pd1 doesn't change the total yet...
+	s.ApplyDiff(nil, []uint64{1})
+	if got := testutil.ToFloat64(s.metrics.PDsTotal); got != 3 {
+		t.Errorf("expected PDsTotal unchanged (3) while pd1 is only tombstoned, got %v", got)
+	}
+
+	// ...only its eviction does.
+	s.mutex.Lock()
+	s.replacePD(s.pdMap[1])
+	s.mutex.Unlock()
+	if got := testutil.ToFloat64(s.metrics.PDsTotal); got != 2 {
+		t.Errorf("expected PDsTotal 2 after pd1's eviction, got %v", got)
+	}
+}
+
+// -- watchPDDiffReload ----------------------------------------------------------
+
+func TestWatchPDDiffReload_NoDiffPathBlocksUntilCtxDone(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- watchPDDiffReload(ctx, nil, "", testLogger())
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("expected nil error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watchPDDiffReload did not return after ctx cancellation")
+	}
+}
+
+func TestWatchPDDiffReload_CtxDoneBeforeSignal(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	path := writeDiffFile(t, [][]byte{diffRemoveLine(99)}) // ID not present; harmless if ever read
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- watchPDDiffReload(ctx, s, path, testLogger())
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("expected nil error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watchPDDiffReload did not return after ctx cancellation")
+	}
+}
+
+// armSIGHUPHandling makes the runtime catch SIGHUP before a test sends one,
+// so a signal racing a goroutine's signal.Notify can't hit the default
+// (terminating) action.
+func armSIGHUPHandling(t *testing.T) {
+	t.Helper()
+	dummy := make(chan os.Signal, 1)
+	signal.Notify(dummy, syscall.SIGHUP)
+	t.Cleanup(func() { signal.Stop(dummy) })
+}
+
+// TestWatchPDDiffReload_AppliesDiffOnSignal sends a real SIGHUP. Not
+// parallel: signals are process-wide.
+func TestWatchPDDiffReload_AppliesDiffOnSignal(t *testing.T) {
+	armSIGHUPHandling(t)
+
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	path := writeDiffFile(t, [][]byte{
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 2, AgentId: "agent-z", DestinationAddress: "192.0.2.20"}),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchPDDiffReload(ctx, s, path, testLogger())
+	}()
+
+	// Loose timing is safe: armSIGHUPHandling already stops the signal terminating the process.
+	time.Sleep(20 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("cannot send SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mutex.Lock()
+		found := false
+		for _, u := range s.unusedByAgent["agent-z"][0] {
+			if u.directive.ProbingDirectiveID == 2 {
+				found = true
+			}
+		}
+		s.mutex.Unlock()
+		if found {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("expected PD diff to be applied after SIGHUP")
+}
+
+// TestWatchPDDiffReload_LogsAndContinuesOnReadError checks an unreadable diff
+// file is logged rather than stopping the watcher.
+func TestWatchPDDiffReload_LogsAndContinuesOnReadError(t *testing.T) {
+	armSIGHUPHandling(t)
+
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	badPath := "/nonexistent/diff.jsonl"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchPDDiffReload(ctx, s, badPath, testLogger())
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("cannot send SIGHUP: %v", err)
+	}
+	// Give the (expected-to-fail) read a moment to complete.
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("expected watchPDDiffReload to still exit cleanly on ctx cancellation after a read error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watchPDDiffReload did not return after ctx cancellation — loop may have exited on the earlier read error instead of continuing")
+	}
+}
+
+func TestWatchPDDiffReload_WarnsOnMalformedLines(t *testing.T) {
+	armSIGHUPHandling(t)
+
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	path := writeDiffFile(t, [][]byte{
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 2, AgentId: "agent-z", DestinationAddress: "192.0.2.20"}),
+		[]byte(`not valid json`),
+	})
+	buf := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = watchPDDiffReload(ctx, s, path, logger) }()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("cannot send SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mutex.Lock()
+		applied := len(s.unusedByAgent["agent-z"][0]) == 1
+		s.mutex.Unlock()
+		if applied {
+			if !strings.Contains(buf.String(), "skipped_malformed=1") {
+				t.Errorf("expected a skipped_malformed=1 warning, got logs: %q", buf.String())
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("expected the valid insert to be applied despite the malformed line")
+}
+
+// TestWatchPDDiffReload_NoDiffPathIgnoresSIGHUP guards against SIGHUP
+// terminating the process when hot-reload is disabled. armSIGHUPHandling
+// would mask that, so this asserts on the watcher's own "ignoring" log.
+func TestWatchPDDiffReload_NoDiffPathIgnoresSIGHUP(t *testing.T) {
+	armSIGHUPHandling(t)
+
+	buf := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchPDDiffReload(ctx, nil, "", logger)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("cannot send SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "ignoring") {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected the watcher to log that it ignored SIGHUP, got logs: %q", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("watcher exited on SIGHUP (err=%v); it should keep running", err)
+	default:
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("expected nil on ctx cancellation, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not return after ctx cancellation")
 	}
 }
 

@@ -47,6 +47,7 @@ func run() error {
 		ringBufferSize             = flag.Int("ring-buffer-size", envOrDefaultInt("RETINA_RING_BUFFER_SIZE", 100), "The size of the ring buffer")
 		pdPathV4                   = flag.String("pd-path-v4", envOrDefault("RETINA_PD_PATH_V4", ""), "Path to the IPv4 probing directives file")
 		pdPathV6                   = flag.String("pd-path-v6", envOrDefault("RETINA_PD_PATH_V6", ""), "Path to the IPv6 probing directives file")
+		pdDiffPath                 = flag.String("pd-diff-path", envOrDefault("RETINA_PD_DIFF_PATH", ""), "Path to the PD diff file (insert/remove ops), reloaded on SIGHUP")
 		issuanceRate               = flag.Float64("issuance-rate", envOrDefaultFloat64("RETINA_ISSUANCE_RATE", 1.0), "Target global issuance rate of probing directives (PDs per second, approximate)")
 		impactThreshold            = flag.Float64("impact-threshold", envOrDefaultFloat64("RETINA_IMPACT_THRESHOLD", 1.0), "Maximum impact threshold per address for the responsible probing algorithm")
 		seed                       = flag.Uint64("seed", envOrDefaultUInt64("RETINA_SEED", 42), "Seed for the randomizer")
@@ -73,6 +74,9 @@ func run() error {
 
 	secret := os.Getenv("RETINA_SECRET")
 
+	// SIGHUP is intentionally not included here: it is handled separately by
+	// orch's reload watcher (see below) rather than treated as a shutdown
+	// signal. SIGINT/SIGTERM remain the only signals that tear the process down.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -85,6 +89,7 @@ func run() error {
 		APIReadHeaderTimeout:       *apiReadHeaderTimeout,
 		PDPathV4:                   *pdPathV4,
 		PDPathV6:                   *pdPathV6,
+		PDDiffPath:                 *pdDiffPath,
 		IssuanceRate:               *issuanceRate,
 		Seed:                       *seed,
 		ImpactThreshold:            *impactThreshold,
@@ -103,6 +108,7 @@ func run() error {
 		"agent_addr", *agentAddr,
 		"pd_path_v4", *pdPathV4,
 		"pd_path_v6", *pdPathV6,
+		"pd_diff_path", *pdDiffPath,
 		"issuance_rate", *issuanceRate,
 		"impact_threshold", *impactThreshold,
 		"active_set_size", *activeSetSize,
@@ -112,6 +118,9 @@ func run() error {
 		"metrics_addr", *metricsAddr,
 	)
 
+	// Reload watcher runs inside orch.Run alongside the API/agent/scheduler
+	// subsystems, sharing the same shutdown context — no separate goroutine
+	// needed here. If pdDiffPath is empty, hot-reload via SIGHUP is disabled.
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {
 		return err
 	}
