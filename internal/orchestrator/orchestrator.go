@@ -48,6 +48,9 @@ type Config struct {
 	PDPathV4     string
 	PDPathV6     string
 	IssuanceRate float64
+	// PDDiffPath is a PD diff file re-read on SIGHUP. Optional; hot-reload
+	// is disabled if empty.
+	PDDiffPath string
 	// ImpactThreshold is the maximum allowed probe rate (probes/second) on any
 	// single address in the responsible probing algorithm.
 	ImpactThreshold            float64
@@ -211,6 +214,9 @@ func (o *orch) Run(parentCtx context.Context) error {
 	group.Go(func() error {
 		return o.runScheduler(ctx)
 	})
+	group.Go(func() error {
+		return o.runPDDiffReload(ctx)
+	})
 
 	return group.Wait()
 }
@@ -233,6 +239,14 @@ func (o *orch) runScheduler(ctx context.Context) error {
 			o.metrics.AgentQueueSize.WithLabelValues(pd.AgentID).Inc()
 		}
 	}
+}
+
+// runPDDiffReload listens for SIGHUP and applies PD diff files to the
+// running scheduler without restarting the orchestrator. If
+// config.PDDiffPath is empty, SIGHUP is still caught but ignored with a
+// warning. See watchPDDiffReload in scheduler.go for the mechanism.
+func (o *orch) runPDDiffReload(ctx context.Context) error {
+	return watchPDDiffReload(ctx, o.scheduler, o.config.PDDiffPath, o.logger.With("component", "pd_diff_reload"))
 }
 
 func (o *orch) runAPIServer(parentCtx context.Context) error {
