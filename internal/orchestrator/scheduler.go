@@ -28,11 +28,15 @@ import (
 // All fields are validated by Config.Validate() in orchestrator.go before
 // NewScheduler is called.
 type SchedulerConfig struct {
-	Seed                       uint64
-	IssuanceRate               float64
-	ImpactThreshold            float64
-	PDPathV4                   string
-	PDPathV6                   string
+	Seed            uint64
+	IssuanceRate    float64
+	ImpactThreshold float64
+	PDPathV4        string
+	PDPathV6        string
+	// PDDiffPath is the path to a PD diff file (insert/remove ops, one per
+	// line) applied via ApplyDiff on reload. Not read by NewScheduler
+	// itself — only used by the orchestrator's SIGHUP reload watcher.
+	PDDiffPath                 string
 	ActiveSetSize              int
 	ConsecutiveMissesThreshold int
 	MaxEvictions               int
