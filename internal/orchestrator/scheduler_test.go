@@ -3,18 +3,23 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/dioptra-io/retina-commons/model"
 	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
@@ -147,10 +152,7 @@ func newTestSchedulerWithConfig(t *testing.T, v4pds []*wire.ProbingDirective, ac
 	return s
 }
 
-// diffInsertLine returns a diff-file line for an insert op: the same
-// protojson encoding readPDs/readPDDiff expect, with an added "op":"insert"
-// field — matching the real diff file format (see readPDDiff, which relies
-// on DiscardUnknown to tolerate this extra, non-proto field).
+// diffInsertLine returns an insert-op line: a protojson PD plus "op":"insert".
 func diffInsertLine(t *testing.T, pd *wire.ProbingDirective) []byte {
 	t.Helper()
 	b, err := protojson.Marshal(pd)
@@ -169,9 +171,6 @@ func diffInsertLine(t *testing.T, pd *wire.ProbingDirective) []byte {
 	return out
 }
 
-// diffRemoveLine returns a diff-file line for a remove op: just "op" and
-// "probing_directive_id", matching the real diff file format — remove
-// lines carry no other directive fields.
 func diffRemoveLine(id uint64) []byte {
 	return []byte(fmt.Sprintf(`{"op":"remove","probing_directive_id":%d}`, id))
 }
@@ -193,9 +192,7 @@ func writeDiffFile(t *testing.T, lines [][]byte) string {
 	return f.Name()
 }
 
-// makeModelPD builds a *model.ProbingDirective the same way readPDDiff
-// would (via FromProto), for tests that call Scheduler.ApplyDiff directly
-// rather than going through a diff file.
+// makeModelPD builds a *model.ProbingDirective as readPDDiff would.
 //
 //nolint:unparam // ipVersion is always IPv4 in current tests but is a meaningful parameter
 func makeModelPD(t *testing.T, id uint64, agentID string, ipVersion wire.IPVersion, addr string) *model.ProbingDirective {
@@ -210,6 +207,24 @@ func makeModelPD(t *testing.T, id uint64, agentID string, ipVersion wire.IPVersi
 		t.Fatalf("cannot build test directive: %v", err)
 	}
 	return &pd
+}
+
+// syncBuffer is a goroutine-safe log sink.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // -- NewScheduler -------------------------------------------------------------
@@ -494,9 +509,12 @@ func TestReadPDDiff_InsertAndRemove(t *testing.T) {
 		diffRemoveLine(2),
 	})
 
-	toInsert, toRemove, err := readPDDiff(path)
+	toInsert, toRemove, skipped, err := readPDDiff(path, testLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("expected no skipped lines, got %d", skipped)
 	}
 	if len(toInsert) != 1 || toInsert[0].ProbingDirectiveID != 1 {
 		t.Errorf("expected one inserted PD with ID 1, got %+v", toInsert)
@@ -506,71 +524,87 @@ func TestReadPDDiff_InsertAndRemove(t *testing.T) {
 	}
 }
 
-// TestReadPDDiff_DiscardsOpField covers the reason DiscardUnknown is set on
-// the insert-line unmarshal options: "op" is not part of the
-// ProbingDirective proto, and without DiscardUnknown, protojson.Unmarshal
-// would reject it as an unknown field. TestReadPDDiff_InsertAndRemove
-// already exercises this path implicitly (an insert line always carries
-// "op"), but this test makes the behavior explicit and would fail loudly
-// if DiscardUnknown were ever removed.
+// TestReadPDDiff_DiscardsOpField makes explicit that DiscardUnknown tolerates
+// the non-proto "op" field.
 func TestReadPDDiff_DiscardsOpField(t *testing.T) {
 	t.Parallel()
 	path := writeDiffFile(t, [][]byte{
 		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 1, DestinationAddress: "192.0.2.1"}),
 	})
-	if _, _, err := readPDDiff(path); err != nil {
-		t.Fatalf("expected \"op\" field to be discarded via DiscardUnknown, got error: %v", err)
+	toInsert, _, skipped, err := readPDDiff(path, testLogger())
+	if err != nil || skipped != 0 || len(toInsert) != 1 {
+		t.Fatalf("expected \"op\" to be discarded via DiscardUnknown, got inserts=%d skipped=%d err=%v",
+			len(toInsert), skipped, err)
+	}
+}
+
+// assertOneLineSkipped checks readPDDiff skips the single malformed line in
+// path without failing the file or applying anything from it.
+func assertOneLineSkipped(t *testing.T, path string) {
+	t.Helper()
+	toInsert, toRemove, skipped, err := readPDDiff(path, testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if skipped != 1 {
+		t.Errorf("expected 1 skipped line, got %d", skipped)
+	}
+	if len(toInsert) != 0 || len(toRemove) != 0 {
+		t.Errorf("expected nothing applied, got inserts=%v removes=%v", toInsert, toRemove)
 	}
 }
 
 func TestReadPDDiff_UnknownOp(t *testing.T) {
 	t.Parallel()
-	path := writeDiffFile(t, [][]byte{[]byte(`{"op":"replace","probing_directive_id":1}`)})
-	if _, _, err := readPDDiff(path); err == nil {
-		t.Fatal("expected error for unknown op, got nil")
-	}
+	assertOneLineSkipped(t, writeDiffFile(t, [][]byte{[]byte(`{"op":"replace","probing_directive_id":1}`)}))
 }
 
 func TestReadPDDiff_InvalidOpJSON(t *testing.T) {
 	t.Parallel()
-	path := writeDiffFile(t, [][]byte{[]byte(`not valid json`)})
-	if _, _, err := readPDDiff(path); err == nil {
-		t.Fatal("expected error for invalid JSON, got nil")
-	}
+	assertOneLineSkipped(t, writeDiffFile(t, [][]byte{[]byte(`not valid json`)}))
 }
 
-// TestReadPDDiff_InvalidInsertDirective covers an insert line that's
-// syntactically valid JSON but semantically rejected by
-// model.ProbingDirectiveFromProto (missing destination_address) —
-// distinct from TestReadPDDiff_InvalidOpJSON, which fails earlier, before
-// the op is even identified.
+// TestReadPDDiff_InvalidInsertDirective covers an insert that protojson
+// accepts but model.ProbingDirectiveFromProto rejects (no destination_address).
 func TestReadPDDiff_InvalidInsertDirective(t *testing.T) {
 	t.Parallel()
-	path := writeDiffFile(t, [][]byte{
+	assertOneLineSkipped(t, writeDiffFile(t, [][]byte{
 		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 1}), // no destination_address
-	})
-	if _, _, err := readPDDiff(path); err == nil {
-		t.Fatal("expected error for insert PD missing destination_address, got nil")
-	}
+	}))
 }
 
-// TestReadPDDiff_InvalidInsertProtojson covers an insert line where
-// protojson.Unmarshal itself fails — a type mismatch (a JSON number where
-// agent_id expects a string) — distinct from
-// TestReadPDDiff_InvalidInsertDirective, where protojson succeeds and the
-// later ProbingDirectiveFromProto call is what rejects the directive.
-// diffOpPeek's plain json.Unmarshal doesn't care about field types, so the
-// op is identified fine before this fails. Note DiscardUnknown (needed to
-// tolerate the "op" field) also silently zero-values unrecognized enum
-// strings rather than erroring on them, so an invalid ip_version value
-// does NOT reach this branch — a scalar type mismatch is required instead.
+// TestReadPDDiff_InvalidInsertProtojson covers protojson itself failing, via a
+// type mismatch. DiscardUnknown also zero-values unknown enum strings, so a
+// bad ip_version would not fail here.
 func TestReadPDDiff_InvalidInsertProtojson(t *testing.T) {
 	t.Parallel()
-	path := writeDiffFile(t, [][]byte{
+	assertOneLineSkipped(t, writeDiffFile(t, [][]byte{
 		[]byte(`{"op":"insert","probing_directive_id":1,"destination_address":"192.0.2.1","agent_id":123}`),
+	}))
+}
+
+// TestReadPDDiff_SkipsMalformedLineKeepsTheRest checks a bad line costs only
+// itself, not the rest of the file.
+func TestReadPDDiff_SkipsMalformedLineKeepsTheRest(t *testing.T) {
+	t.Parallel()
+	path := writeDiffFile(t, [][]byte{
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 1, DestinationAddress: "192.0.2.1"}),
+		[]byte(`not valid json`),
+		diffRemoveLine(2),
 	})
-	if _, _, err := readPDDiff(path); err == nil {
-		t.Fatal("expected protojson unmarshal error for a type-mismatched field, got nil")
+
+	toInsert, toRemove, skipped, err := readPDDiff(path, testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if skipped != 1 {
+		t.Errorf("expected 1 skipped line, got %d", skipped)
+	}
+	if len(toInsert) != 1 || toInsert[0].ProbingDirectiveID != 1 {
+		t.Errorf("expected the valid insert to survive, got %+v", toInsert)
+	}
+	if len(toRemove) != 1 || toRemove[0] != 2 {
+		t.Errorf("expected the valid remove to survive, got %v", toRemove)
 	}
 }
 
@@ -581,9 +615,12 @@ func TestReadPDDiff_SkipsBlankLines(t *testing.T) {
 		diffRemoveLine(1),
 		[]byte(""),
 	})
-	toInsert, toRemove, err := readPDDiff(path)
+	toInsert, toRemove, skipped, err := readPDDiff(path, testLogger())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if skipped != 0 {
+		t.Errorf("blank lines should not count as malformed, got %d skipped", skipped)
 	}
 	if len(toInsert) != 0 || len(toRemove) != 1 {
 		t.Errorf("expected only the single remove op, got toInsert=%v toRemove=%v", toInsert, toRemove)
@@ -592,7 +629,7 @@ func TestReadPDDiff_SkipsBlankLines(t *testing.T) {
 
 func TestReadPDDiff_FileNotFound(t *testing.T) {
 	t.Parallel()
-	if _, _, err := readPDDiff("/nonexistent/diff.jsonl"); err == nil {
+	if _, _, _, err := readPDDiff("/nonexistent/diff.jsonl", testLogger()); err == nil {
 		t.Fatal("expected error for missing file, got nil")
 	}
 }
@@ -611,7 +648,7 @@ func TestReadPDDiff_ScannerError(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatalf("cannot close temp file: %v", err)
 	}
-	if _, _, err := readPDDiff(f.Name()); err == nil {
+	if _, _, _, err := readPDDiff(f.Name(), testLogger()); err == nil {
 		t.Fatal("expected scanner error for oversized line, got nil")
 	}
 }
@@ -878,6 +915,38 @@ func TestReplacePD_PoolExhausted(t *testing.T) {
 	}
 }
 
+// TestReplacePD_PoolExhaustedRemovesDeadSlot checks the randomizer stops
+// yielding a PD removed from pdMap, which would waste an issuance slot per draw.
+func TestReplacePD_PoolExhaustedRemovesDeadSlot(t *testing.T) {
+	t.Parallel()
+	// Active: pd1, pd2 (agent-a). No unused pool, so replacing either
+	// one exhausts it.
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		2, 3, 3)
+
+	for range s.config.ConsecutiveMissesThreshold {
+		_ = s.UpdateFromFIE(makeFIETimeout(1))
+	}
+	if _, ok := s.pdMap[1]; ok {
+		t.Fatal("expected pd1 to be out of the active set")
+	}
+	if got := s.randomizer.Len(); got != 1 {
+		t.Fatalf("expected the randomizer to hold only pd2, got Len() = %d", got)
+	}
+
+	s.issuancePeriod = 0
+	for i := range 20 {
+		pd := s.NextPD(context.Background())
+		if pd == nil || pd.ProbingDirectiveID != 2 {
+			t.Fatalf("draw %d: expected pd2, got %v", i, pd)
+		}
+	}
+}
+
 // -- ApplyDiff --------------------------------------------------------------
 
 func TestApplyDiff_InsertAddsToUnusedPool(t *testing.T) {
@@ -918,13 +987,9 @@ func TestApplyDiff_RemovesFromUnusedPoolImmediately(t *testing.T) {
 	}
 }
 
-// TestApplyDiff_TombstonedActivePDIsPermanentlyEvicted is the core
-// behavioral test for hot-reload removal: an active PD can't be yanked
-// mid-cycle, so ApplyDiff must tombstone it (not touch pdMap directly),
-// and recycleOrEvict must then evict it for good on its next natural
-// replacement rather than recycling it. MaxEvictions is generous (3) so a
-// pass here can't be explained by coincidentally hitting the eviction cap
-// instead of the markedForRemoval guard.
+// TestApplyDiff_TombstonedActivePDIsPermanentlyEvicted is the core removal
+// test: ApplyDiff tombstones an active PD, and recycleOrEvict then evicts it
+// instead of recycling. MaxEvictions is generous so the cap can't explain it.
 func TestApplyDiff_TombstonedActivePDIsPermanentlyEvicted(t *testing.T) {
 	t.Parallel()
 	s := newTestSchedulerWithConfig(t,
@@ -1032,6 +1097,69 @@ func TestApplyDiff_NoOpWhenBothEmpty(t *testing.T) {
 	}
 }
 
+// TestUpdateFromFIE_DoesNotResurrectTombstonedPD checks an FIE for a
+// tombstoned PD doesn't raise issuanceProb above 0 (the path the replacePD-
+// based tombstone test never exercises).
+func TestUpdateFromFIE_DoesNotResurrectTombstonedPD(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+
+	s.ApplyDiff(nil, []uint64{1})
+	if err := s.UpdateFromFIE(makeFIEFull(1, net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.2"))); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	pd, ok := s.pdMap[1]
+	if !ok {
+		t.Fatal("expected pd1 to still be active")
+	}
+	if !pd.markedForRemoval {
+		t.Error("expected pd1 to remain marked for removal")
+	}
+	if pd.issuanceProb != 0 {
+		t.Errorf("expected issuanceProb to stay 0 after an FIE, got %v", pd.issuanceProb)
+	}
+}
+
+// TestApplyDiff_PDsTotalTracksDiff checks PDsTotal follows the diff: inserts
+// add, unused removals subtract at once, a tombstoned PD only once evicted.
+func TestApplyDiff_PDsTotalTracksDiff(t *testing.T) {
+	t.Parallel()
+	// Active: pd1. Unused: pd2. Both agent-a. PDsTotal starts at 2.
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		1, 3, 3)
+	if got := testutil.ToFloat64(s.metrics.PDsTotal); got != 2 {
+		t.Fatalf("expected PDsTotal 2 at startup, got %v", got)
+	}
+
+	// +2 inserts, -1 unused removal (pd2).
+	s.ApplyDiff([]*model.ProbingDirective{
+		makeModelPD(t, 3, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.3"),
+		makeModelPD(t, 4, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.4"),
+	}, []uint64{2})
+	if got := testutil.ToFloat64(s.metrics.PDsTotal); got != 3 {
+		t.Errorf("expected PDsTotal 3 after +2/-1, got %v", got)
+	}
+
+	// Tombstoning active pd1 doesn't change the total yet...
+	s.ApplyDiff(nil, []uint64{1})
+	if got := testutil.ToFloat64(s.metrics.PDsTotal); got != 3 {
+		t.Errorf("expected PDsTotal unchanged (3) while pd1 is only tombstoned, got %v", got)
+	}
+
+	// ...only its eviction does.
+	s.mutex.Lock()
+	s.replacePD(s.pdMap[1])
+	s.mutex.Unlock()
+	if got := testutil.ToFloat64(s.metrics.PDsTotal); got != 2 {
+		t.Errorf("expected PDsTotal 2 after pd1's eviction, got %v", got)
+	}
+}
+
 // -- watchPDDiffReload ----------------------------------------------------------
 
 func TestWatchPDDiffReload_NoDiffPathBlocksUntilCtxDone(t *testing.T) {
@@ -1079,14 +1207,9 @@ func TestWatchPDDiffReload_CtxDoneBeforeSignal(t *testing.T) {
 	}
 }
 
-// armSIGHUPHandling guarantees the Go runtime has already taken over
-// SIGHUP handling before a test sends one via syscall.Kill. Without this,
-// a signal sent before any signal.Notify call has executed anywhere in
-// the process would fall through to the OS default action for SIGHUP —
-// terminating the process — instead of being caught by
-// watchPDDiffReload's own handler. signal.Notify installs its handler
-// synchronously, so by the time this returns, that race is closed
-// regardless of how the watch goroutine itself gets scheduled.
+// armSIGHUPHandling makes the runtime catch SIGHUP before a test sends one,
+// so a signal racing a goroutine's signal.Notify can't hit the default
+// (terminating) action.
 func armSIGHUPHandling(t *testing.T) {
 	t.Helper()
 	dummy := make(chan os.Signal, 1)
@@ -1094,10 +1217,8 @@ func armSIGHUPHandling(t *testing.T) {
 	t.Cleanup(func() { signal.Stop(dummy) })
 }
 
-// TestWatchPDDiffReload_AppliesDiffOnSignal exercises the real SIGHUP
-// path end-to-end. Not run in parallel: real OS signal delivery is a
-// process-wide resource, and this test's assertions depend on observing
-// the effect of a signal only it sent.
+// TestWatchPDDiffReload_AppliesDiffOnSignal sends a real SIGHUP. Not
+// parallel: signals are process-wide.
 func TestWatchPDDiffReload_AppliesDiffOnSignal(t *testing.T) {
 	armSIGHUPHandling(t)
 
@@ -1113,9 +1234,7 @@ func TestWatchPDDiffReload_AppliesDiffOnSignal(t *testing.T) {
 		done <- watchPDDiffReload(ctx, s, path, testLogger())
 	}()
 
-	// Give the goroutine a moment to reach signal.Notify. Loose timing is
-	// fine here — armSIGHUPHandling already guarantees the signal can't
-	// terminate the process even if this races.
+	// Loose timing is safe: armSIGHUPHandling already stops the signal terminating the process.
 	time.Sleep(20 * time.Millisecond)
 	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
 		t.Fatalf("cannot send SIGHUP: %v", err)
@@ -1139,15 +1258,13 @@ func TestWatchPDDiffReload_AppliesDiffOnSignal(t *testing.T) {
 	t.Fatal("expected PD diff to be applied after SIGHUP")
 }
 
-// TestWatchPDDiffReload_LogsAndContinuesOnReadError exercises the error
-// branch on an unreadable diff file: watchPDDiffReload must log and keep
-// waiting for the next signal rather than returning. A second, valid
-// signal afterward confirms the loop is still alive.
+// TestWatchPDDiffReload_LogsAndContinuesOnReadError checks an unreadable diff
+// file is logged rather than stopping the watcher.
 func TestWatchPDDiffReload_LogsAndContinuesOnReadError(t *testing.T) {
 	armSIGHUPHandling(t)
 
 	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
-	badPath := writeDiffFile(t, [][]byte{[]byte(`not valid json`)})
+	badPath := "/nonexistent/diff.jsonl"
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1171,6 +1288,88 @@ func TestWatchPDDiffReload_LogsAndContinuesOnReadError(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("watchPDDiffReload did not return after ctx cancellation — loop may have exited on the earlier read error instead of continuing")
+	}
+}
+
+func TestWatchPDDiffReload_WarnsOnMalformedLines(t *testing.T) {
+	armSIGHUPHandling(t)
+
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	path := writeDiffFile(t, [][]byte{
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 2, AgentId: "agent-z", DestinationAddress: "192.0.2.20"}),
+		[]byte(`not valid json`),
+	})
+	buf := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = watchPDDiffReload(ctx, s, path, logger) }()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("cannot send SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mutex.Lock()
+		applied := len(s.unusedByAgent["agent-z"][0]) == 1
+		s.mutex.Unlock()
+		if applied {
+			if !strings.Contains(buf.String(), "skipped_malformed=1") {
+				t.Errorf("expected a skipped_malformed=1 warning, got logs: %q", buf.String())
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("expected the valid insert to be applied despite the malformed line")
+}
+
+// TestWatchPDDiffReload_NoDiffPathIgnoresSIGHUP guards against SIGHUP
+// terminating the process when hot-reload is disabled. armSIGHUPHandling
+// would mask that, so this asserts on the watcher's own "ignoring" log.
+func TestWatchPDDiffReload_NoDiffPathIgnoresSIGHUP(t *testing.T) {
+	armSIGHUPHandling(t)
+
+	buf := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- watchPDDiffReload(ctx, nil, "", logger)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("cannot send SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(buf.String(), "ignoring") {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected the watcher to log that it ignored SIGHUP, got logs: %q", buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("watcher exited on SIGHUP (err=%v); it should keep running", err)
+	default:
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("expected nil on ctx cancellation, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not return after ctx cancellation")
 	}
 }
 

@@ -48,10 +48,8 @@ type Config struct {
 	PDPathV4     string
 	PDPathV6     string
 	IssuanceRate float64
-	// PDDiffPath is the path to a PD diff file (insert/remove ops). If set,
-	// the orchestrator reloads it on SIGHUP and applies the diff to the
-	// running scheduler without a restart. Optional — hot-reload is
-	// disabled if empty.
+	// PDDiffPath is a PD diff file re-read on SIGHUP. Optional; hot-reload
+	// is disabled if empty.
 	PDDiffPath string
 	// ImpactThreshold is the maximum allowed probe rate (probes/second) on any
 	// single address in the responsible probing algorithm.
@@ -111,8 +109,6 @@ func (c *Config) validateSchedulerConfig() error {
 	if c.MaxEvictions <= 0 {
 		return fmt.Errorf("MaxEvictions must be greater than zero: got %d", c.MaxEvictions)
 	}
-	// PDDiffPath is intentionally unvalidated here: it's optional, and an
-	// empty value simply disables hot-reload (see watchPDDiffReload).
 	return nil
 }
 
@@ -161,7 +157,6 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		ImpactThreshold:            config.ImpactThreshold,
 		PDPathV4:                   config.PDPathV4,
 		PDPathV6:                   config.PDPathV6,
-		PDDiffPath:                 config.PDDiffPath,
 		ActiveSetSize:              config.ActiveSetSize,
 		ConsecutiveMissesThreshold: config.ConsecutiveMissesThreshold,
 		MaxEvictions:               config.MaxEvictions,
@@ -247,9 +242,9 @@ func (o *orch) runScheduler(ctx context.Context) error {
 }
 
 // runPDDiffReload listens for SIGHUP and applies PD diff files to the
-// running scheduler without restarting the orchestrator. A no-op (blocks
-// until ctx is done) if config.PDDiffPath is empty. See watchPDDiffReload
-// in reload.go for the mechanism.
+// running scheduler without restarting the orchestrator. If
+// config.PDDiffPath is empty, SIGHUP is still caught but ignored with a
+// warning. See watchPDDiffReload in scheduler.go for the mechanism.
 func (o *orch) runPDDiffReload(ctx context.Context) error {
 	return watchPDDiffReload(ctx, o.scheduler, o.config.PDDiffPath, o.logger.With("component", "pd_diff_reload"))
 }
