@@ -420,6 +420,100 @@ func TestNewScheduler_NilMetrics(t *testing.T) {
 	}
 }
 
+// -- loadPDsIntoPool ------------------------------------------------------
+
+func TestLoadPDsIntoPool_BalancesAcrossAgents(t *testing.T) {
+	t.Parallel()
+	var pds []*model.ProbingDirective
+	counts := map[string]int{"agent-a": 10, "agent-b": 2, "agent-c": 6}
+	id := uint64(1)
+	for agent, n := range counts {
+		for range n {
+			pds = append(pds, makeModelPD(t, id, agent, wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"))
+			id++
+		}
+	}
+
+	pdMap := make(map[uint64]*pdState)
+	var indices []uint64
+	unusedByAgent := make(map[string][2][]*unusedPD)
+	seen := make(map[uint64]struct{})
+
+	if err := loadPDsIntoPool(pds, 6, pdMap, &indices, unusedByAgent, seen, testLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	activeByAgent := make(map[string]int)
+	for _, ps := range pdMap {
+		activeByAgent[ps.directive.AgentID]++
+	}
+	for agent := range counts {
+		if activeByAgent[agent] != 2 {
+			t.Errorf("agent %s: expected 2 active PDs, got %d", agent, activeByAgent[agent])
+		}
+	}
+}
+
+func TestLoadPDsIntoPool_AgentBelowQuotaContributesAll(t *testing.T) {
+	t.Parallel()
+	pds := []*model.ProbingDirective{
+		makeModelPD(t, 1, "agent-small", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"),
+	}
+	for i := uint64(2); i <= 11; i++ {
+		pds = append(pds, makeModelPD(t, i, "agent-big", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"))
+	}
+
+	pdMap := make(map[uint64]*pdState)
+	var indices []uint64
+	unusedByAgent := make(map[string][2][]*unusedPD)
+	seen := make(map[uint64]struct{})
+
+	if err := loadPDsIntoPool(pds, 6, pdMap, &indices, unusedByAgent, seen, testLogger()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	activeByAgent := make(map[string]int)
+	for _, ps := range pdMap {
+		activeByAgent[ps.directive.AgentID]++
+	}
+	if activeByAgent["agent-small"] != 1 {
+		t.Errorf("expected agent-small's single PD to be active, got %d", activeByAgent["agent-small"])
+	}
+	if activeByAgent["agent-big"] != 3 {
+		t.Errorf("expected agent-big capped at quota 3, got %d", activeByAgent["agent-big"])
+	}
+	if len(pdMap) != 4 {
+		t.Errorf("expected active set of 4, smaller than maxActive=6, got %d", len(pdMap))
+	}
+}
+
+func TestLoadPDsIntoPool_QuotaZeroLogsWarning(t *testing.T) {
+	t.Parallel()
+	pds := []*model.ProbingDirective{
+		makeModelPD(t, 1, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"),
+		makeModelPD(t, 2, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"),
+		makeModelPD(t, 3, "agent-c", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"),
+	}
+
+	pdMap := make(map[uint64]*pdState)
+	var indices []uint64
+	unusedByAgent := make(map[string][2][]*unusedPD)
+	seen := make(map[uint64]struct{})
+	buf := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+
+	if err := loadPDsIntoPool(pds, 2, pdMap, &indices, unusedByAgent, seen, logger); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(pdMap) != 0 {
+		t.Errorf("expected no active PDs with quota=0, got %d", len(pdMap))
+	}
+	if !strings.Contains(buf.String(), "Active set too small") {
+		t.Errorf("expected a warning about quota=0, got logs: %q", buf.String())
+	}
+}
+
 // -- readPDs ------------------------------------------------------------------
 
 func TestReadPDs_InvalidJSON(t *testing.T) {
