@@ -117,11 +117,10 @@ type Scheduler struct {
 	random     *rand.Rand // used for the Bernoulli experiment in NextPD
 }
 
-// loadPDsIntoPool fills the active set and unused pool from a slice of PDs.
-// The first maxActive PDs go into pdMap and indices (active set); the rest go
-// into the per-agent unused pool. The slice should be shuffled before calling
-// to avoid IP range bias in the active set.
-// seen tracks all PD IDs across both V4 and V6 calls to detect duplicates.
+// loadPDsIntoPool fills the active set and unused pool, splitting active
+// slots evenly across agents (floor division, remainder dropped) rather than
+// a flat maxActive cutoff, which would let a larger agent pool dominate.
+// seen tracks PD IDs across both V4 and V6 calls to detect duplicates.
 func loadPDsIntoPool(
 	pds []*model.ProbingDirective,
 	maxActive int,
@@ -129,25 +128,47 @@ func loadPDsIntoPool(
 	indices *[]uint64,
 	unusedByAgent map[string][2][]*unusedPD,
 	seen map[uint64]struct{},
+	logger *slog.Logger,
 ) error {
-	for i, pd := range pds {
+	byAgent := make(map[string][]*model.ProbingDirective)
+	var agentOrder []string
+	for _, pd := range pds {
 		if _, exists := seen[pd.ProbingDirectiveID]; exists {
 			return fmt.Errorf("duplicate PD ID %d", pd.ProbingDirectiveID)
 		}
 		seen[pd.ProbingDirectiveID] = struct{}{}
-		if i < maxActive {
-			pdMap[pd.ProbingDirectiveID] = &pdState{
-				directive:    pd,
-				issuanceProb: 1.0,
+
+		if _, ok := byAgent[pd.AgentID]; !ok {
+			agentOrder = append(agentOrder, pd.AgentID)
+		}
+		byAgent[pd.AgentID] = append(byAgent[pd.AgentID], pd)
+	}
+	if len(agentOrder) == 0 {
+		return nil
+	}
+	quota := maxActive / len(agentOrder)
+	if quota == 0 {
+		logger.Warn("Active set too small for number of agents, no active PDs assigned",
+			slog.Int("max_active", maxActive),
+			slog.Int("num_agents", len(agentOrder)))
+	}
+
+	for _, agentID := range agentOrder {
+		for i, pd := range byAgent[agentID] {
+			if i < quota {
+				pdMap[pd.ProbingDirectiveID] = &pdState{
+					directive:    pd,
+					issuanceProb: 1.0,
+				}
+				*indices = append(*indices, pd.ProbingDirectiveID)
+			} else {
+				pools := unusedByAgent[pd.AgentID]
+				ipVersion := ipIdx(pd.IPVersion)
+				pools[ipVersion] = append(pools[ipVersion], &unusedPD{
+					directive: pd,
+				})
+				unusedByAgent[pd.AgentID] = pools
 			}
-			*indices = append(*indices, pd.ProbingDirectiveID)
-		} else {
-			pools := unusedByAgent[pd.AgentID]
-			ipVersion := ipIdx(pd.IPVersion)
-			pools[ipVersion] = append(pools[ipVersion], &unusedPD{
-				directive: pd,
-			})
-			unusedByAgent[pd.AgentID] = pools
 		}
 	}
 	return nil
@@ -226,10 +247,10 @@ func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics
 	}
 
 	seen := make(map[uint64]struct{}, len(v4pds)+len(v6pds))
-	if err := loadPDsIntoPool(v4pds, v4Active, pdMap, &indices, unusedByAgent, seen); err != nil {
+	if err := loadPDsIntoPool(v4pds, v4Active, pdMap, &indices, unusedByAgent, seen, logger); err != nil {
 		return nil, fmt.Errorf("IPv4 PD file: %w", err)
 	}
-	if err := loadPDsIntoPool(v6pds, v6Active, pdMap, &indices, unusedByAgent, seen); err != nil {
+	if err := loadPDsIntoPool(v6pds, v6Active, pdMap, &indices, unusedByAgent, seen, logger); err != nil {
 		return nil, fmt.Errorf("IPv6 PD file: %w", err)
 	}
 
