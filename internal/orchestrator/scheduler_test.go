@@ -23,17 +23,10 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 )
 
-// Coverage is ~99%: the only uncovered branches are:
-//   - NewScheduler's `newRandomizer` error path, unreachable — indices is
-//     guaranteed non-empty by the `len(v4pds) == 0 && len(v6pds) == 0`
-//     guard directly above it.
-//   - NextPD's busy-wait loop's runtime.Gosched() branch (the sub-100µs
-//     tail of the Sleep-vs-Gosched split). Deterministically landing
-//     `remaining` inside that narrow window isn't reliably testable —
-//     time.Sleep only guarantees sleeping at least the requested
-//     duration, not precisely it — and the branch itself is a pure
-//     scheduling hint with no behavioral effect, unlike the rest of
-//     NextPD's wait/cancellation/stale-pd logic, which is covered.
+// Coverage is ~99%: the only uncovered branch is NewScheduler's
+// `newRandomizer` error path, unreachable — indices is guaranteed
+// non-empty by the `len(v4pds) == 0 && len(v6pds) == 0` guard directly
+// above it.
 
 // -- helpers ------------------------------------------------------------------
 
@@ -1619,19 +1612,16 @@ func TestReadPDs_InvalidDirective(t *testing.T) {
 	}
 }
 
-// TestNextPD_TimerBasedWait exercises NextPD's timer/select branch
-// (issuancePeriod >= 10ms) — every other NextPD test uses IssuanceRate
-// high enough (or issuancePeriod set directly to 0) to take the busy-wait
-// branch instead, leaving this one entirely uncovered otherwise. A fresh
-// scheduler's zero-value lastIssuance puts nextTime in the past, so the
-// timer fires immediately — this exercises the timer.C success case
-// without an actual multi-millisecond test.
+// TestNextPD_TimerBasedWait exercises waitUntil's timer path: lastIssuance
+// is set to now so nextTime is genuinely in the future, unlike the
+// zero-value default, which puts it in the past and skips the timer.
 func TestNextPD_TimerBasedWait(t *testing.T) {
 	t.Parallel()
 	s := newTestSchedulerWithConfig(t,
 		[]*wire.ProbingDirective{makePD(1)},
 		1, 3, 3)
 	s.issuancePeriod = 20 * time.Millisecond
+	s.lastIssuance = time.Now()
 
 	if pd := s.NextPD(context.Background()); pd == nil {
 		t.Fatal("expected non-nil directive")
@@ -1659,21 +1649,57 @@ func TestNextPD_ContextCanceledDuringTimerWait(t *testing.T) {
 	}
 }
 
-// TestNextPD_BusyWaitBranches exercises the inner Sleep-vs-Gosched split
-// inside the busy-wait loop. Every other busy-wait test uses
-// issuancePeriod=0, where remaining<=0 is true on the first iteration and
-// the loop breaks before ever reaching this split — this needs a genuinely
-// positive, sub-10ms remaining duration to reach it at all.
-func TestNextPD_BusyWaitBranches(t *testing.T) {
+// TestWaitUntil_CanceledWithPastDeadline covers the no-wait path: a
+// deadline already passed must still honor a canceled ctx.
+func TestWaitUntil_CanceledWithPastDeadline(t *testing.T) {
 	t.Parallel()
-	s := newTestSchedulerWithConfig(t,
-		[]*wire.ProbingDirective{makePD(1)},
-		1, 3, 3)
-	s.issuancePeriod = 2 * time.Millisecond // < 10ms: busy-wait branch
-	s.lastIssuance = time.Now()             // nextTime genuinely in the future
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
 
+	if s.waitUntil(ctx, time.Now().Add(-time.Second)) {
+		t.Error("expected false for a canceled ctx even with a past deadline")
+	}
+}
+
+// TestNextPD_FixedGridCatchUp checks that while behind schedule (within
+// maxIssuanceLag), each call advances lastIssuance by exactly one period
+// instead of resetting it to now, so missed slots are issued rather than lost.
+func TestNextPD_FixedGridCatchUp(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	s.issuancePeriod = time.Millisecond
+	base := time.Now().Add(-maxIssuanceLag / 2)
+	s.lastIssuance = base
+
+	const calls = 5
+	for range calls {
+		if pd := s.NextPD(context.Background()); pd == nil {
+			t.Fatal("expected non-nil directive")
+		}
+	}
+
+	if want := base.Add(calls * s.issuancePeriod); !s.lastIssuance.Equal(want) {
+		t.Errorf("expected lastIssuance on the grid at %v, got %v (off by %v)",
+			want, s.lastIssuance, s.lastIssuance.Sub(want))
+	}
+}
+
+// TestNextPD_LagBeyondCapResets checks that falling more than
+// maxIssuanceLag behind drops the backlog instead of bursting it.
+func TestNextPD_LagBeyondCapResets(t *testing.T) {
+	t.Parallel()
+	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	s.issuancePeriod = time.Millisecond
+	s.lastIssuance = time.Now().Add(-10 * maxIssuanceLag)
+
+	before := time.Now()
 	if pd := s.NextPD(context.Background()); pd == nil {
 		t.Fatal("expected non-nil directive")
+	}
+
+	if s.lastIssuance.Before(before) {
+		t.Errorf("expected lastIssuance reset to now (>= %v), got %v", before, s.lastIssuance)
 	}
 }
 
@@ -1715,26 +1741,5 @@ func TestNextPD_StalePDDuringWait(t *testing.T) {
 
 	if pd := <-resultCh; pd != nil {
 		t.Errorf("expected nil (pd already replaced concurrently), got pd %d", pd.ProbingDirectiveID)
-	}
-}
-
-// TestNextPD_ContextCanceledDuringBusyWait exercises the busy-wait loop's
-// ctx.Err() check specifically — distinct from TestNextPD_BusyWaitBranches,
-// which lets the loop run to natural completion and never cancels mid-loop.
-// A 1ms deadline against a 5ms period gives comfortable margin for the
-// loop to observe the expired context before remaining<=0 would anyway.
-func TestNextPD_ContextCanceledDuringBusyWait(t *testing.T) {
-	t.Parallel()
-	s := newTestSchedulerWithConfig(t,
-		[]*wire.ProbingDirective{makePD(1)},
-		1, 3, 3)
-	s.issuancePeriod = 5 * time.Millisecond // < 10ms: busy-wait branch
-	s.lastIssuance = time.Now()             // nextTime genuinely in the future
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
-	defer cancel()
-
-	if pd := s.NextPD(ctx); pd != nil {
-		t.Errorf("expected nil after context cancellation, got pd %d", pd.ProbingDirectiveID)
 	}
 }

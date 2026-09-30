@@ -14,7 +14,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -285,12 +284,20 @@ func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics
 	}, nil
 }
 
+// maxIssuanceLag bounds how far issuance may fall behind its fixed schedule
+// before the missed slots are dropped instead of issued as a catch-up burst.
+const maxIssuanceLag = 100 * time.Millisecond
+
 // NextPD returns the next ProbingDirective candidate. It blocks until the
 // rate limit allows the next issuance, then runs a Bernoulli experiment to
 // decide whether to issue the directive. If the Bernoulli experiment fails,
 // the directive is replaced with a new candidate from the unused pool for the
 // same agent and protocol. Returns nil if the active set is empty, the
 // unused pool is exhausted, or ctx is canceled while waiting.
+//
+// Issuance slots lie on a fixed grid spaced issuancePeriod apart, so a late
+// wakeup is made up by the following slots rather than lost, up to
+// maxIssuanceLag.
 func (s *Scheduler) NextPD(ctx context.Context) *model.ProbingDirective {
 	s.mutex.Lock()
 	oldCycle := s.randomizer.Cycle()
@@ -313,7 +320,11 @@ func (s *Scheduler) NextPD(ctx context.Context) *model.ProbingDirective {
 	}
 
 	s.mutex.Lock()
-	s.lastIssuance = time.Now()
+	if now := time.Now(); now.Sub(nextTime) > maxIssuanceLag {
+		s.lastIssuance = now
+	} else {
+		s.lastIssuance = nextTime
+	}
 	s.mutex.Unlock()
 
 	if oldCycle != newCycle {
@@ -356,40 +367,20 @@ func (s *Scheduler) NextPD(ctx context.Context) *model.ProbingDirective {
 
 // waitUntil blocks until nextTime or ctx is canceled, whichever comes
 // first. Returns false if ctx was canceled before nextTime was reached.
-// Split out of NextPD to keep that function's cyclomatic complexity down —
-// this logic is self-contained (only reads s.issuancePeriod) and doesn't
-// need to be inlined.
+// Timer lateness only causes small bursts: NextPD schedules on a fixed
+// grid, so the average rate is preserved without busy-waiting.
 func (s *Scheduler) waitUntil(ctx context.Context, nextTime time.Time) bool {
-	if s.issuancePeriod >= 10*time.Millisecond {
-		timer := time.NewTimer(time.Until(nextTime))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return false
-		case <-timer.C:
-			return true
-		}
+	d := time.Until(nextTime)
+	if d <= 0 {
+		return ctx.Err() == nil
 	}
-
-	// Busy-wait for sub-10ms periods: time.Sleep's effective resolution on
-	// Linux (timer slack, scheduler granularity, C-states) can be several
-	// milliseconds under load, which would distort high issuance rates.
-	// Yield/sleep near the end instead of spinning the whole window —
-	// same precision, less CPU pinned. Checks ctx each iteration so
-	// cancellation can interrupt the wait rather than spinning past it.
-	for {
-		if ctx.Err() != nil {
-			return false
-		}
-		remaining := time.Until(nextTime)
-		if remaining <= 0 {
-			return true
-		}
-		if remaining > 100*time.Microsecond {
-			time.Sleep(remaining - 50*time.Microsecond)
-		} else {
-			runtime.Gosched()
-		}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
