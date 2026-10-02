@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// 100% coverage: every branch in newRandomizer, Next, Cycle, Replace, Remove, and Len is exercised.
+// 100% coverage: every branch in newRandomizer, Next, Cycle, Replace, Remove, Add, and Len is exercised.
 
 // -- newRandomizer ------------------------------------------------------------
 
@@ -461,6 +461,158 @@ func TestRandomizer_RemoveRandomOps(t *testing.T) {
 				}
 				if !alive[id] {
 					t.Fatalf("seed %d step %d: drew removed ID %d", seed, step, id)
+				}
+				if drawn[id] {
+					t.Fatalf("seed %d step %d: ID %d drawn twice in one cycle", seed, step, id)
+				}
+				drawn[id] = true
+			}
+			assertRandomizerInvariants(t, r)
+			if r.Len() != len(alive) {
+				t.Fatalf("seed %d step %d: Len() = %d, want %d", seed, step, r.Len(), len(alive))
+			}
+		}
+	}
+}
+
+// -- Add ------------------------------------------------------------------
+
+// TestRandomizer_AddRecoversFromEmpty is the direct regression test for the
+// production bug: once every ID is removed (unused-pool exhaustion,
+// replacePD's Remove call), the active set was stuck at zero forever. Add
+// must be able to grow a drained randomizer back up.
+func TestRandomizer_AddRecoversFromEmpty(t *testing.T) {
+	t.Parallel()
+	r := removeTestRandomizer(t, 1, 1)
+	r.Remove(1)
+	if r.Len() != 0 {
+		t.Fatalf("expected Len() 0, got %d", r.Len())
+	}
+
+	r.Add(99)
+
+	assertRandomizerInvariants(t, r)
+	if r.Len() != 1 {
+		t.Fatalf("expected Len() 1 after Add, got %d", r.Len())
+	}
+	if got := r.Next(); got != 99 {
+		t.Errorf("expected Next() to return 99, got %d", got)
+	}
+}
+
+func TestRandomizer_AddBeforeAnyDraw(t *testing.T) {
+	t.Parallel()
+	r := removeTestRandomizer(t, 1, 1, 2, 3)
+
+	r.Add(4)
+
+	assertRandomizerInvariants(t, r)
+	assertSameIDs(t, drawIDs(r, 4), 1, 2, 3, 4)
+}
+
+func TestRandomizer_AddMidCycle(t *testing.T) {
+	t.Parallel()
+	r := removeTestRandomizer(t, 2, 1, 2, 3, 4, 5)
+	drawnFirst := []uint64{r.Next(), r.Next()}
+
+	r.Add(99)
+
+	assertRandomizerInvariants(t, r)
+	var remaining []uint64
+	for _, id := range []uint64{1, 2, 3, 4, 5} {
+		if id != drawnFirst[0] && id != drawnFirst[1] {
+			remaining = append(remaining, id)
+		}
+	}
+	remaining = append(remaining, 99)
+	assertSameIDs(t, drawIDs(r, 4), remaining...)
+	if r.Cycle() != 0 {
+		t.Errorf("expected cycle 0 until this pass completes, got %d", r.Cycle())
+	}
+}
+
+// TestRandomizer_AddWhenFullyDrawnBeforeWrap covers the trickiest case: i is
+// -1 (every ID already drawn this cycle, wrap pending on the next Next()
+// call). Add places the new ID at position 0 with i = 0, so the very next
+// Next() returns it directly instead of wrapping — the wrap happens on the
+// call after that.
+// TestRandomizer_AddWhenFullyDrawnBeforeWrap covers the trickiest case: i is
+// -1 (every ID already drawn this cycle, wrap pending on the next Next()
+// call). Add places the new ID at position 0 with i = 0, so the very next
+// Next() returns it directly instead of wrapping — the wrap happens on the
+// call after that. The cycle that just finished (3 original draws before
+// Add + the new ID right after) and the one that follows both cover all 4
+// current IDs exactly once; the post-wrap cycle is not {1,2,3} alone, since
+// Add made 99 a permanent member of the set, reshuffled in with the rest.
+func TestRandomizer_AddWhenFullyDrawnBeforeWrap(t *testing.T) {
+	t.Parallel()
+	r := removeTestRandomizer(t, 4, 1, 2, 3)
+	drawIDs(r, 3)
+	if r.Cycle() != 0 {
+		t.Fatalf("expected cycle 0 before the next draw, got %d", r.Cycle())
+	}
+
+	r.Add(99)
+	assertRandomizerInvariants(t, r)
+
+	if got := r.Next(); got != 99 {
+		t.Errorf("expected the immediate next draw to be the newly added 99, got %d", got)
+	}
+	if r.Cycle() != 0 {
+		t.Errorf("expected cycle still 0 (wrap not yet triggered), got %d", r.Cycle())
+	}
+
+	assertSameIDs(t, drawIDs(r, 4), 1, 2, 3, 99)
+	if r.Cycle() != 1 {
+		t.Errorf("expected cycle 1 after the wrap, got %d", r.Cycle())
+	}
+}
+
+// TestRandomizer_AddRandomOps extends the Remove property test with Add,
+// including recovery from Len() == 0, which real usage (exhaustion followed
+// by a later diff) can hit.
+func TestRandomizer_AddRandomOps(t *testing.T) {
+	t.Parallel()
+	for seed := uint64(0); seed < 300; seed++ {
+		r := removeTestRandomizer(t, seed, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+		alive := map[uint64]bool{}
+		for id := uint64(0); id < 10; id++ {
+			alive[id] = true
+		}
+		rng := rand.New(rand.NewPCG(seed, 2)) // #nosec G404
+		nextNewID := uint64(1000)
+		drawn := make(map[uint64]bool)
+
+		for step := 0; step < 400; step++ {
+			switch {
+			case r.Len() == 0:
+				r.Add(nextNewID)
+				alive[nextNewID] = true
+				nextNewID++
+				drawn = make(map[uint64]bool)
+			case rng.IntN(3) == 0 && len(alive) > 0:
+				var candidates []uint64
+				for id, ok := range alive {
+					if ok {
+						candidates = append(candidates, id)
+					}
+				}
+				victim := candidates[rng.IntN(len(candidates))]
+				r.Remove(victim)
+				delete(alive, victim)
+				delete(drawn, victim)
+			case rng.IntN(2) == 0:
+				r.Add(nextNewID)
+				alive[nextNewID] = true
+				nextNewID++
+			default:
+				before := r.Cycle()
+				id := r.Next()
+				if r.Cycle() != before {
+					drawn = make(map[uint64]bool)
+				}
+				if !alive[id] {
+					t.Fatalf("seed %d step %d: drew absent ID %d", seed, step, id)
 				}
 				if drawn[id] {
 					t.Fatalf("seed %d step %d: ID %d drawn twice in one cycle", seed, step, id)

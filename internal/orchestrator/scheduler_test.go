@@ -1038,7 +1038,9 @@ func TestReplacePD_PoolExhaustedRemovesDeadSlot(t *testing.T) {
 
 func TestApplyDiff_InsertAddsToUnusedPool(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	// ActiveSetSize matches the single starter PD exactly: no deficit, so
+	// topUpActiveSet stays a no-op and doesn't promote the new insert.
+	s := newTestSchedulerWithConfig(t, []*wire.ProbingDirective{makePDV4(1)}, 1, 3, 3)
 	newPD := makeModelPD(t, 2, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.9")
 
 	s.ApplyDiff([]*model.ProbingDirective{newPD}, nil)
@@ -1149,7 +1151,8 @@ func TestApplyDiff_SkipsDuplicateOfUnusedPD(t *testing.T) {
 
 func TestApplyDiff_SkipsIntraBatchDuplicate(t *testing.T) {
 	t.Parallel()
-	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
+	// Same no-deficit reasoning as TestApplyDiff_InsertAddsToUnusedPool.
+	s := newTestSchedulerWithConfig(t, []*wire.ProbingDirective{makePDV4(1)}, 1, 3, 3)
 
 	pdA := makeModelPD(t, 2, "agent-x", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.5")
 	pdB := makeModelPD(t, 2, "agent-x", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.6")
@@ -1247,6 +1250,288 @@ func TestApplyDiff_PDsTotalTracksDiff(t *testing.T) {
 	}
 }
 
+// -- topUpActiveSet (via ApplyDiff) ------------------------------------------
+
+// TestApplyDiff_PromotesFromUnusedPoolAfterExhaustion reproduces the real
+// bug: unused-pool exhaustion permanently shrinks the active set (replacePD
+// removes the dead slot from both pdMap and the randomizer), and a diff that
+// only adds unused supply used to never refill it. topUpActiveSet (called at
+// the end of ApplyDiff) closes that gap.
+func TestApplyDiff_PromotesFromUnusedPoolAfterExhaustion(t *testing.T) {
+	t.Parallel()
+	// Active: pd1, pd2 (agent-a). No unused pool, so replacing either exhausts it.
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		2, 3, 3)
+
+	for range s.config.ConsecutiveMissesThreshold {
+		_ = s.UpdateFromFIE(makeFIETimeout(1))
+	}
+	if len(s.pdMap) != 1 {
+		t.Fatalf("expected the active set to have shrunk to 1 after exhaustion, got %d", len(s.pdMap))
+	}
+	if got := s.randomizer.Len(); got != 1 {
+		t.Fatalf("expected the randomizer to have shrunk to 1 too, got %d", got)
+	}
+
+	// A diff supplying a new agent-a PD should refill the lost slot.
+	s.ApplyDiff([]*model.ProbingDirective{
+		makeModelPD(t, 10, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.10"),
+	}, nil)
+
+	if len(s.pdMap) != 2 {
+		t.Errorf("expected the active set back to 2 after top-up, got %d", len(s.pdMap))
+	}
+	if got := s.randomizer.Len(); got != 2 {
+		t.Errorf("expected the randomizer back to 2 after top-up, got %d", got)
+	}
+	if _, ok := s.pdMap[10]; !ok {
+		t.Error("expected the newly inserted PD to be the one promoted")
+	}
+
+	// And it should actually be drawable, not just present in pdMap.
+	s.issuancePeriod = 0
+	seen := map[uint64]bool{}
+	for i := 0; i < 20; i++ {
+		if pd := s.NextPD(context.Background()); pd != nil {
+			seen[pd.ProbingDirectiveID] = true
+		}
+	}
+	if !seen[10] {
+		t.Error("expected the promoted PD to be drawable via NextPD")
+	}
+}
+
+// TestApplyDiff_TopUpStopsAtActiveSetSize checks promotion doesn't overshoot
+// the configured target even when the unused pool has more supply than the
+// deficit.
+func TestApplyDiff_TopUpStopsAtActiveSetSize(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+		},
+		1, 3, 3) // ActiveSetSize 1, already at target
+
+	s.ApplyDiff([]*model.ProbingDirective{
+		makeModelPD(t, 2, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.2"),
+		makeModelPD(t, 3, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.3"),
+	}, nil)
+
+	if len(s.pdMap) != 1 {
+		t.Errorf("expected active set to stay at ActiveSetSize (1), got %d", len(s.pdMap))
+	}
+	if total := len(s.unusedByAgent["agent-a"][0]); total != 2 {
+		t.Errorf("expected both inserts to land in the unused pool untouched, got %d", total)
+	}
+}
+
+// countByVersion tallies s.pdMap's directives by IP version.
+func countByVersion(s *Scheduler) (v4, v6 int) {
+	for _, pd := range s.pdMap {
+		if pd.directive.IPVersion == wire.IPVersion_IP_VERSION_IPV6 {
+			v6++
+		} else {
+			v4++
+		}
+	}
+	return v4, v6
+}
+
+// TestApplyDiff_TopUpRespectsV4V6HalfSplit checks top-up targets the same
+// v4/v6 half-split as the startup load, not just an agent-fair total count.
+func TestApplyDiff_TopUpRespectsV4V6HalfSplit(t *testing.T) {
+	t.Parallel()
+	// One starter v4 PD, no v6 at construction (so NewScheduler gives v4 the
+	// full ActiveSetSize at startup, same as TestNewScheduler_OnlyV4) —
+	// deliberately the opposite of the target this test checks, so passing
+	// here can't be a startup coincidence.
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       0,
+		IssuanceRate:               1000.0,
+		PDPathV4:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"}}),
+		ImpactThreshold:            1.0,
+		ActiveSetSize:              10,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v4, v6 := countByVersion(s); v4 != 1 || v6 != 0 {
+		t.Fatalf("expected 1 v4 / 0 v6 at startup, got %d/%d", v4, v6)
+	}
+
+	var toInsert []*model.ProbingDirective
+	for i := uint64(100); i < 110; i++ { // 10 new v4 PDs, ample supply
+		toInsert = append(toInsert, makeModelPD(t, i, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"))
+	}
+	for i := uint64(200); i < 209; i++ { // 9 new v6 PDs, ample supply
+		toInsert = append(toInsert, makeModelPD(t, i, "agent-a", wire.IPVersion_IP_VERSION_IPV6, "2001:db8::1"))
+	}
+	s.ApplyDiff(toInsert, nil)
+
+	if len(s.pdMap) != 10 {
+		t.Fatalf("expected the active set to reach ActiveSetSize (10), got %d", len(s.pdMap))
+	}
+	v4, v6 := countByVersion(s)
+	if v4 != 5 || v6 != 5 {
+		t.Errorf("expected a 5/5 v4/v6 split, got %d/%d", v4, v6)
+	}
+}
+
+// TestApplyDiff_TopUpDoesNotSpilloverBetweenProtocols checks that when one
+// protocol's unused supply can't fill its half, those slots stay empty
+// rather than being backfilled by the other protocol's surplus.
+func TestApplyDiff_TopUpDoesNotSpilloverBetweenProtocols(t *testing.T) {
+	t.Parallel()
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       0,
+		IssuanceRate:               1000.0,
+		PDPathV4:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"}}),
+		ImpactThreshold:            1.0,
+		ActiveSetSize:              10,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var toInsert []*model.ProbingDirective
+	for i := uint64(100); i < 120; i++ { // 20 new v4 PDs — plenty of surplus
+		toInsert = append(toInsert, makeModelPD(t, i, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"))
+	}
+	// Only 1 new v6 PD — scarce, can't fill its half of the target (5).
+	toInsert = append(toInsert, makeModelPD(t, 200, "agent-a", wire.IPVersion_IP_VERSION_IPV6, "2001:db8::1"))
+	s.ApplyDiff(toInsert, nil)
+
+	// deficit=9, v4Need=min(9,5-1)=4, v6Need=min(5,5-0)=5 but only 1
+	// available: promoted = 4+1 = 5, final active = 1+5 = 6, well short of
+	// ActiveSetSize=10 despite 16 spare v4 PDs sitting unused.
+	if len(s.pdMap) != 6 {
+		t.Fatalf("expected active set at 6 (not spilling v4 surplus into v6's shortfall), got %d", len(s.pdMap))
+	}
+	v4, v6 := countByVersion(s)
+	if v4 != 5 || v6 != 1 {
+		t.Errorf("expected 5 v4 / 1 v6 (v6 capped by its own scarce supply), got %d/%d", v4, v6)
+	}
+	if remaining := len(s.unusedByAgent["agent-a"][0]); remaining != 16 {
+		t.Errorf("expected 16 v4 PDs left unpromoted in the unused pool, got %d", remaining)
+	}
+}
+
+// TestApplyDiff_TopUpCountsExistingActiveV6 covers topUpActiveSet's active-
+// count loop actually incrementing v6ActiveNow: every other top-up test's
+// v6 PDs only ever arrive as new unused supply within the same ApplyDiff
+// call, so that branch of the counting loop is otherwise never taken.
+func TestApplyDiff_TopUpCountsExistingActiveV6(t *testing.T) {
+	t.Parallel()
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       0,
+		IssuanceRate:               1000.0,
+		PDPathV4:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"}}),
+		PDPathV6:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV6, DestinationAddress: "2001:db8::1"}}),
+		ImpactThreshold:            1.0,
+		ActiveSetSize:              10,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v4, v6 := countByVersion(s); v4 != 1 || v6 != 1 {
+		t.Fatalf("expected 1 active v4 and 1 active v6 at startup, got %d/%d", v4, v6)
+	}
+
+	var toInsert []*model.ProbingDirective
+	for i := uint64(100); i < 110; i++ {
+		toInsert = append(toInsert, makeModelPD(t, i, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"))
+	}
+	for i := uint64(200); i < 210; i++ {
+		toInsert = append(toInsert, makeModelPD(t, i, "agent-a", wire.IPVersion_IP_VERSION_IPV6, "2001:db8::1"))
+	}
+	s.ApplyDiff(toInsert, nil)
+
+	if len(s.pdMap) != 10 {
+		t.Fatalf("expected the active set to reach ActiveSetSize (10), got %d", len(s.pdMap))
+	}
+	v4, v6 := countByVersion(s)
+	if v4 != 5 || v6 != 5 {
+		t.Errorf("expected a 5/5 split counting the pre-existing actives, got %d/%d", v4, v6)
+	}
+}
+
+// TestApplyDiff_TopUpGivesFullCapacityToV6WhenV4Absent covers
+// topUpActiveSet's other switch case: when v4 has zero PDs anywhere
+// (active or unused), v6 gets the full ActiveSetSize target rather than
+// just half. The symmetric case (v6 absent) is already exercised by every
+// V4-only top-up test; this is the direction none of them cover.
+func TestApplyDiff_TopUpGivesFullCapacityToV6WhenV4Absent(t *testing.T) {
+	t.Parallel()
+	s, err := NewScheduler(&SchedulerConfig{
+		Seed:                       0,
+		IssuanceRate:               1000.0,
+		PDPathV6:                   writeSchedulerPDFile(t, []*wire.ProbingDirective{{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV6, DestinationAddress: "2001:db8::1"}}),
+		ImpactThreshold:            1.0,
+		ActiveSetSize:              10,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var toInsert []*model.ProbingDirective
+	for i := uint64(200); i < 209; i++ { // 9 new v6 PDs, no v4 anywhere in the system
+		toInsert = append(toInsert, makeModelPD(t, i, "agent-a", wire.IPVersion_IP_VERSION_IPV6, "2001:db8::1"))
+	}
+	s.ApplyDiff(toInsert, nil)
+
+	if len(s.pdMap) != 10 {
+		t.Fatalf("expected v6 to fill the entire ActiveSetSize (10) since v4 has no supply at all, got %d", len(s.pdMap))
+	}
+	v4, v6 := countByVersion(s)
+	if v4 != 0 || v6 != 10 {
+		t.Errorf("expected 0 v4 / 10 v6, got %d/%d", v4, v6)
+	}
+}
+
+// TestApplyDiff_TopUpStopsMidPassAcrossAgents covers promoteUpTo's
+// "if promoted >= n { break }" guard: with a single agent (every other
+// top-up test), that line is unreachable, since one agent contributes at
+// most one promotion per pass — it only matters once a pass's first agent
+// already satisfies the target before the loop reaches a second agent.
+func TestApplyDiff_TopUpStopsMidPassAcrossAgents(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+		},
+		2, 3, 3) // ActiveSetSize 2, deficit 1
+
+	s.ApplyDiff([]*model.ProbingDirective{
+		makeModelPD(t, 2, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.2"),
+		makeModelPD(t, 3, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.3"),
+	}, nil)
+
+	// deficit=1, satisfied entirely by the alphabetically-first agent
+	// ("agent-a") within the first pass; agent-b's supply must be left
+	// untouched rather than also being drawn from in that same pass.
+	if len(s.pdMap) != 2 {
+		t.Fatalf("expected active set at ActiveSetSize (2), got %d", len(s.pdMap))
+	}
+	if _, ok := s.pdMap[2]; !ok {
+		t.Error("expected agent-a's PD (sorted first) to be the one promoted")
+	}
+	if len(s.unusedByAgent["agent-b"][0]) != 1 {
+		t.Error("expected agent-b's PD to be left untouched in the unused pool")
+	}
+}
+
 // -- watchPDDiffReload ----------------------------------------------------------
 
 func TestWatchPDDiffReload_NoDiffPathBlocksUntilCtxDone(t *testing.T) {
@@ -1294,6 +1579,26 @@ func TestWatchPDDiffReload_CtxDoneBeforeSignal(t *testing.T) {
 	}
 }
 
+// pdIsKnown reports whether id is present anywhere in s — active or still
+// unused under agentID — since a diff's insert can land in either place: it
+// stays unused, or topUpActiveSet promotes it immediately if the active set
+// was under ActiveSetSize.
+func pdIsKnown(s *Scheduler, agentID string, id uint64) bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if _, ok := s.pdMap[id]; ok {
+		return true
+	}
+	for _, v := range s.unusedByAgent[agentID] {
+		for _, u := range v {
+			if u.directive.ProbingDirectiveID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // armSIGHUPHandling makes the runtime catch SIGHUP before a test sends one,
 // so a signal racing a goroutine's signal.Notify can't hit the default
 // (terminating) action.
@@ -1329,15 +1634,7 @@ func TestWatchPDDiffReload_AppliesDiffOnSignal(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		s.mutex.Lock()
-		found := false
-		for _, u := range s.unusedByAgent["agent-z"][0] {
-			if u.directive.ProbingDirectiveID == 2 {
-				found = true
-			}
-		}
-		s.mutex.Unlock()
-		if found {
+		if pdIsKnown(s, "agent-z", 2) {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -1400,10 +1697,7 @@ func TestWatchPDDiffReload_WarnsOnMalformedLines(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		s.mutex.Lock()
-		applied := len(s.unusedByAgent["agent-z"][0]) == 1
-		s.mutex.Unlock()
-		if applied {
+		if pdIsKnown(s, "agent-z", 2) {
 			if !strings.Contains(buf.String(), "skipped_malformed=1") {
 				t.Errorf("expected a skipped_malformed=1 warning, got logs: %q", buf.String())
 			}

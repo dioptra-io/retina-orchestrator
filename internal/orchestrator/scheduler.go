@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
@@ -470,7 +471,28 @@ func (s *Scheduler) ApplyDiff(toInsert []*model.ProbingDirective, toRemove []uin
 		removeKeys[id] = struct{}{}
 	}
 
-	removedFromUnused := 0
+	removedFromUnused, tombstoned := s.applyRemovals(removeKeys)
+	inserted, skippedDuplicate, skippedInvalid := s.applyInserts(toInsert)
+
+	// Tombstoned active PDs leave PDsTotal later, in recycleOrEvict.
+	s.metrics.PDsTotal.Add(float64(inserted - removedFromUnused))
+
+	promoted := s.topUpActiveSet()
+
+	s.logger.Info("Applied PD diff",
+		slog.Int("inserted", inserted),
+		slog.Int("skipped_duplicate", skippedDuplicate),
+		slog.Int("skipped_invalid", skippedInvalid),
+		slog.Int("removed_from_unused", removedFromUnused),
+		slog.Int("tombstoned_active", tombstoned),
+		slog.Int("promoted_to_active", promoted),
+		slog.Int("remove_ids_total", len(toRemove)))
+}
+
+// applyRemovals drops matching unused PDs immediately and tombstones
+// matching active PDs for eviction on their next replacement. Must be
+// called with s.mutex held.
+func (s *Scheduler) applyRemovals(removeKeys map[uint64]struct{}) (removedFromUnused, tombstoned int) {
 	for agentID, pools := range s.unusedByAgent {
 		for v := range pools {
 			kept := pools[v][:0]
@@ -487,7 +509,6 @@ func (s *Scheduler) ApplyDiff(toInsert []*model.ProbingDirective, toRemove []uin
 		s.unusedByAgent[agentID] = pools
 	}
 
-	tombstoned := 0
 	for id, pd := range s.pdMap {
 		if _, drop := removeKeys[id]; drop {
 			pd.markedForRemoval = true
@@ -495,7 +516,13 @@ func (s *Scheduler) ApplyDiff(toInsert []*model.ProbingDirective, toRemove []uin
 			tombstoned++
 		}
 	}
+	return removedFromUnused, tombstoned
+}
 
+// applyInserts adds toInsert to the unused pool, skipping anything with an
+// empty AgentID or an ID already known (active or unused, including other
+// entries in this same batch). Must be called with s.mutex held.
+func (s *Scheduler) applyInserts(toInsert []*model.ProbingDirective) (inserted, skippedDuplicate, skippedInvalid int) {
 	existingIDs := make(map[uint64]struct{}, len(s.pdMap))
 	for id := range s.pdMap {
 		existingIDs[id] = struct{}{}
@@ -508,7 +535,6 @@ func (s *Scheduler) ApplyDiff(toInsert []*model.ProbingDirective, toRemove []uin
 		}
 	}
 
-	inserted, skippedDuplicate, skippedInvalid := 0, 0, 0
 	for _, d := range toInsert {
 		if d.AgentID == "" {
 			s.logger.Debug("Skipping PD insert with empty AgentID",
@@ -531,17 +557,99 @@ func (s *Scheduler) ApplyDiff(toInsert []*model.ProbingDirective, toRemove []uin
 		s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(d.IPVersion)).Inc()
 		inserted++
 	}
+	return inserted, skippedDuplicate, skippedInvalid
+}
 
-	// Tombstoned active PDs leave PDsTotal later, in recycleOrEvict.
-	s.metrics.PDsTotal.Add(float64(inserted - removedFromUnused))
+// topUpActiveSet promotes unused PDs into the active set until it reaches
+// ActiveSetSize or supply runs out, recovering slots lost to earlier
+// exhaustion (see replacePD) once new supply arrives via ApplyDiff. Targets
+// the same v4/v6 half-split as loadPDsIntoPool's startup load (full capacity
+// to one protocol if the other has no PDs anywhere). If one side's unused
+// supply can't fill its half, those slots stay empty rather than being
+// backfilled by the other protocol — the active set may temporarily sit
+// below ActiveSetSize, but never more skewed than the configured split.
+// Must be called with s.mutex held.
+func (s *Scheduler) topUpActiveSet() int {
+	deficit := s.config.ActiveSetSize - len(s.pdMap)
+	if deficit <= 0 {
+		return 0
+	}
 
-	s.logger.Info("Applied PD diff",
-		slog.Int("inserted", inserted),
-		slog.Int("skipped_duplicate", skippedDuplicate),
-		slog.Int("skipped_invalid", skippedInvalid),
-		slog.Int("removed_from_unused", removedFromUnused),
-		slog.Int("tombstoned_active", tombstoned),
-		slog.Int("remove_ids_total", len(toRemove)))
+	v4ActiveNow, v6ActiveNow := 0, 0
+	for _, pd := range s.pdMap {
+		if pd.directive.IPVersion == wire.IPVersion_IP_VERSION_IPV6 {
+			v6ActiveNow++
+		} else {
+			v4ActiveNow++
+		}
+	}
+	v4UnusedTotal, v6UnusedTotal := 0, 0
+	for _, pools := range s.unusedByAgent {
+		v4UnusedTotal += len(pools[0])
+		v6UnusedTotal += len(pools[1])
+	}
+
+	halfActive := s.config.ActiveSetSize / 2
+	v4Target, v6Target := halfActive, halfActive
+	switch {
+	case v4ActiveNow+v4UnusedTotal == 0:
+		v6Target = s.config.ActiveSetSize
+	case v6ActiveNow+v6UnusedTotal == 0:
+		v4Target = s.config.ActiveSetSize
+	}
+
+	remaining := deficit
+	v4Need := min(remaining, max(0, v4Target-v4ActiveNow))
+	remaining -= s.promoteUpTo(v4Need, 0)
+	v6Need := min(remaining, max(0, v6Target-v6ActiveNow))
+	remaining -= s.promoteUpTo(v6Need, 1)
+	return deficit - remaining
+}
+
+// promoteUpTo promotes up to n unused PDs of the given protocol (0 for v4, 1
+// for v6) into the active set, round-robining one per agent per pass so no
+// single agent's surplus dominates. Returns the number actually promoted,
+// which is less than n if that protocol's supply runs out. Must be called
+// with s.mutex held.
+func (s *Scheduler) promoteUpTo(n, protocol int) int {
+	if n <= 0 {
+		return 0
+	}
+	agentIDs := make([]string, 0, len(s.unusedByAgent))
+	for agentID := range s.unusedByAgent {
+		agentIDs = append(agentIDs, agentID)
+	}
+	sort.Strings(agentIDs)
+
+	promoted := 0
+	for promoted < n {
+		promotedThisPass := false
+		for _, agentID := range agentIDs {
+			if promoted >= n {
+				break
+			}
+			pools := s.unusedByAgent[agentID]
+			if len(pools[protocol]) > 0 {
+				last := len(pools[protocol]) - 1
+				u := pools[protocol][last]
+				pools[protocol][last] = nil
+				pools[protocol] = pools[protocol][:last]
+				s.unusedByAgent[agentID] = pools
+				s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(u.directive.IPVersion)).Dec()
+
+				replacement := u.promote()
+				s.pdMap[replacement.directive.ProbingDirectiveID] = replacement
+				s.randomizer.Add(replacement.directive.ProbingDirectiveID)
+				s.metrics.PDsActiveTotal.Inc()
+				promoted++
+				promotedThisPass = true
+			}
+		}
+		if !promotedThisPass {
+			break
+		}
+	}
+	return promoted
 }
 
 // UpdateFromFIE updates the scheduling state of a directive based on an
