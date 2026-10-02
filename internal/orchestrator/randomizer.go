@@ -14,12 +14,12 @@ import (
 // begins and the sequence is reshuffled.
 //
 // randomizer is not safe for concurrent use. All calls to Next, Replace,
-// Remove, Len, and Cycle must be made under the scheduler mutex.
+// Remove, Add, Len, and Cycle must be made under the scheduler mutex.
 type randomizer struct {
 	random  *rand.Rand
 	indices []uint64
 	// indexPD is a reverse map from PD ID to its current position in indices,
-	// kept in sync with every swap performed by Next, Replace, and Remove.
+	// kept in sync with every swap performed by Next, Replace, Remove, and Add.
 	indexPD map[uint64]int
 	i       int
 	length  int
@@ -122,6 +122,28 @@ func (r *randomizer) Remove(id uint64) {
 	r.indices = r.indices[:last]
 	r.length--
 	delete(r.indexPD, id)
+}
+
+// Add inserts id as undrawn, growing the cycle by one, in O(1). Precondition:
+// id must not already be present. The new slot is appended, then swapped
+// into position i+1 — the first drawn slot — extending the undrawn region by
+// one. If i == -1 (cycle about to wrap), the next Next() returns id
+// immediately instead of wrapping; the wrap happens on the call after.
+func (r *randomizer) Add(id uint64) {
+	pos := r.length
+	r.indices = append(r.indices, id)
+	r.indexPD[id] = pos
+	r.length++
+
+	boundary := r.i + 1
+	if boundary != pos {
+		moved := r.indices[boundary]
+		r.indices[pos] = moved
+		r.indexPD[moved] = pos
+		r.indices[boundary] = id
+		r.indexPD[id] = boundary
+	}
+	r.i = boundary
 }
 
 // Len returns the number of IDs currently in the randomizer.
