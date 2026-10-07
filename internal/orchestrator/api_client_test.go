@@ -1,0 +1,597 @@
+// Copyright (c) 2025 Sorbonne Université
+// SPDX-License-Identifier: MIT
+package orchestrator
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"net"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/dioptra-io/retina-commons/v2/framing"
+	"github.com/dioptra-io/retina-commons/v2/model"
+	wire "github.com/dioptra-io/retina-commons/v2/wire/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+)
+
+// Intentionally uncovered in streamOnce (api_client.go):
+//
+//   - The *net.TCPConn type assertion failure is unreachable in practice —
+//     DialContext with network "tcp" always returns *net.TCPConn (same
+//     reasoning as agent_server.go's equivalent assertion).
+//   - SetKeepAlive/SetKeepAlivePeriod error branches are unreachable on a
+//     freshly dialed, valid TCP connection.
+
+func newTestMetrics() *Metrics {
+	return &Metrics{
+		APIClientFIEsPushedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "test_api_client_fies_pushed_total",
+		}),
+		APIClientFIEsDroppedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "test_api_client_fies_dropped_total",
+		}),
+		APIClientConnectionUp: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "test_api_client_connection_up",
+		}),
+	}
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func waitForGauge(t *testing.T, g prometheus.Gauge, want float64) {
+	t.Helper()
+	const timeout = time.Second
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if testutil.ToFloat64(g) == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("gauge did not reach %v within %s (last value %v)", want, timeout, testutil.ToFloat64(g))
+}
+
+// waitForCounter polls because the client increments the counter after
+// framing.Send returns, which can be after the server has already received
+// the FIE.
+func waitForCounter(t *testing.T, c prometheus.Counter, want float64) {
+	t.Helper()
+	const timeout = time.Second
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if testutil.ToFloat64(c) == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("counter did not reach %v within %s (last value %v)", want, timeout, testutil.ToFloat64(c))
+}
+
+// testFIE returns a minimal but valid FIE — DestinationAddress and
+// ProductionTimestamp are required by ToProto(), so a bare zero-value
+// literal would be dropped rather than sent.
+func testFIE(id uint64) *model.ForwardingInfoElement {
+	return &model.ForwardingInfoElement{
+		ProbingDirectiveID:  id,
+		DestinationAddress:  net.ParseIP("192.0.2.1"),
+		ProductionTimestamp: time.Now(),
+	}
+}
+
+// fakeIngestServer mimics retina-api's ingest listener: a raw TCP server
+// decoding length-prefixed protobuf FIEs (see retina-commons/framing),
+// plus a mid-stream disconnect for failure-detection tests.
+type fakeIngestServer struct {
+	listener net.Listener
+	addr     string
+
+	mu       sync.Mutex
+	received []*wire.ForwardingInfoElement
+
+	closeAfterN int // hard-reset the connection after N received FIEs; 0 = never
+
+	receivedCh chan struct{}
+	attempts   atomic.Int64
+}
+
+func newFakeIngestServer(t *testing.T) *fakeIngestServer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	f := &fakeIngestServer{
+		listener:   ln,
+		addr:       ln.Addr().String(),
+		receivedCh: make(chan struct{}, 100_000),
+	}
+	go f.acceptLoop()
+	t.Cleanup(func() { _ = ln.Close() })
+	return f
+}
+
+func (f *fakeIngestServer) acceptLoop() {
+	for {
+		conn, err := f.listener.Accept()
+		if err != nil {
+			return // listener closed
+		}
+		go f.handle(conn)
+	}
+}
+
+func (f *fakeIngestServer) handle(conn net.Conn) {
+	defer conn.Close()
+	f.attempts.Add(1)
+
+	count := 0
+	for {
+		var fie wire.ForwardingInfoElement
+		if err := framing.Receive(conn, 0, &fie); err != nil {
+			return
+		}
+		f.mu.Lock()
+		f.received = append(f.received, &fie)
+		f.mu.Unlock()
+		select {
+		case f.receivedCh <- struct{}{}:
+		default:
+		}
+		count++
+
+		if f.closeAfterN > 0 && count >= f.closeAfterN {
+			// SetLinger(0) forces a hard RST instead of a graceful FIN, so
+			// the client's next send fails immediately rather than
+			// hanging indefinitely.
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				_ = tcpConn.SetLinger(0)
+			}
+			return
+		}
+	}
+}
+
+func (f *fakeIngestServer) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.received)
+}
+
+// waitForCount blocks until the server has received at least n FIEs or the
+// timeout elapses.
+func (f *fakeIngestServer) waitForCount(t *testing.T, n int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for f.count() < n {
+		select {
+		case <-f.receivedCh:
+		case <-deadline:
+			t.Fatalf("timed out waiting for server to receive %d FIEs, got %d", n, f.count())
+		}
+	}
+}
+
+// ---- newAPIClient / config validation ----
+
+// TestNewAPIClient_Validation covers only what newAPIClient itself checks —
+// address/bufferSize/reconnectDelay validation lives in Config.Validate()
+// now (see orchestrator_test.go's TestConfig_Validate_* tests).
+func TestNewAPIClient_Validation(t *testing.T) {
+	t.Parallel()
+	baseConfig := func() *apiClientConfig {
+		return &apiClientConfig{address: "127.0.0.1:1", bufferSize: 100, metrics: newTestMetrics()}
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(c *apiClientConfig)
+		wantErr bool
+	}{
+		{"nil metrics", func(c *apiClientConfig) { c.metrics = nil }, true},
+		{"valid minimal config", func(*apiClientConfig) {}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := baseConfig()
+			tt.mutate(cfg)
+			_, err := newAPIClient(cfg)
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// TestNewAPIClient_Defaults covers only what newAPIClient itself defaults
+// (sendTimeout, logger) — bufferSize/reconnectDelay default in
+// Config.applyDefaults() now (orchestrator_test.go).
+func TestNewAPIClient_Defaults(t *testing.T) {
+	t.Parallel()
+	cfg := &apiClientConfig{address: "127.0.0.1:1", bufferSize: 100, metrics: newTestMetrics()}
+	c, err := newAPIClient(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.sendTimeout != 5*time.Second {
+		t.Errorf("expected default sendTimeout 5s, got %s", cfg.sendTimeout)
+	}
+	if cfg.logger == nil {
+		t.Error("expected default logger to be set")
+	}
+	if cap(c.fieChan) != 100 {
+		t.Errorf("expected fieChan capacity to match the given bufferSize, got %d", cap(c.fieChan))
+	}
+}
+
+// TestNewAPIClient_UnbufferedIfBufferSizeUnset: newAPIClient no longer
+// defaults a zero bufferSize, so calling it directly with none set silently
+// produces an unbuffered channel.
+func TestNewAPIClient_UnbufferedIfBufferSizeUnset(t *testing.T) {
+	t.Parallel()
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", metrics: newTestMetrics()})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cap(c.fieChan) != 0 {
+		t.Errorf("expected an unbuffered channel when bufferSize is left unset, got capacity %d", cap(c.fieChan))
+	}
+}
+
+func TestNewAPIClient_PreservesExplicitValues(t *testing.T) {
+	t.Parallel()
+	logger := discardLogger()
+	metrics := newTestMetrics()
+
+	cfg := &apiClientConfig{
+		address:        "127.0.0.1:1",
+		bufferSize:     42,
+		reconnectDelay: 3 * time.Second,
+		sendTimeout:    2 * time.Second,
+		logger:         logger,
+		metrics:        metrics,
+	}
+	c, err := newAPIClient(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.bufferSize != 42 || cap(c.fieChan) != 42 {
+		t.Errorf("expected explicit bufferSize 42 preserved, got %d (chan cap %d)", cfg.bufferSize, cap(c.fieChan))
+	}
+	if cfg.reconnectDelay != 3*time.Second {
+		t.Errorf("expected explicit reconnectDelay preserved, got %s", cfg.reconnectDelay)
+	}
+	if cfg.sendTimeout != 2*time.Second {
+		t.Errorf("expected explicit sendTimeout preserved, got %s", cfg.sendTimeout)
+	}
+}
+
+// ---- push ----
+
+func TestPush_NilFIEIsDroppedAndCounted(t *testing.T) {
+	t.Parallel()
+	metrics := newTestMetrics()
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", bufferSize: 1, metrics: metrics})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c.push(nil)
+
+	if got := testutil.ToFloat64(metrics.APIClientFIEsDroppedTotal); got != 1 {
+		t.Errorf("expected dropped counter 1, got %v", got)
+	}
+	if len(c.fieChan) != 0 {
+		t.Error("expected channel to remain empty after a nil push")
+	}
+}
+
+func TestPush_SucceedsWhenSpaceAvailable(t *testing.T) {
+	t.Parallel()
+	metrics := newTestMetrics()
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", bufferSize: 2, metrics: metrics})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fie := testFIE(42)
+	c.push(fie)
+
+	if got := testutil.ToFloat64(metrics.APIClientFIEsDroppedTotal); got != 0 {
+		t.Errorf("did not expect any drops, got %v", got)
+	}
+	select {
+	case got := <-c.fieChan:
+		if got.ProbingDirectiveID != 42 {
+			t.Errorf("unexpected FIE dequeued: %+v", got)
+		}
+	default:
+		t.Error("expected FIE to be queued")
+	}
+}
+
+func TestPush_FullBufferDropsAndCounts(t *testing.T) {
+	t.Parallel()
+	metrics := newTestMetrics()
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", bufferSize: 1, metrics: metrics})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fie1 := testFIE(1)
+	fie2 := testFIE(2)
+
+	c.push(fie1) // fills the buffer (size 1)
+	c.push(fie2) // must be dropped
+
+	if got := testutil.ToFloat64(metrics.APIClientFIEsDroppedTotal); got != 1 {
+		t.Errorf("expected dropped counter 1, got %v", got)
+	}
+	select {
+	case got := <-c.fieChan:
+		if got != fie1 {
+			t.Error("expected the first FIE to remain queued, second to be dropped")
+		}
+	default:
+		t.Error("expected one FIE to remain queued")
+	}
+}
+
+// ---- streamOnce ----
+
+func TestStreamOnce_SuccessfulStreamingAndCleanShutdown(t *testing.T) {
+	t.Parallel()
+	fake := newFakeIngestServer(t)
+	metrics := newTestMetrics()
+
+	c, err := newAPIClient(&apiClientConfig{
+		address:    fake.addr,
+		bufferSize: 100,
+		metrics:    metrics,
+		logger:     discardLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- c.streamOnce(ctx) }()
+
+	waitForGauge(t, metrics.APIClientConnectionUp, 1)
+
+	const n = 5
+	for i := uint64(0); i < n; i++ {
+		c.push(testFIE(i))
+	}
+	fake.waitForCount(t, n, 2*time.Second)
+	waitForCounter(t, metrics.APIClientFIEsPushedTotal, n)
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("expected nil error on clean shutdown, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("streamOnce did not return after context cancellation")
+	}
+
+	waitForGauge(t, metrics.APIClientConnectionUp, 0)
+}
+
+// TestStreamOnce_CanceledBeforeAnyFIE covers cancellation when nothing has
+// ever been pushed — distinct from the clean-shutdown path in
+// TestStreamOnce_SuccessfulStreamingAndCleanShutdown, which cancels after
+// data has already flowed.
+func TestStreamOnce_CanceledBeforeAnyFIE(t *testing.T) {
+	t.Parallel()
+	fake := newFakeIngestServer(t)
+
+	metrics := newTestMetrics()
+	c, err := newAPIClient(&apiClientConfig{address: fake.addr, bufferSize: 100, metrics: metrics, logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	if err := c.streamOnce(ctx); err != nil {
+		t.Errorf("expected nil error on cancellation before any FIE was pushed, got %v", err)
+	}
+}
+
+func TestStreamOnce_MidStreamDisconnectIsDetected(t *testing.T) {
+	t.Parallel()
+	fake := newFakeIngestServer(t)
+	fake.closeAfterN = 2
+
+	metrics := newTestMetrics()
+	c, err := newAPIClient(&apiClientConfig{address: fake.addr, bufferSize: 100, metrics: metrics, logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- c.streamOnce(ctx) }()
+
+	waitForGauge(t, metrics.APIClientConnectionUp, 1)
+
+	// Push more than closeAfterN so a later send lands on the closed connection.
+	for i := uint64(0); i < 10; i++ {
+		c.push(testFIE(i))
+	}
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error after the server closed the connection mid-stream")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("streamOnce did not detect the mid-stream disconnect in time")
+	}
+
+	waitForGauge(t, metrics.APIClientConnectionUp, 0)
+}
+
+// TestStreamOnce_InvalidFIEIsDroppedNotSent covers the fie.ToProto()
+// error branch: a FIE missing its required DestinationAddress is dropped
+// and counted, without breaking the connection or blocking later,
+// well-formed FIEs from being sent normally.
+func TestStreamOnce_InvalidFIEIsDroppedNotSent(t *testing.T) {
+	t.Parallel()
+	fake := newFakeIngestServer(t)
+	metrics := newTestMetrics()
+
+	c, err := newAPIClient(&apiClientConfig{address: fake.addr, bufferSize: 100, metrics: metrics, logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- c.streamOnce(ctx) }()
+
+	waitForGauge(t, metrics.APIClientConnectionUp, 1)
+
+	invalid := &model.ForwardingInfoElement{ProbingDirectiveID: 1} // no DestinationAddress
+	c.push(invalid)
+	c.push(testFIE(2))
+	fake.waitForCount(t, 1, 2*time.Second)
+
+	if got := testutil.ToFloat64(metrics.APIClientFIEsDroppedTotal); got != 1 {
+		t.Errorf("expected the invalid FIE to be dropped and counted, got %v", got)
+	}
+	if fake.count() != 1 {
+		t.Errorf("expected only the valid FIE to reach the server, got %d", fake.count())
+	}
+	waitForCounter(t, metrics.APIClientFIEsPushedTotal, 1)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("streamOnce did not return after context cancellation")
+	}
+}
+
+// ---- run ----
+
+// TestRun_ReturnsImmediatelyIfAlreadyCanceled covers run()'s top-of-loop
+// ctx.Err() check specifically — every other run() test exits via the
+// select's <-ctx.Done() case instead, never looping back to hit this one.
+func TestRun_ReturnsImmediatelyIfAlreadyCanceled(t *testing.T) {
+	t.Parallel()
+	metrics := newTestMetrics()
+	c, err := newAPIClient(&apiClientConfig{address: "127.0.0.1:1", bufferSize: 100, metrics: metrics, logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled before run() is ever called
+
+	done := make(chan struct{})
+	go func() {
+		c.run(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("run did not return immediately for an already-canceled context")
+	}
+}
+
+// TestRun_RetriesOnFailureAndStopsOnCancel points at an address nothing is
+// listening on — a real, common failure mode (retina-api down, wrong port).
+func TestRun_RetriesOnFailureAndStopsOnCancel(t *testing.T) {
+	t.Parallel()
+
+	metrics := newTestMetrics()
+	c, err := newAPIClient(&apiClientConfig{
+		address:        "127.0.0.1:1", // port 1: nothing listens here
+		bufferSize:     100,
+		metrics:        metrics,
+		reconnectDelay: 10 * time.Millisecond,
+		logger:         discardLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		c.run(ctx)
+		close(done)
+	}()
+
+	// Let it retry a handful of times before stopping it.
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return after context cancellation")
+	}
+}
+
+func TestRun_SuccessfulSessionDoesNotRetry(t *testing.T) {
+	t.Parallel()
+	fake := newFakeIngestServer(t)
+
+	metrics := newTestMetrics()
+	c, err := newAPIClient(&apiClientConfig{
+		address:        fake.addr,
+		bufferSize:     100,
+		metrics:        metrics,
+		reconnectDelay: 10 * time.Millisecond,
+		logger:         discardLogger(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		c.run(ctx)
+		close(done)
+	}()
+
+	waitForGauge(t, metrics.APIClientConnectionUp, 1)
+	c.push(testFIE(7))
+	fake.waitForCount(t, 1, 2*time.Second)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("run did not return after cancel")
+	}
+
+	if attempts := fake.attempts.Load(); attempts != 1 {
+		t.Errorf("expected exactly one connection attempt for a healthy session, got %d", attempts)
+	}
+}

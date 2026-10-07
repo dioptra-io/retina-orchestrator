@@ -1,9 +1,7 @@
 // Copyright (c) 2025 Sorbonne Université
 // SPDX-License-Identifier: MIT
 
-// Package structures provides generic data structures for the orchestrator,
-// including a per-consumer queue and a ring buffer for FIE streaming.
-package structures
+package orchestrator
 
 import (
 	"context"

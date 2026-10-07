@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MIT
 
 // Package orchestrator implements the Retina orchestrator, which schedules
-// ProbingDirectives (PDs) to connected agents and streams the resulting
-// ForwardingInfoElements to HTTP clients.
+// ProbingDirectives (PDs) to connected agents and pushes the resulting
+// ForwardingInfoElements to retina-api for external streaming.
 package orchestrator
 
 import (
@@ -14,12 +14,13 @@ import (
 	"slices"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/api/v1"
-	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
+	"github.com/dioptra-io/retina-commons/v2/model"
+	wire "github.com/dioptra-io/retina-commons/v2/wire/v2"
 	"golang.org/x/sync/errgroup"
 )
 
 // Config is the main configuration struct used in the orchestrator.
+// All CLI flags are defined here; sub-components are configured from this struct.
 type Config struct {
 	// AgentAddress is the TCP listening address for agent connections, in the form "host:port".
 	AgentAddress      string
@@ -27,30 +28,60 @@ type Config struct {
 
 	// PDQueueSize is the number of PDs that can be queued per agent.
 	// Increase this value if agents are slow to consume directives.
-	PDQueueSize    int
-	RingBufferSize int
+	PDQueueSize int
 
-	// APIAddress is the TCP listening address for the HTTP API server, in the form "host:port".
+	// APIAddress is retina-api's ingest listener address, e.g. "retina0.lip6.fr:8123".
 	APIAddress string
-	// APIReadHeaderTimeout defaults to 5 seconds if zero.
-	APIReadHeaderTimeout time.Duration
+	// APIBufferSize is the outbound FIE buffer capacity. Defaults to 10,000 if zero.
+	APIBufferSize int
+	// APIReconnectDelay is the wait before retrying a dropped connection. Defaults to 5s if zero.
+	APIReconnectDelay time.Duration
+	// APISendTimeout is the deadline for sending one FIE. Defaults to 5s if zero.
+	APISendTimeout time.Duration
 
 	FIEFilterPolicy string
-	PDPath          string
 	Seed            uint64
-	// IssuanceRate is the target global issuance rate of probing directives
-	// (PDs per second, approximate).
-	IssuanceRate float64
-	// ImpactThreshold is the maximum number of concurrent directives allowed
-	// to impact a single address in the responsible probing algorithm.
-	ImpactThreshold float64
 	// Secret is the shared secret for agent authentication.
 	// This is an MVS feature and will be removed soon.
 	Secret string
+
+	// Scheduler parameters
+	PDPathV4     string
+	PDPathV6     string
+	IssuanceRate float64
+	// PDDiffPath is a PD diff file re-read on SIGHUP. Optional; hot-reload
+	// is disabled if empty.
+	PDDiffPath string
+	// ImpactThreshold is the maximum allowed probe rate (probes/second) on any
+	// single address in the responsible probing algorithm.
+	ImpactThreshold            float64
+	ActiveSetSize              int
+	ConsecutiveMissesThreshold int
+	MaxEvictions               int
 }
 
-// Validate checks all configuration fields and applies defaults where appropriate.
-// Returns an error if any required field is missing or invalid.
+// applyDefaults fills in zero-valued optional fields with their defaults.
+// It never rejects anything — call Validate afterward to check the result.
+// NewOrch calls both, in this order.
+func (c *Config) applyDefaults() {
+	if c.APIBufferSize == 0 {
+		c.APIBufferSize = 10_000 // smooths a brief reconnect blip, not a sustained outage
+	}
+	if c.APIReconnectDelay == 0 {
+		c.APIReconnectDelay = 5 * time.Second
+	}
+	if c.APISendTimeout == 0 {
+		c.APISendTimeout = 5 * time.Second
+	}
+	if c.FIEFilterPolicy == "" {
+		c.FIEFilterPolicy = "both"
+	}
+}
+
+// Validate checks all configuration fields and returns an error if any
+// required field is missing or invalid. It does not mutate c — call
+// applyDefaults first if zero-valued optional fields should be treated as
+// "use the default" rather than checked as-is.
 func (c *Config) Validate() error {
 	if c.AgentAddress == "" {
 		return fmt.Errorf("AgentAddress cannot be empty")
@@ -61,23 +92,40 @@ func (c *Config) Validate() error {
 	if c.PDQueueSize <= 0 {
 		return fmt.Errorf("PDQueueSize must be greater than zero: got %d", c.PDQueueSize)
 	}
-	if c.RingBufferSize <= 0 {
-		return fmt.Errorf("RingBufferSize must be greater than zero: got %d", c.RingBufferSize)
-	}
-	if c.APIAddress == "" {
-		return fmt.Errorf("APIAddress cannot be empty")
-	}
-	if c.APIReadHeaderTimeout == 0 {
-		c.APIReadHeaderTimeout = 5 * time.Second
-	}
-	if c.FIEFilterPolicy == "" {
-		c.FIEFilterPolicy = "both"
+	if err := c.validateAPIConfig(); err != nil {
+		return err
 	}
 	if !slices.Contains([]string{"any", "one", "both"}, c.FIEFilterPolicy) {
 		return fmt.Errorf("supported FIE filtering policies are 'any', 'one', or 'both' got %s", c.FIEFilterPolicy)
 	}
-	if c.PDPath == "" {
-		return fmt.Errorf("PDPath cannot be empty")
+	return c.validateSchedulerConfig()
+}
+
+// validateAPIConfig checks the fields governing the connection to
+// retina-api: APIAddress, APIBufferSize, APIReconnectDelay, APISendTimeout.
+func (c *Config) validateAPIConfig() error {
+	if c.APIAddress == "" {
+		return fmt.Errorf("APIAddress cannot be empty")
+	}
+	if c.APIBufferSize < 0 {
+		return fmt.Errorf("APIBufferSize cannot be negative: got %d", c.APIBufferSize)
+	}
+	if c.APIBufferSize > 5_000_000 {
+		return fmt.Errorf("APIBufferSize is implausibly large (%d): likely a config error", c.APIBufferSize)
+	}
+	if c.APIReconnectDelay < 0 {
+		return fmt.Errorf("APIReconnectDelay cannot be negative: got %s", c.APIReconnectDelay)
+	}
+	if c.APISendTimeout < 0 {
+		return fmt.Errorf("APISendTimeout cannot be negative: got %s", c.APISendTimeout)
+	}
+	return nil
+}
+
+// validateSchedulerConfig checks scheduler-specific configuration fields.
+func (c *Config) validateSchedulerConfig() error {
+	if c.PDPathV4 == "" && c.PDPathV6 == "" {
+		return fmt.Errorf("at least one of PDPathV4 or PDPathV6 must be provided")
 	}
 	if c.IssuanceRate <= 0 {
 		return fmt.Errorf("IssuanceRate must be greater than zero: got %f", c.IssuanceRate)
@@ -85,6 +133,17 @@ func (c *Config) Validate() error {
 	if c.ImpactThreshold <= 0 {
 		return fmt.Errorf("ImpactThreshold must be greater than zero: got %f", c.ImpactThreshold)
 	}
+	if c.ActiveSetSize <= 0 {
+		return fmt.Errorf("ActiveSetSize must be greater than zero: got %d", c.ActiveSetSize)
+	}
+	if c.ConsecutiveMissesThreshold <= 0 {
+		return fmt.Errorf("ConsecutiveMissesThreshold must be greater than zero: got %d", c.ConsecutiveMissesThreshold)
+	}
+	if c.MaxEvictions <= 0 {
+		return fmt.Errorf("MaxEvictions must be greater than zero: got %d", c.MaxEvictions)
+	}
+	// PDDiffPath is intentionally unvalidated here: it's optional, and an
+	// empty value simply disables hot-reload (see watchPDDiffReload).
 	return nil
 }
 
@@ -94,14 +153,17 @@ type orch struct {
 	metrics     *Metrics
 	scheduler   *Scheduler
 	agentServer *agentServer
-	apiServer   *apiServer
-	pdQueue     *structures.Queue[api.ProbingDirective]
-	ringBuffer  *structures.RingBuffer[api.ForwardingInfoElement]
+	apiClient   *apiClient
+	pdQueue     *Queue[model.ProbingDirective]
 }
 
 // NewOrch creates a new orchestrator from the given configuration. Returns an
 // error if the configuration is invalid or any component creation fails.
 func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, error) {
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+	config.applyDefaults()
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
@@ -112,27 +174,46 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 		return nil, fmt.Errorf("metrics cannot be nil")
 	}
 
+	// Copy after applyDefaults() (which mutates config) so the
+	// orchestrator's own reads can't race with the caller mutating the
+	// original afterward.
+	configCopy := *config
+	config = &configCopy
+
 	o := &orch{
 		config:  config,
 		logger:  logger,
 		metrics: metrics,
 	}
 
-	scheduler, err := NewScheduler(config.Seed, config.IssuanceRate, config.PDPath, logger.With("component", "scheduler"), metrics)
+	scheduler, err := NewScheduler(&SchedulerConfig{
+		Seed:                       config.Seed,
+		IssuanceRate:               config.IssuanceRate,
+		ImpactThreshold:            config.ImpactThreshold,
+		PDPathV4:                   config.PDPathV4,
+		PDPathV6:                   config.PDPathV6,
+		PDDiffPath:                 config.PDDiffPath,
+		ActiveSetSize:              config.ActiveSetSize,
+		ConsecutiveMissesThreshold: config.ConsecutiveMissesThreshold,
+		MaxEvictions:               config.MaxEvictions,
+	}, logger.With("component", "scheduler"), metrics)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating scheduler: %w", err)
 	}
 	o.scheduler = scheduler
 
-	apiServer, err := newAPIServer(&apiServerConfig{
-		address:           config.APIAddress,
-		readHeaderTimeout: config.APIReadHeaderTimeout,
-		fieHandler:        o.fieStreamHandler,
+	ac, err := newAPIClient(&apiClientConfig{
+		address:        config.APIAddress,
+		bufferSize:     config.APIBufferSize,
+		reconnectDelay: config.APIReconnectDelay,
+		sendTimeout:    config.APISendTimeout,
+		logger:         logger.With("component", "api_client"),
+		metrics:        metrics,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error on creating API server: %w", err)
+		return nil, fmt.Errorf("error on creating api client: %w", err)
 	}
-	o.apiServer = apiServer
+	o.apiClient = ac
 
 	agentServer, err := newAgentServer(&agentServerConfig{
 		bufferLength:     config.AgentBufferLength,
@@ -146,25 +227,27 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.agentServer = agentServer
 
-	pdQueue, err := structures.NewQueue[api.ProbingDirective](config.PDQueueSize)
+	pdQueue, err := NewQueue[model.ProbingDirective](config.PDQueueSize)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating pd queue: %w", err)
 	}
 	o.pdQueue = pdQueue
 
-	ringBuffer, err := structures.NewRingBuffer[api.ForwardingInfoElement](config.RingBufferSize)
-	if err != nil {
-		return nil, fmt.Errorf("error on creating ring buffer: %w", err)
-	}
-	o.ringBuffer = ringBuffer
-
 	return o, nil
 }
 
+// Run starts every orchestrator component and blocks until one fails or
+// ctx is canceled. apiClient.run always returns nil — a failed or dropped
+// connection to retina-api reconnects on its own and never brings down the
+// rest of the orchestrator (see api_client.go). runAgentServer/
+// runScheduler/runPDDiffReload return nil on clean shutdown and non-nil
+// only for failures that should stop the orchestrator via errgroup's
+// cancellation.
 func (o *orch) Run(parentCtx context.Context) error {
 	group, ctx := errgroup.WithContext(parentCtx)
 	group.Go(func() error {
-		return o.runAPIServer(ctx)
+		o.apiClient.run(ctx)
+		return nil
 	})
 	group.Go(func() error {
 		return o.runAgentServer(ctx)
@@ -172,19 +255,19 @@ func (o *orch) Run(parentCtx context.Context) error {
 	group.Go(func() error {
 		return o.runScheduler(ctx)
 	})
+	group.Go(func() error {
+		return o.runPDDiffReload(ctx)
+	})
 
 	return group.Wait()
 }
 
 func (o *orch) runScheduler(ctx context.Context) error {
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		pd := o.scheduler.NextPD(ctx)
+		if ctx.Err() != nil {
+			return nil
 		}
-
-		pd := o.scheduler.NextPD()
 		if pd == nil {
 			continue
 		}
@@ -199,24 +282,21 @@ func (o *orch) runScheduler(ctx context.Context) error {
 	}
 }
 
-func (o *orch) runAPIServer(ctx context.Context) error {
-	group, ctx := errgroup.WithContext(ctx)
-	group.Go(func() error {
-		return o.apiServer.listenAndServe()
-	})
-	group.Go(func() error {
-		<-ctx.Done()
-		return o.apiServer.close(3 * time.Second)
-	})
-	if err := group.Wait(); err != nil && !errors.Is(err, ctx.Err()) {
-		return err
-	}
-	return nil
+// runPDDiffReload listens for SIGHUP and applies PD diff files to the
+// running scheduler without restarting the orchestrator. If
+// config.PDDiffPath is empty, SIGHUP is still caught but ignored with a
+// warning. See watchPDDiffReload in scheduler.go for the mechanism.
+func (o *orch) runPDDiffReload(ctx context.Context) error {
+	return watchPDDiffReload(ctx, o.scheduler, o.config.PDDiffPath, o.logger.With("component", "pd_diff_reload"))
 }
 
-func (o *orch) runAgentServer(ctx context.Context) error {
+func (o *orch) runAgentServer(parentCtx context.Context) error {
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
 	group, ctx := errgroup.WithContext(ctx)
 	group.Go(func() error {
+		defer cancel() // wake the shutdown goroutine even if listenAndServe returns nil
 		return o.agentServer.listenAndServe()
 	})
 	group.Go(func() error {
@@ -227,47 +307,6 @@ func (o *orch) runAgentServer(ctx context.Context) error {
 		return err
 	}
 	return nil
-}
-
-func (o *orch) fieStreamHandler(s *fieClient) {
-	var closeReason string
-	consumer := o.ringBuffer.NewConsumer()
-	o.metrics.StreamClientsConnected.Inc()
-	o.metrics.StreamConnectionsTotal.Inc()
-	defer func() {
-		consumer.Close()
-		o.metrics.StreamClientsConnected.Dec()
-		o.metrics.StreamDisconnectionsTotal.WithLabelValues(closeReason).Inc()
-		o.logger.Debug("FIE stream closed", slog.String("reason", closeReason))
-	}()
-
-	for {
-		fie, seq, err := consumer.Pop(s.context())
-		if err != nil {
-			closeReason = "internal_error"
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				closeReason = "shutdown_or_disconnect"
-			}
-			return
-		}
-		seqFIE := &SequencedFIE{
-			ForwardingInfoElement: *fie,
-			SequenceNumber:        seq,
-		}
-
-		o.logger.Debug("Sending FIE to client",
-			slog.Uint64("seq", seq),
-			slog.Uint64("pd_id", fie.ProbingDirectiveID))
-		if err = s.sendFIE(seqFIE); err != nil {
-			closeReason = "internal_error"
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				closeReason = "shutdown_or_disconnect"
-			}
-			return
-		}
-		o.metrics.FIEsStreamedTotal.Inc()
-		o.metrics.StreamLagSeconds.Observe(time.Since(seqFIE.ProductionTimestamp).Seconds())
-	}
 }
 
 //nolint:funlen
@@ -300,19 +339,16 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 				slog.String("agent_id", status.agentID),
 				slog.Uint64("pd_id", fie.ProbingDirectiveID),
 				slog.Bool("complete", fie.NearInfo != nil && fie.FarInfo != nil))
+
 			if err := o.scheduler.UpdateFromFIE(fie); err != nil {
 				o.logger.Error("Failed to update scheduler from FIE", "agent_id", status.agentID, "err", err)
 			}
 
-			allow, err := o.filterFIE(fie)
-			if err != nil {
-				return fmt.Errorf("error on filtering FIE: %w", err)
-			}
-			if !allow {
+			if !o.filterFIE(fie) {
 				continue
 			}
 
-			_ = o.ringBuffer.Push(fie)
+			o.apiClient.push(fie)
 		}
 	})
 
@@ -346,31 +382,35 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 	}
 }
 
-func (o *orch) agentAuthHandler(auth api.AuthRequest) api.AuthResponse {
+// agentAuthHandler takes/returns *wire.AuthRequest/AuthResponse — pointers,
+// not values, since these generated proto messages embed a sync.Mutex
+// (via protoimpl.MessageState) that copylocks correctly flags if copied
+// by value. See authHandleFunc's doc comment in agent_server.go.
+func (o *orch) agentAuthHandler(auth *wire.AuthRequest) *wire.AuthResponse {
 	if auth.Secret == o.config.Secret {
-		return api.AuthResponse{
+		return &wire.AuthResponse{
 			Authenticated: true,
 			Message:       "authenticated",
 		}
 	}
 	o.logger.Warn("Agent authentication failed")
-	return api.AuthResponse{
+	return &wire.AuthResponse{
 		Authenticated: false,
 		Message:       "secret is not correct",
 	}
 }
 
 // filterFIE reports whether a FIE should be streamed based on the policy.
-// Returns true if the FIE is allowed.
-func (o *orch) filterFIE(fie *api.ForwardingInfoElement) (bool, error) {
+// No longer returns an error: the policy is validated once in
+// Config.Validate() against an immutable config copy, so the default
+// case below is unreachable in practice.
+func (o *orch) filterFIE(fie *model.ForwardingInfoElement) bool {
 	switch o.config.FIEFilterPolicy {
 	case "any": // allow all FIEs
-		return true, nil
-	case "both": // allow FIEs with two non-nil response addresses
-		return fie.NearInfo != nil && fie.FarInfo != nil, nil
+		return true
 	case "one": // allow FIEs with at least one non-nil response address
-		return fie.NearInfo != nil || fie.FarInfo != nil, nil
-	default:
-		return false, fmt.Errorf("unsupported fie filtering policy: %q", o.config.FIEFilterPolicy)
+		return fie.NearInfo != nil || fie.FarInfo != nil
+	default: // "both", already the only other value Config.Validate() allows
+		return fie.NearInfo != nil && fie.FarInfo != nil
 	}
 }

@@ -23,14 +23,19 @@ type Metrics struct {
 	PDsTotal             prometheus.Gauge
 	CycleDurationSeconds prometheus.Histogram
 	CyclesTotal          prometheus.Counter
-	PDsSkippedTotal      prometheus.Counter
 
-	// Streaming endpoint
-	StreamClientsConnected    prometheus.Gauge
-	StreamConnectionsTotal    prometheus.Counter
-	StreamDisconnectionsTotal *prometheus.CounterVec
-	FIEsStreamedTotal         prometheus.Counter
-	StreamLagSeconds          prometheus.Histogram
+	// PD replacement — labeled by agent_id
+	PDsReplacedBernoulliTotal *prometheus.CounterVec
+	PDsReplacedMissTotal      *prometheus.CounterVec
+	PDsEvictedTotal           *prometheus.CounterVec
+	PDsUnusedTotal            *prometheus.GaugeVec
+	// PDsActiveTotal is not per-agent since the active set is shared across agents.
+	PDsActiveTotal prometheus.Gauge
+
+	// apiClient (push connection to retina-api)
+	APIClientFIEsPushedTotal  prometheus.Counter
+	APIClientFIEsDroppedTotal prometheus.Counter
+	APIClientConnectionUp     prometheus.Gauge
 }
 
 // NewMetrics creates and registers all orchestrator metrics with the given registry.
@@ -69,7 +74,7 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 		// PD cycling
 		PDsTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Name: "retina_orchestrator_pds_total",
-			Help: "Total number of probing directives in the current list.",
+			Help: "Number of probing directives known to the scheduler (active and unused), including PD diffs applied on SIGHUP.",
 		}),
 		CycleDurationSeconds: factory.NewHistogram(prometheus.HistogramOpts{ // TODO: tune buckets once we have real cycle duration data.
 			Name:    "retina_orchestrator_cycle_duration_seconds",
@@ -80,32 +85,41 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 			Name: "retina_orchestrator_cycles_total",
 			Help: "Total number of completed PD cycles.",
 		}),
-		PDsSkippedTotal: factory.NewCounter(prometheus.CounterOpts{
-			Name: "retina_orchestrator_pds_skipped_total",
-			Help: "Total number of directives skipped by the Bernoulli experiment due to issuance probability < 1.",
+
+		// PD replacement
+		PDsReplacedBernoulliTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_pds_replaced_bernoulli_total",
+			Help: "Total number of probing directives replaced due to failed Bernoulli experiment (responsible probing), labeled by agent ID.",
+		}, []string{"agent_id"}),
+		PDsReplacedMissTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_pds_replaced_miss_total",
+			Help: "Total number of probing directives replaced due to consecutive misses threshold, labeled by agent ID.",
+		}, []string{"agent_id"}),
+		PDsEvictedTotal: factory.NewCounterVec(prometheus.CounterOpts{
+			Name: "retina_orchestrator_pds_evicted_total",
+			Help: "Total number of probing directives permanently evicted from the pool, labeled by agent ID.",
+		}, []string{"agent_id"}),
+		PDsUnusedTotal: factory.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "retina_orchestrator_pds_unused_total",
+			Help: "Current number of probing directives in the unused pool, labeled by IP version (4 or 6).",
+		}, []string{"ip_version"}),
+		PDsActiveTotal: factory.NewGauge(prometheus.GaugeOpts{
+			Name: "retina_orchestrator_pds_active_total",
+			Help: "Current number of probing directives in the active set.",
 		}),
 
-		// Streaming endpoint
-		StreamClientsConnected: factory.NewGauge(prometheus.GaugeOpts{
-			Name: "retina_orchestrator_stream_clients_connected",
-			Help: "Number of currently active streaming clients.",
+		// Streaming to retina-api
+		APIClientFIEsPushedTotal: factory.NewCounter(prometheus.CounterOpts{
+			Name: "retina_orchestrator_api_client_fies_pushed_total",
+			Help: "Total number of FIEs sent to retina-api.",
 		}),
-		StreamConnectionsTotal: factory.NewCounter(prometheus.CounterOpts{
-			Name: "retina_orchestrator_stream_connections_total",
-			Help: "Total number of streaming connections opened.",
+		APIClientFIEsDroppedTotal: factory.NewCounter(prometheus.CounterOpts{
+			Name: "retina_orchestrator_api_client_fies_dropped_total",
+			Help: "Total number of FIEs dropped before reaching retina-api: outbound buffer full or conversion failure.",
 		}),
-		StreamDisconnectionsTotal: factory.NewCounterVec(prometheus.CounterOpts{
-			Name: "retina_orchestrator_stream_disconnections_total",
-			Help: "Total number of streaming disconnections, labeled by reason.",
-		}, []string{"reason"}),
-		FIEsStreamedTotal: factory.NewCounter(prometheus.CounterOpts{
-			Name: "retina_orchestrator_fies_streamed_total",
-			Help: "Total number of FIEs pushed to streaming clients.",
-		}),
-		StreamLagSeconds: factory.NewHistogram(prometheus.HistogramOpts{
-			Name:    "retina_orchestrator_stream_lag_seconds",
-			Help:    "Time between receiving a FIE from an agent and delivering it to streaming clients.",
-			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0},
+		APIClientConnectionUp: factory.NewGauge(prometheus.GaugeOpts{
+			Name: "retina_orchestrator_api_client_connection_up",
+			Help: "1 if the push connection to retina-api is currently established, 0 otherwise.",
 		}),
 	}
 }

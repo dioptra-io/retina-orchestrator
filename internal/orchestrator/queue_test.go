@@ -1,5 +1,5 @@
 // Tests provide 100% coverage of queue.go.
-package structures
+package orchestrator
 
 import (
 	"context"
