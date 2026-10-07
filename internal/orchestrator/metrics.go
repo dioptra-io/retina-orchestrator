@@ -74,7 +74,7 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 		// PD cycling
 		PDsTotal: factory.NewGauge(prometheus.GaugeOpts{
 			Name: "retina_orchestrator_pds_total",
-			Help: "Total number of probing directives loaded at startup.",
+			Help: "Number of probing directives known to the scheduler (active and unused), including PD diffs applied on SIGHUP.",
 		}),
 		CycleDurationSeconds: factory.NewHistogram(prometheus.HistogramOpts{ // TODO: tune buckets once we have real cycle duration data.
 			Name:    "retina_orchestrator_cycle_duration_seconds",
@@ -111,11 +111,11 @@ func NewMetrics(registry prometheus.Registerer) *Metrics {
 		// Streaming to retina-api
 		APIClientFIEsPushedTotal: factory.NewCounter(prometheus.CounterOpts{
 			Name: "retina_orchestrator_api_client_fies_pushed_total",
-			Help: "Total number of FIEs pushed to retina-api.",
+			Help: "Total number of FIEs sent to retina-api.",
 		}),
 		APIClientFIEsDroppedTotal: factory.NewCounter(prometheus.CounterOpts{
 			Name: "retina_orchestrator_api_client_fies_dropped_total",
-			Help: "Total number of FIEs dropped because the outbound buffer to retina-api was full.",
+			Help: "Total number of FIEs dropped before reaching retina-api: outbound buffer full or conversion failure.",
 		}),
 		APIClientConnectionUp: factory.NewGauge(prometheus.GaugeOpts{
 			Name: "retina_orchestrator_api_client_connection_up",

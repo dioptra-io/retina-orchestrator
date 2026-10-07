@@ -34,6 +34,10 @@ func main() {
 
 //nolint:funlen
 func run() error {
+	// Catch SIGHUP from the start: until the reload watcher registers, the
+	// default action would terminate the process (e.g. during PD loading).
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGHUP)
+
 	var (
 		apiAddr                    = flag.String("api-addr", envOrDefault("RETINA_API_ADDR", ""), "retina-api ingest listener address, e.g. retina0.lip6.fr:8123")
 		apiBufferSize              = flag.Int("api-buffer-size", envOrDefaultInt("RETINA_API_BUFFER_SIZE", 10_000), "Outbound FIE buffer capacity toward retina-api")
@@ -114,9 +118,6 @@ func run() error {
 		"metrics_addr", *metricsAddr,
 	)
 
-	// Reload watcher runs inside orch.Run alongside the agent/scheduler
-	// subsystems, sharing the same shutdown context — no separate goroutine
-	// needed here. If pdDiffPath is empty, hot-reload via SIGHUP is disabled.
 	if err := orch.Run(ctx); !errors.Is(err, ctx.Err()) {
 		return err
 	}

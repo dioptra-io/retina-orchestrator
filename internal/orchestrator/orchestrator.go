@@ -14,9 +14,8 @@ import (
 	"slices"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/model"
-	wire "github.com/dioptra-io/retina-commons/wire/v2"
-	"github.com/dioptra-io/retina-orchestrator/internal/orchestrator/structures"
+	"github.com/dioptra-io/retina-commons/v2/model"
+	wire "github.com/dioptra-io/retina-commons/v2/wire/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -155,7 +154,7 @@ type orch struct {
 	scheduler   *Scheduler
 	agentServer *agentServer
 	apiClient   *apiClient
-	pdQueue     *structures.Queue[model.ProbingDirective]
+	pdQueue     *Queue[model.ProbingDirective]
 }
 
 // NewOrch creates a new orchestrator from the given configuration. Returns an
@@ -228,7 +227,7 @@ func NewOrch(config *Config, logger *slog.Logger, metrics *Metrics) (*orch, erro
 	}
 	o.agentServer = agentServer
 
-	pdQueue, err := structures.NewQueue[model.ProbingDirective](config.PDQueueSize)
+	pdQueue, err := NewQueue[model.ProbingDirective](config.PDQueueSize)
 	if err != nil {
 		return nil, fmt.Errorf("error on creating pd queue: %w", err)
 	}
@@ -350,7 +349,6 @@ func (o *orch) agentHandler(status *agentAuthStatus, s *agentStream) {
 			}
 
 			o.apiClient.push(fie)
-			o.metrics.APIClientFIEsPushedTotal.Inc()
 		}
 	})
 

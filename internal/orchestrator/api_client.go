@@ -9,8 +9,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/framing"
-	"github.com/dioptra-io/retina-commons/model"
+	"github.com/dioptra-io/retina-commons/v2/framing"
+	"github.com/dioptra-io/retina-commons/v2/model"
 )
 
 // apiClientKeepalivePeriod matches agentKeepalivePeriod (agent_server.go).
@@ -137,6 +137,7 @@ func (c *apiClient) streamOnce(ctx context.Context) error {
 				}
 				return fmt.Errorf("failed to send FIE: %w", err)
 			}
+			c.config.metrics.APIClientFIEsPushedTotal.Inc()
 		case <-ctx.Done():
 			return nil
 		}

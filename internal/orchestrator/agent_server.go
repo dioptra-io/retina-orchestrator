@@ -13,9 +13,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/framing"
-	"github.com/dioptra-io/retina-commons/model"
-	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"github.com/dioptra-io/retina-commons/v2/framing"
+	"github.com/dioptra-io/retina-commons/v2/model"
+	wire "github.com/dioptra-io/retina-commons/v2/wire/v2"
 )
 
 // ErrServerShutdown is returned by agentServer.listenAndServe once close

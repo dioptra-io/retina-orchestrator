@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/dioptra-io/retina-commons/framing"
-	"github.com/dioptra-io/retina-commons/model"
-	wire "github.com/dioptra-io/retina-commons/wire/v2"
+	"github.com/dioptra-io/retina-commons/v2/framing"
+	"github.com/dioptra-io/retina-commons/v2/model"
+	wire "github.com/dioptra-io/retina-commons/v2/wire/v2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -29,6 +29,9 @@ import (
 
 func newTestMetrics() *Metrics {
 	return &Metrics{
+		APIClientFIEsPushedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "test_api_client_fies_pushed_total",
+		}),
 		APIClientFIEsDroppedTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "test_api_client_fies_dropped_total",
 		}),
@@ -53,6 +56,22 @@ func waitForGauge(t *testing.T, g prometheus.Gauge, want float64) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("gauge did not reach %v within %s (last value %v)", want, timeout, testutil.ToFloat64(g))
+}
+
+// waitForCounter polls because the client increments the counter after
+// framing.Send returns, which can be after the server has already received
+// the FIE.
+func waitForCounter(t *testing.T, c prometheus.Counter, want float64) {
+	t.Helper()
+	const timeout = time.Second
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if testutil.ToFloat64(c) == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("counter did not reach %v within %s (last value %v)", want, timeout, testutil.ToFloat64(c))
 }
 
 // testFIE returns a minimal but valid FIE — DestinationAddress and
@@ -358,6 +377,7 @@ func TestStreamOnce_SuccessfulStreamingAndCleanShutdown(t *testing.T) {
 		c.push(testFIE(i))
 	}
 	fake.waitForCount(t, n, 2*time.Second)
+	waitForCounter(t, metrics.APIClientFIEsPushedTotal, n)
 
 	cancel()
 	select {
@@ -463,6 +483,7 @@ func TestStreamOnce_InvalidFIEIsDroppedNotSent(t *testing.T) {
 	if fake.count() != 1 {
 		t.Errorf("expected only the valid FIE to reach the server, got %d", fake.count())
 	}
+	waitForCounter(t, metrics.APIClientFIEsPushedTotal, 1)
 
 	cancel()
 	select {

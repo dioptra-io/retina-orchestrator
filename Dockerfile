@@ -7,8 +7,6 @@ RUN go mod download
 
 COPY . .
 
-# docs/ must exist before swag init runs; the .gitkeep ensures the directory
-# is tracked in git but swag will overwrite the generated files at build time.
 RUN go install github.com/swaggo/swag/cmd/swag@v1.16.6 && \
     swag init --parseDependency --parseInternal \
               -g main.go \
