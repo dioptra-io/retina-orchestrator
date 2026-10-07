@@ -17,10 +17,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: Stub docs package
-        run: |
-          mkdir -p docs
-          printf 'package docs\n' > docs/docs.go
       - uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2

@@ -1,4 +1,4 @@
-name: CI Coverage
+name: Test & Coverage
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  coverage:
+  test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -20,11 +20,6 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-
-      - name: Stub docs package
-        run: |
-          mkdir -p docs
-          printf 'package docs\n' > docs/docs.go
 
       - name: Run tests with atomic coverage
         run: go test ./... -race -count=1 -coverpkg=./... -coverprofile=coverage.out -covermode=atomic
