@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand/v2"
 	"net"
 	"os"
@@ -55,18 +56,119 @@ type pdState struct {
 	markedForRemoval   bool
 }
 
-// unusedPD is a lightweight ProbingDirective in the unused pool, omitting
-// scheduling state only meaningful for active directives.
+type nextHeaderKind uint8
+
+const (
+	nextHeaderNone nextHeaderKind = iota
+	nextHeaderICMP
+	nextHeaderUDP
+	nextHeaderICMPv6
+)
+
+// unusedPD is a ProbingDirective in the unused pool. It is deliberately
+// pointer-free: the pools hold millions of entries, and the GC must scan
+// every pointer it can reach, so a []unusedPD costs memory (40 bytes per PD,
+// see TestUnusedPDSize) but no mark time. The agent ID is not stored (pools
+// are keyed by agent). NextHeader is flattened into two half words; nextHeaderKind
+// says which variant they belong to (for UDP, the ports).
 type unusedPD struct {
-	evictionCount int
-	directive     *model.ProbingDirective
+	probingDirectiveID            uint64
+	destinationAddress            [16]byte // not net.IP/netip.Addr: both hold pointers; IPv4 is stored in mapped form
+	firstHalfWord, secondHalfWord uint32
+	ipVersion                     uint8
+	protocol                      uint8
+	nearTTL                       uint8
+	nextHeaderKind                nextHeaderKind
+	evictionCount                 uint16
 }
 
-func (u *unusedPD) promote() *pdState {
+// newUnusedPD fails on a value that doesn't fit. A NextHeader variant added to
+// the wire format would be dropped here, which TestNextHeaderVariantsSupported
+// guards against.
+func newUnusedPD(pd *model.ProbingDirective, evictionCount int) (unusedPD, error) {
+	if pd == nil {
+		return unusedPD{}, fmt.Errorf("nil probing directive")
+	}
+	ip16 := pd.DestinationAddress.To16()
+	if ip16 == nil {
+		return unusedPD{}, fmt.Errorf("invalid destination address %v", pd.DestinationAddress)
+	}
+	if pd.IPVersion != wire.IPVersion_IP_VERSION_IPV4 && pd.IPVersion != wire.IPVersion_IP_VERSION_IPV6 {
+		return unusedPD{}, fmt.Errorf("unsupported ip_version %d", pd.IPVersion)
+	}
+	if _, ok := wire.Protocol_name[int32(pd.Protocol)]; !ok {
+		return unusedPD{}, fmt.Errorf("unknown protocol %d", pd.Protocol)
+	}
+
+	u := unusedPD{
+		probingDirectiveID: pd.ProbingDirectiveID,
+		ipVersion:          uint8(pd.IPVersion), //nolint:gosec // defined enum values fit, see TestEnumsFitUnusedPD
+		protocol:           uint8(pd.Protocol),  //nolint:gosec // defined enum values fit, see TestEnumsFitUnusedPD
+		nearTTL:            pd.NearTTL,
+		evictionCount:      uint16(min(max(evictionCount, 0), math.MaxUint16)), //nolint:gosec // clamped to range
+	}
+	copy(u.destinationAddress[:], ip16)
+
+	switch nh := pd.NextHeader.GetHeader().(type) {
+	case nil:
+		u.nextHeaderKind = nextHeaderNone
+	case *wire.NextHeader_IcmpNextHeader:
+		u.nextHeaderKind = nextHeaderICMP
+		u.firstHalfWord = nh.IcmpNextHeader.GetFirstHalfWord()
+		u.secondHalfWord = nh.IcmpNextHeader.GetSecondHalfWord()
+	case *wire.NextHeader_UdpNextHeader:
+		u.nextHeaderKind = nextHeaderUDP
+		u.firstHalfWord = nh.UdpNextHeader.GetSourcePort()
+		u.secondHalfWord = nh.UdpNextHeader.GetDestinationPort()
+	case *wire.NextHeader_Icmpv6NextHeader:
+		u.nextHeaderKind = nextHeaderICMPv6
+		u.firstHalfWord = nh.Icmpv6NextHeader.GetFirstHalfWord()
+		u.secondHalfWord = nh.Icmpv6NextHeader.GetSecondHalfWord()
+	}
+	return u, nil
+}
+
+// unpack rebuilds the directive. An empty NextHeader message (set, but with
+// no variant) comes back as nil.
+func (u unusedPD) unpack(agentID string) *model.ProbingDirective {
+	var dst net.IP
+	if v4 := net.IP(u.destinationAddress[:]).To4(); v4 != nil {
+		dst = append(net.IP(nil), v4...)
+	} else {
+		dst = append(net.IP(nil), u.destinationAddress[:]...)
+	}
+
+	pd := &model.ProbingDirective{
+		ProbingDirectiveID: u.probingDirectiveID,
+		IPVersion:          wire.IPVersion(u.ipVersion),
+		Protocol:           wire.Protocol(u.protocol),
+		AgentID:            agentID,
+		DestinationAddress: dst,
+		NearTTL:            u.nearTTL,
+	}
+	switch u.nextHeaderKind {
+	case nextHeaderNone:
+	case nextHeaderICMP:
+		pd.NextHeader = &wire.NextHeader{Header: &wire.NextHeader_IcmpNextHeader{
+			IcmpNextHeader: &wire.ICMPNextHeader{FirstHalfWord: u.firstHalfWord, SecondHalfWord: u.secondHalfWord},
+		}}
+	case nextHeaderUDP:
+		pd.NextHeader = &wire.NextHeader{Header: &wire.NextHeader_UdpNextHeader{
+			UdpNextHeader: &wire.UDPNextHeader{SourcePort: u.firstHalfWord, DestinationPort: u.secondHalfWord},
+		}}
+	case nextHeaderICMPv6:
+		pd.NextHeader = &wire.NextHeader{Header: &wire.NextHeader_Icmpv6NextHeader{
+			Icmpv6NextHeader: &wire.ICMPv6NextHeader{FirstHalfWord: u.firstHalfWord, SecondHalfWord: u.secondHalfWord},
+		}}
+	}
+	return pd
+}
+
+func (u unusedPD) promote(agentID string) *pdState {
 	return &pdState{
 		issuanceProb:  1.0,
-		evictionCount: u.evictionCount,
-		directive:     u.directive,
+		evictionCount: int(u.evictionCount),
+		directive:     u.unpack(agentID),
 	}
 }
 
@@ -82,6 +184,14 @@ func ipIdx(ipVersion wire.IPVersion) int {
 // ipVersionLabel returns a compact label for the IP version, used in metrics.
 func ipVersionLabel(ipVersion wire.IPVersion) string {
 	if ipVersion == wire.IPVersion_IP_VERSION_IPV6 {
+		return "6"
+	}
+	return "4"
+}
+
+// poolLabel returns the metrics label for an unused-pool index (0=IPv4, 1=IPv6).
+func poolLabel(idx int) string {
+	if idx == 1 {
 		return "6"
 	}
 	return "4"
@@ -105,8 +215,15 @@ type Scheduler struct {
 	impactRecords map[string]*impactRecord
 	// unusedByAgent maps each agent ID to a 2-element array of unused PD pools,
 	// indexed by IP version (0=IPv4, 1=IPv6). Replacement is protocol-matched
-	// to maintain a stable IPv4/IPv6 distribution in the active set.
-	unusedByAgent map[string][2][]*unusedPD
+	// to maintain a stable IPv4/IPv6 distribution in the active set. The pools
+	// hold pointer-free unusedPD values, so the garbage collector never scans
+	// them (see unusedPD).
+	unusedByAgent map[string][2][]unusedPD
+	// known holds the ID of every PD in the scheduler: active (including
+	// tombstoned ones) and unused. An ID leaves the set when its PD is
+	// permanently evicted or removed from the unused pool. It makes duplicate
+	// checks in ApplyDiff O(1) without rebuilding a set of every ID.
+	known map[uint64]struct{}
 
 	lastIssuance   time.Time
 	lastCycleBegin time.Time
@@ -117,86 +234,124 @@ type Scheduler struct {
 	random     *rand.Rand // used for the Bernoulli experiment in NextPD
 }
 
-// loadPDsIntoPool fills the active set and unused pool, splitting active
-// slots evenly across agents (floor division, remainder dropped) rather than
-// a flat maxActive cutoff, which would let a larger agent pool dominate.
-// seen tracks PD IDs across both V4 and V6 calls to detect duplicates.
-func loadPDsIntoPool(
-	pds []*model.ProbingDirective,
+// loadedPDs holds the PDs of one file as unusedPD values, grouped by agent in
+// file order.
+type loadedPDs struct {
+	byAgent    map[string][]unusedPD
+	agentOrder []string
+	count      int
+}
+
+// loadPDFile streams the PD file at path one line at a time, retaining only
+// the 40-byte unusedPD form of each PD. An empty
+// path yields an empty loadedPDs. known tracks PD IDs across both the V4 and V6
+// files to detect duplicates, and is filled as a side effect.
+func loadPDFile(path string, known map[uint64]struct{}) (*loadedPDs, error) {
+	loaded := &loadedPDs{byAgent: make(map[string][]unusedPD)}
+	if path == "" {
+		return loaded, nil
+	}
+	err := forEachPD(path, func(pd *model.ProbingDirective) error {
+		if _, exists := known[pd.ProbingDirectiveID]; exists {
+			return fmt.Errorf("duplicate PD ID %d", pd.ProbingDirectiveID)
+		}
+		u, err := newUnusedPD(pd, 0)
+		if err != nil {
+			return fmt.Errorf("PD %d: %w", pd.ProbingDirectiveID, err)
+		}
+		known[pd.ProbingDirectiveID] = struct{}{}
+
+		if _, ok := loaded.byAgent[pd.AgentID]; !ok {
+			loaded.agentOrder = append(loaded.agentOrder, pd.AgentID)
+		}
+		loaded.byAgent[pd.AgentID] = append(loaded.byAgent[pd.AgentID], u)
+		loaded.count++
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return loaded, nil
+}
+
+// distributePDs fills the active set and unused pools from a loaded file,
+// splitting active slots evenly across agents (floor division, remainder
+// dropped) rather than a flat maxActive cutoff, which would let a larger
+// agent pool dominate. For each agent, the first quota PDs in file order
+// become active and the rest go to its unused pools.
+func distributePDs(
+	loaded *loadedPDs,
 	maxActive int,
 	pdMap map[uint64]*pdState,
 	indices *[]uint64,
-	unusedByAgent map[string][2][]*unusedPD,
-	seen map[uint64]struct{},
+	unusedByAgent map[string][2][]unusedPD,
 	logger *slog.Logger,
-) error {
-	byAgent := make(map[string][]*model.ProbingDirective)
-	var agentOrder []string
-	for _, pd := range pds {
-		if _, exists := seen[pd.ProbingDirectiveID]; exists {
-			return fmt.Errorf("duplicate PD ID %d", pd.ProbingDirectiveID)
-		}
-		seen[pd.ProbingDirectiveID] = struct{}{}
-
-		if _, ok := byAgent[pd.AgentID]; !ok {
-			agentOrder = append(agentOrder, pd.AgentID)
-		}
-		byAgent[pd.AgentID] = append(byAgent[pd.AgentID], pd)
+) {
+	if len(loaded.agentOrder) == 0 {
+		return
 	}
-	if len(agentOrder) == 0 {
-		return nil
-	}
-	quota := maxActive / len(agentOrder)
+	quota := maxActive / len(loaded.agentOrder)
 	if quota == 0 {
 		logger.Warn("Active set too small for number of agents, no active PDs assigned",
 			slog.Int("max_active", maxActive),
-			slog.Int("num_agents", len(agentOrder)))
+			slog.Int("num_agents", len(loaded.agentOrder)))
 	}
 
-	for _, agentID := range agentOrder {
-		for i, pd := range byAgent[agentID] {
-			if i < quota {
-				pdMap[pd.ProbingDirectiveID] = &pdState{
-					directive:    pd,
-					issuanceProb: 1.0,
-				}
-				*indices = append(*indices, pd.ProbingDirectiveID)
-			} else {
-				pools := unusedByAgent[pd.AgentID]
-				ipVersion := ipIdx(pd.IPVersion)
-				pools[ipVersion] = append(pools[ipVersion], &unusedPD{
-					directive: pd,
-				})
-				unusedByAgent[pd.AgentID] = pools
+	for _, agentID := range loaded.agentOrder {
+		agentPDs := loaded.byAgent[agentID]
+		numActive := min(quota, len(agentPDs))
+		for _, u := range agentPDs[:numActive] {
+			pd := u.unpack(agentID)
+			pdMap[pd.ProbingDirectiveID] = &pdState{
+				directive:    pd,
+				issuanceProb: 1.0,
 			}
+			*indices = append(*indices, pd.ProbingDirectiveID)
 		}
+		addToPools(unusedByAgent, agentID, agentPDs[numActive:])
+		delete(loaded.byAgent, agentID)
 	}
-	return nil
 }
 
-// loadAllPDs reads the V4 and V6 PD files from config. Either path may be empty,
-// but at least one file must produce non-zero PDs.
-func loadAllPDs(config *SchedulerConfig) ([]*model.ProbingDirective, []*model.ProbingDirective, error) {
-	var (
-		err          error
-		v4pds, v6pds []*model.ProbingDirective
-	)
-	if config.PDPathV4 != "" {
-		v4pds, err = readPDs(config.PDPathV4)
-		if err != nil {
-			return nil, nil, fmt.Errorf("cannot read IPv4 PD file: %w", err)
+// addToPools appends pds to the agent's unused pools. In the common case
+// (every PD of one IP version, pool still empty) the slice is adopted as is,
+// without copying.
+func addToPools(unusedByAgent map[string][2][]unusedPD, agentID string, pds []unusedPD) {
+	if len(pds) == 0 {
+		return
+	}
+	pools := unusedByAgent[agentID]
+	v := ipIdx(wire.IPVersion(pds[0].ipVersion))
+	sameVersion := true
+	for _, u := range pds {
+		if ipIdx(wire.IPVersion(u.ipVersion)) != v {
+			sameVersion = false
+			break
 		}
 	}
-	if config.PDPathV6 != "" {
-		v6pds, err = readPDs(config.PDPathV6)
-		if err != nil {
-			return nil, nil, fmt.Errorf("cannot read IPv6 PD file: %w", err)
+	if sameVersion && len(pools[v]) == 0 {
+		pools[v] = pds
+	} else {
+		for _, u := range pds {
+			i := ipIdx(wire.IPVersion(u.ipVersion))
+			pools[i] = append(pools[i], u)
 		}
 	}
-	if len(v4pds) == 0 && len(v6pds) == 0 {
-		return nil, nil, fmt.Errorf("invalid arguments: both PD files are empty")
+	unusedByAgent[agentID] = pools
+}
+
+// setPoolGauges sets the PD gauges once the initial load is done.
+func setPoolGauges(metrics *Metrics, active int, unusedByAgent map[string][2][]unusedPD) {
+	metrics.PDsActiveTotal.Set(float64(active))
+	for v := range 2 {
+		total := 0
+		for _, pools := range unusedByAgent {
+			total += len(pools[v])
+		}
+		if total > 0 {
+			metrics.PDsUnusedTotal.WithLabelValues(poolLabel(v)).Set(float64(total))
+		}
 	}
-	return v4pds, v6pds, nil
 }
 
 // NewScheduler creates a new Scheduler from the given configuration.
@@ -220,57 +375,50 @@ func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics
 	configCopy := *config
 	config = &configCopy
 
-	v4pds, v6pds, err := loadAllPDs(config)
+	known := make(map[uint64]struct{}, countLines(config.PDPathV4)+countLines(config.PDPathV6))
+	v4file, err := loadPDFile(config.PDPathV4, known)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot read IPv4 PD file: %w", err)
+	}
+	v6file, err := loadPDFile(config.PDPathV6, known)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read IPv6 PD file: %w", err)
+	}
+	if v4file.count == 0 && v6file.count == 0 {
+		return nil, fmt.Errorf("invalid arguments: both PD files are empty")
 	}
 
 	logger.Info("Scheduler loaded directives",
-		slog.Int("v4_count", len(v4pds)),
+		slog.Int("v4_count", v4file.count),
 		slog.String("v4_file", config.PDPathV4),
-		slog.Int("v6_count", len(v6pds)),
+		slog.Int("v6_count", v6file.count),
 		slog.String("v6_file", config.PDPathV6))
 
 	pdMap := make(map[uint64]*pdState, config.ActiveSetSize)
 	indices := make([]uint64, 0, config.ActiveSetSize)
-	unusedByAgent := make(map[string][2][]*unusedPD)
+	unusedByAgent := make(map[string][2][]unusedPD)
 
 	halfActive := config.ActiveSetSize / 2
 
 	// When only one protocol is present, give all active set slots to that protocol.
 	v4Active, v6Active := halfActive, halfActive
-	if len(v4pds) == 0 {
+	if v4file.count == 0 {
 		v6Active = config.ActiveSetSize
 	}
-	if len(v6pds) == 0 {
+	if v6file.count == 0 {
 		v4Active = config.ActiveSetSize
 	}
 
-	seen := make(map[uint64]struct{}, len(v4pds)+len(v6pds))
-	if err := loadPDsIntoPool(v4pds, v4Active, pdMap, &indices, unusedByAgent, seen, logger); err != nil {
-		return nil, fmt.Errorf("IPv4 PD file: %w", err)
-	}
-	if err := loadPDsIntoPool(v6pds, v6Active, pdMap, &indices, unusedByAgent, seen, logger); err != nil {
-		return nil, fmt.Errorf("IPv6 PD file: %w", err)
-	}
+	distributePDs(v4file, v4Active, pdMap, &indices, unusedByAgent, logger)
+	distributePDs(v6file, v6Active, pdMap, &indices, unusedByAgent, logger)
 
 	randomizer, err := newRandomizer(config.Seed, indices)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create randomizer: %w", err)
 	}
 
-	totalPDs := len(v4pds) + len(v6pds)
-	metrics.PDsTotal.Set(float64(totalPDs))
-	metrics.PDsActiveTotal.Set(float64(len(pdMap)))
-	for _, ipVer := range []wire.IPVersion{wire.IPVersion_IP_VERSION_IPV4, wire.IPVersion_IP_VERSION_IPV6} {
-		total := 0
-		for _, pools := range unusedByAgent {
-			total += len(pools[ipIdx(ipVer)])
-		}
-		if total > 0 {
-			metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(ipVer)).Set(float64(total))
-		}
-	}
+	metrics.PDsTotal.Set(float64(v4file.count + v6file.count))
+	setPoolGauges(metrics, len(pdMap), unusedByAgent)
 
 	return &Scheduler{
 		logger:         logger,
@@ -279,6 +427,7 @@ func NewScheduler(config *SchedulerConfig, logger *slog.Logger, metrics *Metrics
 		pdMap:          pdMap,
 		impactRecords:  make(map[string]*impactRecord),
 		unusedByAgent:  unusedByAgent,
+		known:          known,
 		issuancePeriod: time.Duration(float64(time.Second) / config.IssuanceRate),
 		randomizer:     randomizer,
 		random:         rand.New(rand.NewPCG(config.Seed, 0)), // #nosec G404
@@ -299,6 +448,9 @@ const maxIssuanceLag = 100 * time.Millisecond
 // Issuance slots lie on a fixed grid spaced issuancePeriod apart, so a late
 // wakeup is made up by the following slots rather than lost, up to
 // maxIssuanceLag.
+//
+// NextPD must be called from a single goroutine: the slot reservation and the
+// cycle bookkeeping are not atomic across the wait.
 func (s *Scheduler) NextPD(ctx context.Context) *model.ProbingDirective {
 	s.mutex.Lock()
 	oldCycle := s.randomizer.Cycle()
@@ -390,25 +542,32 @@ func (s *Scheduler) waitUntil(ctx context.Context, nextTime time.Time) bool {
 // by a PD diff (see ApplyDiff). Must be called with s.mutex held.
 func (s *Scheduler) recycleOrEvict(pd *pdState) {
 	agentID := pd.directive.AgentID
-	ipVersion := ipIdx(pd.directive.IPVersion)
 	if !pd.markedForRemoval && pd.evictionCount < s.config.MaxEvictions {
-		pools := s.unusedByAgent[agentID]
-		pools[ipVersion] = append(pools[ipVersion], &unusedPD{
-			evictionCount: pd.evictionCount + 1,
-			directive:     pd.directive,
-		})
-		s.unusedByAgent[agentID] = pools
-		s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(pd.directive.IPVersion)).Inc()
-	} else {
-		s.metrics.PDsEvictedTotal.WithLabelValues(agentID).Inc()
-		if pd.markedForRemoval {
-			s.metrics.PDsTotal.Dec()
+		// The directive was converted once on entry, so this cannot fail for a
+		// PD that came from a file or a diff.
+		u, err := newUnusedPD(pd.directive, pd.evictionCount+1)
+		if err == nil {
+			ipVersion := ipIdx(pd.directive.IPVersion)
+			pools := s.unusedByAgent[agentID]
+			pools[ipVersion] = append(pools[ipVersion], u)
+			s.unusedByAgent[agentID] = pools
+			s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(pd.directive.IPVersion)).Inc()
+			return
 		}
-		s.logger.Debug("PD permanently evicted",
+		s.logger.Error("Cannot return PD to the unused pool, evicting it",
 			slog.Uint64("pd_id", pd.directive.ProbingDirectiveID),
-			slog.String("agent_id", agentID),
-			slog.String("ip_version", ipVersionLabel(pd.directive.IPVersion)))
+			slog.Any("error", err))
 	}
+
+	delete(s.known, pd.directive.ProbingDirectiveID)
+	s.metrics.PDsEvictedTotal.WithLabelValues(agentID).Inc()
+	if pd.markedForRemoval {
+		s.metrics.PDsTotal.Dec()
+	}
+	s.logger.Debug("PD permanently evicted",
+		slog.Uint64("pd_id", pd.directive.ProbingDirectiveID),
+		slog.String("agent_id", agentID),
+		slog.String("ip_version", ipVersionLabel(pd.directive.IPVersion)))
 }
 
 // replacePD replaces the given PD in the active set with a random draw from
@@ -443,11 +602,10 @@ func (s *Scheduler) replacePD(pd *pdState) *pdState {
 	rawReplacement := unused[drawIdx]
 	// Swap and shrink unused pool — O(1) removal without preserving order.
 	unused[drawIdx] = unused[len(unused)-1]
-	unused[len(unused)-1] = nil // avoid memory leak
 	pools[ipVersion] = unused[:len(unused)-1]
 	s.unusedByAgent[agentID] = pools
 	s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(pd.directive.IPVersion)).Dec()
-	replacement := rawReplacement.promote()
+	replacement := rawReplacement.promote(agentID)
 	s.pdMap[replacement.directive.ProbingDirectiveID] = replacement
 	s.randomizer.Replace(pd.directive.ProbingDirectiveID, replacement.directive.ProbingDirectiveID)
 	s.metrics.PDsActiveTotal.Inc()
@@ -497,8 +655,9 @@ func (s *Scheduler) applyRemovals(removeKeys map[uint64]struct{}) (removedFromUn
 		for v := range pools {
 			kept := pools[v][:0]
 			for _, u := range pools[v] {
-				if _, drop := removeKeys[u.directive.ProbingDirectiveID]; drop {
-					s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(u.directive.IPVersion)).Dec()
+				if _, drop := removeKeys[u.probingDirectiveID]; drop {
+					s.metrics.PDsUnusedTotal.WithLabelValues(poolLabel(v)).Dec()
+					delete(s.known, u.probingDirectiveID)
 					removedFromUnused++
 					continue
 				}
@@ -523,18 +682,6 @@ func (s *Scheduler) applyRemovals(removeKeys map[uint64]struct{}) (removedFromUn
 // empty AgentID or an ID already known (active or unused, including other
 // entries in this same batch). Must be called with s.mutex held.
 func (s *Scheduler) applyInserts(toInsert []*model.ProbingDirective) (inserted, skippedDuplicate, skippedInvalid int) {
-	existingIDs := make(map[uint64]struct{}, len(s.pdMap))
-	for id := range s.pdMap {
-		existingIDs[id] = struct{}{}
-	}
-	for _, pools := range s.unusedByAgent {
-		for v := range pools {
-			for _, u := range pools[v] {
-				existingIDs[u.directive.ProbingDirectiveID] = struct{}{}
-			}
-		}
-	}
-
 	for _, d := range toInsert {
 		if d.AgentID == "" {
 			s.logger.Debug("Skipping PD insert with empty AgentID",
@@ -542,17 +689,25 @@ func (s *Scheduler) applyInserts(toInsert []*model.ProbingDirective) (inserted, 
 			skippedInvalid++
 			continue
 		}
-		if _, exists := existingIDs[d.ProbingDirectiveID]; exists {
+		if _, exists := s.known[d.ProbingDirectiveID]; exists {
 			s.logger.Debug("Skipping duplicate PD insert",
 				slog.Uint64("pd_id", d.ProbingDirectiveID))
 			skippedDuplicate++
 			continue
 		}
-		existingIDs[d.ProbingDirectiveID] = struct{}{}
+		u, err := newUnusedPD(d, 0)
+		if err != nil {
+			s.logger.Debug("Skipping PD insert that cannot be stored in the unused pool",
+				slog.Uint64("pd_id", d.ProbingDirectiveID),
+				slog.Any("error", err))
+			skippedInvalid++
+			continue
+		}
+		s.known[d.ProbingDirectiveID] = struct{}{}
 
 		pools := s.unusedByAgent[d.AgentID]
 		v := ipIdx(d.IPVersion)
-		pools[v] = append(pools[v], &unusedPD{directive: d})
+		pools[v] = append(pools[v], u)
 		s.unusedByAgent[d.AgentID] = pools
 		s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(d.IPVersion)).Inc()
 		inserted++
@@ -563,7 +718,7 @@ func (s *Scheduler) applyInserts(toInsert []*model.ProbingDirective) (inserted, 
 // topUpActiveSet promotes unused PDs into the active set until it reaches
 // ActiveSetSize or supply runs out, recovering slots lost to earlier
 // exhaustion (see replacePD) once new supply arrives via ApplyDiff. Targets
-// the same v4/v6 half-split as loadPDsIntoPool's startup load (full capacity
+// the same v4/v6 half-split as distributePDs's startup load (full capacity
 // to one protocol if the other has no PDs anywhere). If one side's unused
 // supply can't fill its half, those slots stay empty rather than being
 // backfilled by the other protocol — the active set may temporarily sit
@@ -632,12 +787,11 @@ func (s *Scheduler) promoteUpTo(n, protocol int) int {
 			if len(pools[protocol]) > 0 {
 				last := len(pools[protocol]) - 1
 				u := pools[protocol][last]
-				pools[protocol][last] = nil
 				pools[protocol] = pools[protocol][:last]
 				s.unusedByAgent[agentID] = pools
-				s.metrics.PDsUnusedTotal.WithLabelValues(ipVersionLabel(u.directive.IPVersion)).Dec()
+				s.metrics.PDsUnusedTotal.WithLabelValues(poolLabel(protocol)).Dec()
 
-				replacement := u.promote()
+				replacement := u.promote(agentID)
 				s.pdMap[replacement.directive.ProbingDirectiveID] = replacement
 				s.randomizer.Add(replacement.directive.ProbingDirectiveID)
 				s.metrics.PDsActiveTotal.Inc()
@@ -781,20 +935,46 @@ func ipKey(ip net.IP) string {
 	return normalized.String()
 }
 
-// readPDs reads a PD file and returns the parsed directives. Each line is
-// a protojson-encoded wire.ProbingDirective — protojson is used rather
-// than encoding/json because it understands oneofs (next_header) and
-// accepts numeric enum values, both confirmed against a real file sample.
-func readPDs(filepath string) ([]*model.ProbingDirective, error) {
+// countLines returns the number of newline bytes in the file, or 0 if it
+// can't be read. It only sizes the known-ID map up front, so an error is
+// harmless: the map just grows as it fills.
+func countLines(path string) int {
+	if path == "" {
+		return 0
+	}
+	f, err := os.Open(path) //nolint:gosec
+	if err != nil {
+		return 0
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+	buf := make([]byte, 1<<20)
+	n := 0
+	for {
+		c, err := f.Read(buf)
+		n += bytes.Count(buf[:c], []byte{'\n'})
+		if err != nil {
+			return n
+		}
+	}
+}
+
+// forEachPD reads a PD file and calls fn with each parsed directive, one
+// line at a time, without holding the file in memory. Each line is a
+// protojson-encoded wire.ProbingDirective — protojson is used rather than
+// encoding/json because it understands oneofs (next_header) and accepts
+// numeric enum values, both confirmed against a real file sample. An error
+// returned by fn stops the read and is reported with its line number.
+func forEachPD(filepath string, fn func(*model.ProbingDirective) error) error {
 	f, err := os.Open(filepath) //nolint:gosec
 	if err != nil {
-		return nil, fmt.Errorf("cannot open file: %w", err)
+		return fmt.Errorf("cannot open file: %w", err)
 	}
 	defer func() {
 		_ = f.Close()
 	}()
 
-	var results []*model.ProbingDirective
 	scanner := bufio.NewScanner(f)
 	// 4MiB max (default ~64KiB), in case a directive line is unusually large.
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
@@ -808,26 +988,28 @@ func readPDs(filepath string) ([]*model.ProbingDirective, error) {
 
 		var wirePD wire.ProbingDirective
 		if err := protojson.Unmarshal(line, &wirePD); err != nil {
-			return nil, fmt.Errorf("cannot unmarshal line %d: %w", lineNum, err)
+			return fmt.Errorf("cannot unmarshal line %d: %w", lineNum, err)
 		}
 
 		pd, err := model.ProbingDirectiveFromProto(&wirePD)
 		if err != nil {
-			return nil, fmt.Errorf("invalid PD on line %d: %w", lineNum, err)
+			return fmt.Errorf("invalid PD on line %d: %w", lineNum, err)
 		}
-		results = append(results, &pd)
+		if err := fn(&pd); err != nil {
+			return fmt.Errorf("line %d: %w", lineNum, err)
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scanner error: %w", err)
+		return fmt.Errorf("scanner error: %w", err)
 	}
-
-	return results, nil
+	return nil
 }
 
 type diffOpPeek struct {
-	Op                 string `json:"op"`
-	ProbingDirectiveID uint64 `json:"probing_directive_id"`
+	Op string `json:"op"`
+	// A pointer, so a missing ID isn't mistaken for the valid ID 0.
+	ProbingDirectiveID *uint64 `json:"probing_directive_id"`
 }
 
 // readPDDiff reads a combined insert/remove diff file (JSONL, one op per
@@ -887,7 +1069,11 @@ func readPDDiff(filepath string, logger *slog.Logger) (toInsert []*model.Probing
 			}
 			toInsert = append(toInsert, &pd)
 		case "remove":
-			toRemove = append(toRemove, peek.ProbingDirectiveID)
+			if peek.ProbingDirectiveID == nil {
+				skip(lineNum, fmt.Errorf("remove op without probing_directive_id"))
+				continue
+			}
+			toRemove = append(toRemove, *peek.ProbingDirectiveID)
 		default:
 			skip(lineNum, fmt.Errorf("unknown op %q", peek.Op))
 		}

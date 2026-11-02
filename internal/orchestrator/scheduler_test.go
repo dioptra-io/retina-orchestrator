@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"os/signal"
+	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,6 +24,7 @@ import (
 	wire "github.com/dioptra-io/retina-commons/v2/wire/v2"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // Coverage is ~99%: the only uncovered branch is NewScheduler's
@@ -53,9 +57,9 @@ func writeSchedulerPDFile(t *testing.T, pds []*wire.ProbingDirective) string {
 
 // makePD/makePDV4/makePDV6 return *wire.ProbingDirective (not *model) since
 // their only use is being written to a file and read back through
-// readPDs() — no need to round-trip through model's net.IP/uint8 typing
+// forEachPD — no need to round-trip through model's net.IP/uint8 typing
 // for that. DestinationAddress is required now: model.ProbingDirectiveFromProto
-// (called inside readPDs) rejects an empty one, unlike the old api.ProbingDirective.
+// (called inside forEachPD) rejects an empty one, unlike the old api.ProbingDirective.
 func makePD(id uint64) *wire.ProbingDirective {
 	return &wire.ProbingDirective{ProbingDirectiveId: id, IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"}
 }
@@ -413,9 +417,9 @@ func TestNewScheduler_NilMetrics(t *testing.T) {
 	}
 }
 
-// -- loadPDsIntoPool ------------------------------------------------------
+// -- distributePDs -------------------------------------------------------------
 
-func TestLoadPDsIntoPool_BalancesAcrossAgents(t *testing.T) {
+func TestDistributePDs_BalancesAcrossAgents(t *testing.T) {
 	t.Parallel()
 	var pds []*model.ProbingDirective
 	counts := map[string]int{"agent-a": 10, "agent-b": 2, "agent-c": 6}
@@ -429,12 +433,9 @@ func TestLoadPDsIntoPool_BalancesAcrossAgents(t *testing.T) {
 
 	pdMap := make(map[uint64]*pdState)
 	var indices []uint64
-	unusedByAgent := make(map[string][2][]*unusedPD)
-	seen := make(map[uint64]struct{})
+	unusedByAgent := make(map[string][2][]unusedPD)
 
-	if err := loadPDsIntoPool(pds, 6, pdMap, &indices, unusedByAgent, seen, testLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	distributePDs(newLoadedPDs(t, pds), 6, pdMap, &indices, unusedByAgent, testLogger())
 
 	activeByAgent := make(map[string]int)
 	for _, ps := range pdMap {
@@ -447,7 +448,7 @@ func TestLoadPDsIntoPool_BalancesAcrossAgents(t *testing.T) {
 	}
 }
 
-func TestLoadPDsIntoPool_AgentBelowQuotaContributesAll(t *testing.T) {
+func TestDistributePDs_AgentBelowQuotaContributesAll(t *testing.T) {
 	t.Parallel()
 	pds := []*model.ProbingDirective{
 		makeModelPD(t, 1, "agent-small", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"),
@@ -458,12 +459,9 @@ func TestLoadPDsIntoPool_AgentBelowQuotaContributesAll(t *testing.T) {
 
 	pdMap := make(map[uint64]*pdState)
 	var indices []uint64
-	unusedByAgent := make(map[string][2][]*unusedPD)
-	seen := make(map[uint64]struct{})
+	unusedByAgent := make(map[string][2][]unusedPD)
 
-	if err := loadPDsIntoPool(pds, 6, pdMap, &indices, unusedByAgent, seen, testLogger()); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	distributePDs(newLoadedPDs(t, pds), 6, pdMap, &indices, unusedByAgent, testLogger())
 
 	activeByAgent := make(map[string]int)
 	for _, ps := range pdMap {
@@ -480,7 +478,7 @@ func TestLoadPDsIntoPool_AgentBelowQuotaContributesAll(t *testing.T) {
 	}
 }
 
-func TestLoadPDsIntoPool_QuotaZeroLogsWarning(t *testing.T) {
+func TestDistributePDs_QuotaZeroLogsWarning(t *testing.T) {
 	t.Parallel()
 	pds := []*model.ProbingDirective{
 		makeModelPD(t, 1, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1"),
@@ -490,14 +488,11 @@ func TestLoadPDsIntoPool_QuotaZeroLogsWarning(t *testing.T) {
 
 	pdMap := make(map[uint64]*pdState)
 	var indices []uint64
-	unusedByAgent := make(map[string][2][]*unusedPD)
-	seen := make(map[uint64]struct{})
+	unusedByAgent := make(map[string][2][]unusedPD)
 	buf := &syncBuffer{}
 	logger := slog.New(slog.NewTextHandler(buf, nil))
 
-	if err := loadPDsIntoPool(pds, 2, pdMap, &indices, unusedByAgent, seen, logger); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	distributePDs(newLoadedPDs(t, pds), 2, pdMap, &indices, unusedByAgent, logger)
 
 	if len(pdMap) != 0 {
 		t.Errorf("expected no active PDs with quota=0, got %d", len(pdMap))
@@ -507,7 +502,7 @@ func TestLoadPDsIntoPool_QuotaZeroLogsWarning(t *testing.T) {
 	}
 }
 
-// -- readPDs ------------------------------------------------------------------
+// -- forEachPD ------------------------------------------------------------------
 
 func TestReadPDs_InvalidJSON(t *testing.T) {
 	t.Parallel()
@@ -537,7 +532,7 @@ func TestReadPDs_ScannerError(t *testing.T) {
 		t.Fatalf("cannot create temp file: %v", err)
 	}
 	// Write a line longer than the scanner's configured max (4 MiB, set in
-	// scheduler.go's readPDs to accommodate legitimately large directives —
+	// scheduler.go's forEachPD to accommodate legitimately large directives —
 	// raised from bufio.Scanner's 64 KiB default) to trigger scanner.Err().
 	if _, err := f.Write(make([]byte, 4*1024*1024+1)); err != nil {
 		t.Fatalf("cannot write to temp file: %v", err)
@@ -1047,7 +1042,7 @@ func TestApplyDiff_InsertAddsToUnusedPool(t *testing.T) {
 
 	found := false
 	for _, u := range s.unusedByAgent["agent-b"][0] {
-		if u.directive.ProbingDirectiveID == 2 {
+		if u.probingDirectiveID == 2 {
 			found = true
 		}
 	}
@@ -1110,7 +1105,7 @@ func TestApplyDiff_TombstonedActivePDIsPermanentlyEvicted(t *testing.T) {
 		t.Error("expected pd1 to be gone from the active set after replacement")
 	}
 	for _, u := range s.unusedByAgent["agent-a"][0] {
-		if u.directive.ProbingDirectiveID == 1 {
+		if u.probingDirectiveID == 1 {
 			t.Error("expected pd1 to be permanently evicted, not recycled back into the unused pool")
 		}
 	}
@@ -1591,7 +1586,7 @@ func pdIsKnown(s *Scheduler, agentID string, id uint64) bool {
 	}
 	for _, v := range s.unusedByAgent[agentID] {
 		for _, u := range v {
-			if u.directive.ProbingDirectiveID == id {
+			if u.probingDirectiveID == id {
 				return true
 			}
 		}
@@ -1616,7 +1611,7 @@ func TestWatchPDDiffReload_AppliesDiffOnSignal(t *testing.T) {
 
 	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
 	path := writeDiffFile(t, [][]byte{
-		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 2, AgentId: "agent-z", DestinationAddress: "192.0.2.20"}),
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 2, AgentId: "agent-z", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.20"}),
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1680,7 +1675,7 @@ func TestWatchPDDiffReload_WarnsOnMalformedLines(t *testing.T) {
 
 	s := newTestScheduler(t, []*wire.ProbingDirective{makePD(1)})
 	path := writeDiffFile(t, [][]byte{
-		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 2, AgentId: "agent-z", DestinationAddress: "192.0.2.20"}),
+		diffInsertLine(t, &wire.ProbingDirective{ProbingDirectiveId: 2, AgentId: "agent-z", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.20"}),
 		[]byte(`not valid json`),
 	})
 	buf := &syncBuffer{}
@@ -2035,5 +2030,496 @@ func TestNextPD_StalePDDuringWait(t *testing.T) {
 
 	if pd := <-resultCh; pd != nil {
 		t.Errorf("expected nil (pd already replaced concurrently), got pd %d", pd.ProbingDirectiveID)
+	}
+}
+
+// newLoadedPDs builds the loadedPDs that loadPDFile would produce for pds.
+func newLoadedPDs(t *testing.T, pds []*model.ProbingDirective) *loadedPDs {
+	t.Helper()
+	loaded := &loadedPDs{byAgent: make(map[string][]unusedPD)}
+	for _, pd := range pds {
+		u, err := newUnusedPD(pd, 0)
+		if err != nil {
+			t.Fatalf("cannot pack test directive %d: %v", pd.ProbingDirectiveID, err)
+		}
+		if _, ok := loaded.byAgent[pd.AgentID]; !ok {
+			loaded.agentOrder = append(loaded.agentOrder, pd.AgentID)
+		}
+		loaded.byAgent[pd.AgentID] = append(loaded.byAgent[pd.AgentID], u)
+		loaded.count++
+	}
+	return loaded
+}
+
+// unusedIDs returns the IDs of every PD in every unused pool.
+func unusedIDs(s *Scheduler) map[uint64]struct{} {
+	ids := make(map[uint64]struct{})
+	for _, pools := range s.unusedByAgent {
+		for _, pool := range pools {
+			for _, u := range pool {
+				ids[u.probingDirectiveID] = struct{}{}
+			}
+		}
+	}
+	return ids
+}
+
+// -- unusedPD -----------------------------------------------------------------
+
+// The memory estimate for the unused pools (15M PDs in about 600 MB) assumes
+// 40 bytes per entry, so a field added carelessly must fail loudly.
+func TestUnusedPDSize(t *testing.T) {
+	t.Parallel()
+	if got := reflect.TypeOf(unusedPD{}).Size(); got != 40 {
+		t.Errorf("unusedPD is %d bytes, want 40", got)
+	}
+}
+
+func TestEnumsFitUnusedPD(t *testing.T) {
+	t.Parallel()
+	for v := range wire.IPVersion_name {
+		if v < 0 || v > math.MaxUint8 {
+			t.Errorf("IPVersion %d does not fit unusedPD.ipVersion", v)
+		}
+	}
+	for v := range wire.Protocol_name {
+		if v < 0 || v > math.MaxUint8 {
+			t.Errorf("Protocol %d does not fit unusedPD.protocol", v)
+		}
+	}
+}
+
+func TestNextHeaderVariantsSupported(t *testing.T) {
+	t.Parallel()
+	const supported = 3 // ICMP, UDP, ICMPv6: the cases handled in newUnusedPD and unpack
+	header := (&wire.NextHeader{}).ProtoReflect().Descriptor().Oneofs().ByName("header")
+	if header == nil {
+		t.Fatal("NextHeader has no header oneof")
+	}
+	if got := header.Fields().Len(); got != supported {
+		t.Errorf("NextHeader has %d variants, unusedPD supports %d: update newUnusedPD, unpack and nextHeaderKind", got, supported)
+	}
+}
+
+func TestUnusedPD_HasNoPointers(t *testing.T) {
+	t.Parallel()
+	pointerKinds := []reflect.Kind{
+		reflect.Pointer, reflect.Slice, reflect.Map, reflect.String,
+		reflect.Interface, reflect.Chan, reflect.Func, reflect.UnsafePointer,
+	}
+	var check func(typ reflect.Type)
+	check = func(typ reflect.Type) {
+		switch {
+		case slices.Contains(pointerKinds, typ.Kind()):
+			t.Errorf("unusedPD contains a pointer-bearing %s; the GC would scan every pooled entry", typ)
+		case typ.Kind() == reflect.Struct:
+			for i := range typ.NumField() {
+				check(typ.Field(i).Type)
+			}
+		case typ.Kind() == reflect.Array:
+			check(typ.Elem())
+		}
+	}
+	check(reflect.TypeOf(unusedPD{}))
+}
+
+func TestPackUnpack_RoundTrip(t *testing.T) {
+	t.Parallel()
+	// Above the int64 maximum, like real IDs.
+	const id = uint64(18446741891296895000)
+
+	cases := []struct {
+		name     string
+		version  wire.IPVersion
+		addr     string
+		protocol wire.Protocol
+		ttl      uint8
+		header   *wire.NextHeader
+		wantLen  int
+	}{
+		{
+			name: "ipv4 icmp", version: wire.IPVersion_IP_VERSION_IPV4, addr: "192.0.2.7",
+			protocol: wire.Protocol_PROTOCOL_ICMP, ttl: 14, wantLen: net.IPv4len,
+			header: &wire.NextHeader{Header: &wire.NextHeader_IcmpNextHeader{
+				IcmpNextHeader: &wire.ICMPNextHeader{FirstHalfWord: 31916, SecondHalfWord: 7},
+			}},
+		},
+		{
+			name: "ipv4 udp", version: wire.IPVersion_IP_VERSION_IPV4, addr: "198.51.100.200",
+			protocol: wire.Protocol_PROTOCOL_UDP, ttl: 255, wantLen: net.IPv4len,
+			header: &wire.NextHeader{Header: &wire.NextHeader_UdpNextHeader{
+				UdpNextHeader: &wire.UDPNextHeader{SourcePort: 33434, DestinationPort: 53},
+			}},
+		},
+		{
+			name: "ipv6 icmpv6", version: wire.IPVersion_IP_VERSION_IPV6, addr: "2001:db8::dead:beef",
+			protocol: wire.Protocol_PROTOCOL_ICMPV6, ttl: 3, wantLen: net.IPv6len,
+			header: &wire.NextHeader{Header: &wire.NextHeader_Icmpv6NextHeader{
+				Icmpv6NextHeader: &wire.ICMPv6NextHeader{FirstHalfWord: math.MaxUint32, SecondHalfWord: 1},
+			}},
+		},
+		{
+			name: "ipv4 without next header", version: wire.IPVersion_IP_VERSION_IPV4, addr: "203.0.113.1",
+			protocol: wire.Protocol_PROTOCOL_ICMP, ttl: 0, wantLen: net.IPv4len,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			pd := makeModelPD(t, id, "agent-x", tc.version, tc.addr)
+			pd.Protocol = tc.protocol
+			pd.NearTTL = tc.ttl
+			pd.NextHeader = tc.header
+
+			u, err := newUnusedPD(pd, 4)
+			if err != nil {
+				t.Fatalf("packPD: %v", err)
+			}
+			got := u.unpack("agent-x")
+
+			assertSamePD(t, got, pd, tc.wantLen)
+
+			state := u.promote("agent-x")
+			if state.evictionCount != 4 || state.issuanceProb != 1.0 || state.directive.ProbingDirectiveID != id {
+				t.Errorf("promote: evictionCount=%d issuanceProb=%v id=%d",
+					state.evictionCount, state.issuanceProb, state.directive.ProbingDirectiveID)
+			}
+		})
+	}
+}
+
+func TestPackPD_EvictionCountSaturates(t *testing.T) {
+	t.Parallel()
+	pd := makeModelPD(t, 1, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1")
+
+	big, err := newUnusedPD(pd, 1<<20)
+	if err != nil {
+		t.Fatalf("packPD: %v", err)
+	}
+	if big.evictionCount != math.MaxUint16 {
+		t.Errorf("evictionCount = %d, want %d", big.evictionCount, math.MaxUint16)
+	}
+	neg, err := newUnusedPD(pd, -3)
+	if err != nil {
+		t.Fatalf("packPD: %v", err)
+	}
+	if neg.evictionCount != 0 {
+		t.Errorf("evictionCount = %d, want 0", neg.evictionCount)
+	}
+}
+
+func TestPackPD_Rejects(t *testing.T) {
+	t.Parallel()
+	valid := func() *model.ProbingDirective {
+		return makeModelPD(t, 1, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.1")
+	}
+
+	if _, err := newUnusedPD(nil, 0); err == nil {
+		t.Error("expected an error for a nil directive")
+	}
+
+	noDst := valid()
+	noDst.DestinationAddress = nil
+	if _, err := newUnusedPD(noDst, 0); err == nil {
+		t.Error("expected an error for a missing destination address")
+	}
+
+	badVersion := valid()
+	badVersion.IPVersion = wire.IPVersion(5)
+	if _, err := newUnusedPD(badVersion, 0); err == nil {
+		t.Error("expected an error for an unknown ip_version")
+	}
+
+	unspecifiedVersion := valid()
+	unspecifiedVersion.IPVersion = wire.IPVersion_IP_VERSION_UNSPECIFIED
+	if _, err := newUnusedPD(unspecifiedVersion, 0); err == nil {
+		t.Error("expected an error for an unspecified ip_version")
+	}
+
+	badProtocol := valid()
+	badProtocol.Protocol = wire.Protocol(-1)
+	if _, err := newUnusedPD(badProtocol, 0); err == nil {
+		t.Error("expected an error for an unknown protocol")
+	}
+}
+
+// -- addToPools ---------------------------------------------------------------
+
+func TestAddToPools_UniformMixedAndExisting(t *testing.T) {
+	t.Parallel()
+	pack := func(id uint64, version wire.IPVersion, addr string) unusedPD {
+		p, err := newUnusedPD(makeModelPD(t, id, "a", version, addr), 0)
+		if err != nil {
+			t.Fatalf("packPD: %v", err)
+		}
+		return p
+	}
+	v4 := wire.IPVersion_IP_VERSION_IPV4
+	v6 := wire.IPVersion_IP_VERSION_IPV6
+
+	pools := make(map[string][2][]unusedPD)
+
+	// Uniform batch into an empty pool.
+	addToPools(pools, "a", []unusedPD{pack(1, v4, "192.0.2.1"), pack(2, v4, "192.0.2.2")})
+	if got := len(pools["a"][0]); got != 2 {
+		t.Fatalf("v4 pool = %d, want 2", got)
+	}
+
+	// Mixed batch, onto a non-empty v4 pool.
+	addToPools(pools, "a", []unusedPD{
+		pack(3, v6, "2001:db8::3"), pack(4, v4, "192.0.2.4"), pack(5, v6, "2001:db8::5"),
+	})
+	if len(pools["a"][0]) != 3 || len(pools["a"][1]) != 2 {
+		t.Errorf("pools = %d v4 / %d v6, want 3 / 2", len(pools["a"][0]), len(pools["a"][1]))
+	}
+
+	// Uniform batch onto a non-empty pool is appended, not swapped in.
+	addToPools(pools, "a", []unusedPD{pack(6, v4, "192.0.2.6")})
+	if got := len(pools["a"][0]); got != 4 {
+		t.Errorf("v4 pool = %d, want 4", got)
+	}
+
+	// Empty batch leaves no entry behind.
+	addToPools(pools, "b", nil)
+	if _, ok := pools["b"]; ok {
+		t.Error("expected no pool entry for an empty batch")
+	}
+}
+
+// -- known-ID set -------------------------------------------------------------
+
+func TestKnown_CoversActiveAndUnusedAtStartup(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{makePDV4(1), makePDV4(2), makePDV4(3)}, 1, 3, 3)
+
+	if len(s.known) != 3 {
+		t.Fatalf("known = %d IDs, want 3", len(s.known))
+	}
+	for id := range s.pdMap {
+		if _, ok := s.known[id]; !ok {
+			t.Errorf("active PD %d missing from known", id)
+		}
+	}
+	for id := range unusedIDs(s) {
+		if _, ok := s.known[id]; !ok {
+			t.Errorf("unused PD %d missing from known", id)
+		}
+	}
+}
+
+func TestKnown_ReleasedOnRemovalAndReinsertable(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{makePDV4(1), makePDV4(2)}, 1, 3, 3)
+
+	var unusedID uint64
+	for id := range unusedIDs(s) {
+		unusedID = id
+	}
+
+	s.ApplyDiff(nil, []uint64{unusedID})
+	if _, ok := s.known[unusedID]; ok {
+		t.Fatal("expected a PD removed from the unused pool to leave the known set")
+	}
+
+	reinsert := makeModelPD(t, unusedID, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.9")
+	s.ApplyDiff([]*model.ProbingDirective{reinsert}, nil)
+	if _, ok := s.known[unusedID]; !ok {
+		t.Error("expected the re-inserted PD to be known again")
+	}
+	if got := len(s.unusedByAgent["agent-b"][0]); got != 1 {
+		t.Errorf("agent-b unused pool = %d, want 1", got)
+	}
+}
+
+func TestKnown_ReleasedOnPermanentEviction(t *testing.T) {
+	t.Parallel()
+	// MaxEvictions=0: a replaced PD is evicted instead of recycled.
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{makePDV4(1), makePDV4(2)}, 1, 3, 0)
+
+	var activeID uint64
+	for id := range s.pdMap {
+		activeID = id
+	}
+
+	s.mutex.Lock()
+	replacement := s.replacePD(s.pdMap[activeID])
+	s.mutex.Unlock()
+
+	if replacement == nil {
+		t.Fatal("expected a replacement from the unused pool")
+		return
+	}
+	if _, ok := s.known[activeID]; ok {
+		t.Error("expected the evicted PD to leave the known set")
+	}
+	if _, ok := s.known[replacement.directive.ProbingDirectiveID]; !ok {
+		t.Error("expected the promoted PD to stay known")
+	}
+	if len(s.known) != 1 {
+		t.Errorf("known = %d IDs, want 1", len(s.known))
+	}
+}
+
+// A PD that leaves the pool and later comes back (recycled) must be
+// unpackable again and keep its place in the known set.
+func TestReplacePD_RecycledPDRoundTripsThroughPool(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{makePDV4(1), makePDV4(2)}, 1, 3, 3)
+
+	var first uint64
+	for id := range s.pdMap {
+		first = id
+	}
+
+	s.mutex.Lock()
+	second := s.replacePD(s.pdMap[first]) // first is recycled into the pool
+	s.mutex.Unlock()
+	if second == nil {
+		t.Fatal("expected a replacement")
+	}
+
+	s.mutex.Lock()
+	back := s.replacePD(second) // second is replaced by the recycled first
+	s.mutex.Unlock()
+	if back == nil {
+		t.Fatal("expected the recycled PD to be drawn again")
+		return
+	}
+
+	pd := back.directive
+	if pd.ProbingDirectiveID != first {
+		t.Fatalf("drawn id = %d, want %d", pd.ProbingDirectiveID, first)
+	}
+	if pd.IPVersion != wire.IPVersion_IP_VERSION_IPV4 || !pd.DestinationAddress.Equal(net.ParseIP("192.0.2.1")) {
+		t.Errorf("directive changed across the pool: %+v", pd)
+	}
+	if back.evictionCount != 1 {
+		t.Errorf("evictionCount = %d, want 1", back.evictionCount)
+	}
+	if len(s.known) != 2 {
+		t.Errorf("known = %d IDs, want 2", len(s.known))
+	}
+}
+
+func TestReadPDDiff_SkipsRemoveWithoutID(t *testing.T) {
+	t.Parallel()
+	path := writeDiffFile(t, [][]byte{[]byte(`{"op":"remove"}`), diffRemoveLine(7)})
+
+	_, toRemove, skipped, err := readPDDiff(path, testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(toRemove) != 1 || toRemove[0] != 7 {
+		t.Errorf("toRemove = %v, want [7]", toRemove)
+	}
+	if skipped != 1 {
+		t.Errorf("skipped = %d, want 1", skipped)
+	}
+}
+
+func TestReadPDDiff_RemoveOfIDZeroIsKept(t *testing.T) {
+	t.Parallel()
+	path := writeDiffFile(t, [][]byte{diffRemoveLine(0)})
+
+	_, toRemove, skipped, err := readPDDiff(path, testLogger())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(toRemove) != 1 || toRemove[0] != 0 || skipped != 0 {
+		t.Errorf("toRemove = %v, skipped = %d, want [0], 0", toRemove, skipped)
+	}
+}
+
+// assertSamePD checks that got has the same fields as want, with a destination
+// address of wantLen bytes.
+func assertSamePD(t *testing.T, got, want *model.ProbingDirective, wantLen int) {
+	t.Helper()
+	if got.ProbingDirectiveID != want.ProbingDirectiveID {
+		t.Errorf("id = %d, want %d", got.ProbingDirectiveID, want.ProbingDirectiveID)
+	}
+	if got.IPVersion != want.IPVersion || got.Protocol != want.Protocol {
+		t.Errorf("version/protocol = %v/%v, want %v/%v", got.IPVersion, got.Protocol, want.IPVersion, want.Protocol)
+	}
+	if got.AgentID != want.AgentID {
+		t.Errorf("agent = %q, want %q", got.AgentID, want.AgentID)
+	}
+	if got.NearTTL != want.NearTTL {
+		t.Errorf("near ttl = %d, want %d", got.NearTTL, want.NearTTL)
+	}
+	if !got.DestinationAddress.Equal(want.DestinationAddress) || len(got.DestinationAddress) != wantLen {
+		t.Errorf("destination = %v (%d bytes), want %v (%d bytes)",
+			got.DestinationAddress, len(got.DestinationAddress), want.DestinationAddress, wantLen)
+	}
+	if want.NextHeader == nil {
+		if got.NextHeader != nil {
+			t.Errorf("next header = %v, want nil", got.NextHeader)
+		}
+	} else if !proto.Equal(got.NextHeader, want.NextHeader) {
+		t.Errorf("next header = %v, want %v", got.NextHeader, want.NextHeader)
+	}
+}
+
+func TestNewScheduler_RejectsPDWithUnspecifiedIPVersion(t *testing.T) {
+	t.Parallel()
+	_, err := NewScheduler(&SchedulerConfig{
+		Seed:         0,
+		IssuanceRate: 1.0,
+		PDPathV4: writeSchedulerPDFile(t, []*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, DestinationAddress: "192.0.2.1"},
+		}),
+		ActiveSetSize:              2,
+		ImpactThreshold:            1.0,
+		ConsecutiveMissesThreshold: 3,
+		MaxEvictions:               3,
+	}, testLogger(), testMetrics())
+	if err == nil {
+		t.Fatal("expected error for a PD with an unspecified ip_version, got nil")
+	}
+	if !strings.Contains(err.Error(), "PD 1") {
+		t.Errorf("expected the error to name the PD, got: %v", err)
+	}
+}
+
+func TestApplyDiff_SkipsInsertThatCannotBeStored(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t, []*wire.ProbingDirective{makePDV4(1)}, 1, 3, 3)
+	bad := makeModelPD(t, 5, "agent-b", wire.IPVersion_IP_VERSION_UNSPECIFIED, "192.0.2.9")
+
+	s.ApplyDiff([]*model.ProbingDirective{bad}, nil)
+
+	if _, ok := s.known[5]; ok {
+		t.Error("expected a PD that cannot be stored to stay out of the known set")
+	}
+	if got := len(s.unusedByAgent["agent-b"][0]); got != 0 {
+		t.Errorf("agent-b unused pool = %d, want 0", got)
+	}
+}
+
+// A PD that cannot be packed must not be lost silently from the accounting:
+// it is evicted, and its ID is released.
+func TestRecycleOrEvict_EvictsPDThatCannotBePacked(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t, []*wire.ProbingDirective{makePDV4(1)}, 1, 3, 3)
+	pd := &pdState{directive: &model.ProbingDirective{
+		ProbingDirectiveID: 99,
+		AgentID:            "agent-a",
+		IPVersion:          wire.IPVersion_IP_VERSION_IPV4,
+	}} // no destination address
+	s.known[99] = struct{}{}
+
+	s.mutex.Lock()
+	s.recycleOrEvict(pd)
+	s.mutex.Unlock()
+
+	if _, ok := s.known[99]; ok {
+		t.Error("expected the evicted PD to leave the known set")
+	}
+	if got := len(s.unusedByAgent["agent-a"][0]); got != 0 {
+		t.Errorf("agent-a unused pool = %d, want 0", got)
 	}
 }
