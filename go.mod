@@ -3,7 +3,7 @@ module github.com/dioptra-io/retina-orchestrator
 go 1.25.7
 
 require (
-	github.com/dioptra-io/retina-commons/v2 v2.0.0
+	github.com/dioptra-io/retina-commons/v2 v2.0.1
 	github.com/prometheus/client_golang v1.23.2
 	golang.org/x/sync v0.20.0
 	google.golang.org/protobuf v1.36.12
