@@ -762,10 +762,11 @@ func (s *Scheduler) topUpActiveSet() int {
 }
 
 // promoteUpTo promotes up to n unused PDs of the given protocol (0 for v4, 1
-// for v6) into the active set, round-robining one per agent per pass so no
-// single agent's surplus dominates. Returns the number actually promoted,
-// which is less than n if that protocol's supply runs out. Must be called
-// with s.mutex held.
+// for v6) into the active set. Each promotion goes to the agent with the
+// fewest active PDs of that protocol, so agents that lost slots to an
+// exhausted pool catch up before the others grow. Returns the number actually
+// promoted, which is less than n if that protocol's supply runs out. Must be
+// called with s.mutex held.
 func (s *Scheduler) promoteUpTo(n, protocol int) int {
 	if n <= 0 {
 		return 0
@@ -776,34 +777,48 @@ func (s *Scheduler) promoteUpTo(n, protocol int) int {
 	}
 	sort.Strings(agentIDs)
 
-	promoted := 0
-	for promoted < n {
-		promotedThisPass := false
-		for _, agentID := range agentIDs {
-			if promoted >= n {
-				break
-			}
-			pools := s.unusedByAgent[agentID]
-			if len(pools[protocol]) > 0 {
-				last := len(pools[protocol]) - 1
-				u := pools[protocol][last]
-				pools[protocol] = pools[protocol][:last]
-				s.unusedByAgent[agentID] = pools
-				s.metrics.PDsUnusedTotal.WithLabelValues(poolLabel(protocol)).Dec()
-
-				replacement := u.promote(agentID)
-				s.pdMap[replacement.directive.ProbingDirectiveID] = replacement
-				s.randomizer.Add(replacement.directive.ProbingDirectiveID)
-				s.metrics.PDsActiveTotal.Inc()
-				promoted++
-				promotedThisPass = true
-			}
-		}
-		if !promotedThisPass {
-			break
+	active := make(map[string]int, len(agentIDs))
+	for _, pd := range s.pdMap {
+		if ipIdx(pd.directive.IPVersion) == protocol {
+			active[pd.directive.AgentID]++
 		}
 	}
+
+	promoted := 0
+	for promoted < n {
+		chosen, found := "", false
+		for _, agentID := range agentIDs {
+			if len(s.unusedByAgent[agentID][protocol]) == 0 {
+				continue
+			}
+			if !found || active[agentID] < active[chosen] {
+				chosen, found = agentID, true
+			}
+		}
+		if !found {
+			break
+		}
+		s.promoteOne(chosen, protocol)
+		active[chosen]++
+		promoted++
+	}
 	return promoted
+}
+
+// promoteOne moves the last unused PD of the agent's pool into the active
+// set. The pool must not be empty. Must be called with s.mutex held.
+func (s *Scheduler) promoteOne(agentID string, protocol int) {
+	pools := s.unusedByAgent[agentID]
+	last := len(pools[protocol]) - 1
+	u := pools[protocol][last]
+	pools[protocol] = pools[protocol][:last]
+	s.unusedByAgent[agentID] = pools
+	s.metrics.PDsUnusedTotal.WithLabelValues(poolLabel(protocol)).Dec()
+
+	replacement := u.promote(agentID)
+	s.pdMap[replacement.directive.ProbingDirectiveID] = replacement
+	s.randomizer.Add(replacement.directive.ProbingDirectiveID)
+	s.metrics.PDsActiveTotal.Inc()
 }
 
 // UpdateFromFIE updates the scheduling state of a directive based on an

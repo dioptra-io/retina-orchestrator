@@ -1495,12 +1495,9 @@ func TestApplyDiff_TopUpGivesFullCapacityToV6WhenV4Absent(t *testing.T) {
 	}
 }
 
-// TestApplyDiff_TopUpStopsMidPassAcrossAgents covers promoteUpTo's
-// "if promoted >= n { break }" guard: with a single agent (every other
-// top-up test), that line is unreachable, since one agent contributes at
-// most one promotion per pass — it only matters once a pass's first agent
-// already satisfies the target before the loop reaches a second agent.
-func TestApplyDiff_TopUpStopsMidPassAcrossAgents(t *testing.T) {
+// TestApplyDiff_TopUpFavorsAgentWithFewestActive checks that a refill goes to
+// the agent with the fewest active PDs, not to the first agent in ID order.
+func TestApplyDiff_TopUpFavorsAgentWithFewestActive(t *testing.T) {
 	t.Parallel()
 	s := newTestSchedulerWithConfig(t,
 		[]*wire.ProbingDirective{
@@ -1513,17 +1510,43 @@ func TestApplyDiff_TopUpStopsMidPassAcrossAgents(t *testing.T) {
 		makeModelPD(t, 3, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.3"),
 	}, nil)
 
-	// deficit=1, satisfied entirely by the alphabetically-first agent
-	// ("agent-a") within the first pass; agent-b's supply must be left
-	// untouched rather than also being drawn from in that same pass.
 	if len(s.pdMap) != 2 {
 		t.Fatalf("expected active set at ActiveSetSize (2), got %d", len(s.pdMap))
 	}
-	if _, ok := s.pdMap[2]; !ok {
-		t.Error("expected agent-a's PD (sorted first) to be the one promoted")
+	if _, ok := s.pdMap[3]; !ok {
+		t.Error("expected agent-b's PD to be promoted: it had no active PD")
 	}
-	if len(s.unusedByAgent["agent-b"][0]) != 1 {
-		t.Error("expected agent-b's PD to be left untouched in the unused pool")
+	if len(s.unusedByAgent["agent-a"][0]) != 1 {
+		t.Error("expected agent-a's PD to be left untouched in the unused pool")
+	}
+}
+
+// TestApplyDiff_TopUpRebalancesAgentsAfterExhaustion covers the case where an
+// agent lost active slots: the refill must bring it back level with the others
+// instead of spreading the deficit evenly.
+func TestApplyDiff_TopUpRebalancesAgentsAfterExhaustion(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+		},
+		4, 3, 3) // ActiveSetSize 4, deficit 3
+
+	var diff []*model.ProbingDirective
+	for id := uint64(2); id <= 4; id++ {
+		diff = append(diff, makeModelPD(t, id, "agent-a", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.2"))
+	}
+	for id := uint64(5); id <= 7; id++ {
+		diff = append(diff, makeModelPD(t, id, "agent-b", wire.IPVersion_IP_VERSION_IPV4, "192.0.2.3"))
+	}
+	s.ApplyDiff(diff, nil)
+
+	activeByAgent := make(map[string]int)
+	for _, ps := range s.pdMap {
+		activeByAgent[ps.directive.AgentID]++
+	}
+	if activeByAgent["agent-a"] != 2 || activeByAgent["agent-b"] != 2 {
+		t.Errorf("active per agent = %v, want agent-a 2 and agent-b 2", activeByAgent)
 	}
 }
 
