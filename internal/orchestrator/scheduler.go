@@ -504,7 +504,7 @@ func (s *Scheduler) NextPD(ctx context.Context) *model.ProbingDirective {
 		s.mutex.Unlock()
 		return nil
 	}
-	replacement := s.replacePD(pd)
+	replacement := s.replacePD(pd, false)
 	s.mutex.Unlock()
 
 	s.metrics.PDsReplacedBernoulliTotal.WithLabelValues(pd.directive.AgentID).Inc()
@@ -539,13 +539,20 @@ func (s *Scheduler) waitUntil(ctx context.Context, nextTime time.Time) bool {
 
 // recycleOrEvict returns the PD to the unused pool or permanently evicts it
 // if MaxEvictions has been reached, or if the PD has been marked for removal
-// by a PD diff (see ApplyDiff). Must be called with s.mutex held.
-func (s *Scheduler) recycleOrEvict(pd *pdState) {
+// by a PD diff (see ApplyDiff). Only a replacement caused by consecutive
+// misses (countEviction) counts toward MaxEvictions: a PD replaced by the
+// Bernoulli experiment was throttled, not unproductive. Must be called with
+// s.mutex held.
+func (s *Scheduler) recycleOrEvict(pd *pdState, countEviction bool) {
 	agentID := pd.directive.AgentID
-	if !pd.markedForRemoval && pd.evictionCount < s.config.MaxEvictions {
+	count := pd.evictionCount
+	if countEviction {
+		count++
+	}
+	if !pd.markedForRemoval && (!countEviction || pd.evictionCount < s.config.MaxEvictions) {
 		// The directive was converted once on entry, so this cannot fail for a
 		// PD that came from a file or a diff.
-		u, err := newUnusedPD(pd.directive, pd.evictionCount+1)
+		u, err := newUnusedPD(pd.directive, count)
 		if err == nil {
 			ipVersion := ipIdx(pd.directive.IPVersion)
 			pools := s.unusedByAgent[agentID]
@@ -571,8 +578,10 @@ func (s *Scheduler) recycleOrEvict(pd *pdState) {
 }
 
 // replacePD replaces the given PD in the active set with a random draw from
-// the unused pool for the same agent and protocol. Must be called with s.mutex held.
-func (s *Scheduler) replacePD(pd *pdState) *pdState {
+// the unused pool for the same agent and protocol. countEviction is true when
+// the replacement is caused by consecutive misses (see recycleOrEvict). Must be
+// called with s.mutex held.
+func (s *Scheduler) replacePD(pd *pdState, countEviction bool) *pdState {
 	s.removeImpact(pd.lastHitNearAddress, pd)
 	s.removeImpact(pd.lastHitFarAddress, pd)
 
@@ -594,7 +603,7 @@ func (s *Scheduler) replacePD(pd *pdState) *pdState {
 			slog.String("agent_id", agentID),
 			slog.String("ip_version", ipVersionLabel(pd.directive.IPVersion)))
 		s.randomizer.Remove(pd.directive.ProbingDirectiveID)
-		s.recycleOrEvict(pd)
+		s.recycleOrEvict(pd, countEviction)
 		return nil
 	}
 
@@ -611,7 +620,7 @@ func (s *Scheduler) replacePD(pd *pdState) *pdState {
 	s.metrics.PDsActiveTotal.Inc()
 
 	// Replacement is issued naturally in the next NextPD call via the randomizer.
-	s.recycleOrEvict(pd)
+	s.recycleOrEvict(pd, countEviction)
 
 	return replacement
 }
@@ -895,10 +904,11 @@ func (s *Scheduler) UpdateFromFIE(fie *model.ForwardingInfoElement) error {
 			s.logger.Debug("PD replaced (consecutive misses)",
 				slog.Uint64("pd_id", pd.directive.ProbingDirectiveID))
 			// Return value not used — replacement is issued naturally in the next NextPD call.
-			s.replacePD(pd)
+			s.replacePD(pd, true)
 		}
 	} else {
 		pd.consecutiveMisses = 0
+		pd.evictionCount = 0
 	}
 
 	return nil

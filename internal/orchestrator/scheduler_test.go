@@ -976,6 +976,98 @@ func TestReplacePD_PermanentEviction(t *testing.T) {
 	}
 }
 
+// -- eviction counting ---------------------------------------------------------
+
+// A PD replaced by the Bernoulli experiment was throttled, not unproductive:
+// it must go back to the pool without counting toward MaxEvictions, even when
+// MaxEvictions is 0.
+func TestReplacePD_BernoulliDoesNotCountTowardEviction(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{
+			{ProbingDirectiveId: 1, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.1"},
+			{ProbingDirectiveId: 2, AgentId: "agent-a", IpVersion: wire.IPVersion_IP_VERSION_IPV4, DestinationAddress: "192.0.2.2"},
+		},
+		1, 3, 0)
+
+	var activeID uint64
+	for id := range s.pdMap {
+		activeID = id
+	}
+	s.mutex.Lock()
+	replacement := s.replacePD(s.pdMap[activeID], false)
+	s.mutex.Unlock()
+
+	if replacement == nil {
+		t.Fatal("expected a replacement from the unused pool")
+		return
+	}
+	if _, ok := s.known[activeID]; !ok {
+		t.Error("expected the throttled PD to stay known: it was recycled, not evicted")
+	}
+	pool := s.unusedByAgent["agent-a"][0]
+	if len(pool) != 1 || pool[0].probingDirectiveID != activeID {
+		t.Fatalf("expected the throttled PD back in the pool, got %+v", pool)
+	}
+	if pool[0].evictionCount != 0 {
+		t.Errorf("evictionCount = %d, want 0", pool[0].evictionCount)
+	}
+}
+
+// A miss-driven replacement still counts: with the count at MaxEvictions the
+// PD is permanently evicted.
+func TestReplacePD_MissAtMaxEvictionsEvicts(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t,
+		[]*wire.ProbingDirective{makePDV4(1), makePDV4(2)}, 1, 3, 2)
+
+	var activeID uint64
+	for id := range s.pdMap {
+		activeID = id
+	}
+	s.pdMap[activeID].evictionCount = 2
+
+	s.mutex.Lock()
+	s.replacePD(s.pdMap[activeID], true)
+	s.mutex.Unlock()
+
+	if _, ok := s.known[activeID]; ok {
+		t.Error("expected the PD to be permanently evicted")
+	}
+}
+
+// A PD that yields again starts over: its eviction count goes back to 0.
+func TestUpdateFromFIE_YieldResetsEvictionCount(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t, []*wire.ProbingDirective{makePDV4(1)}, 1, 3, 3)
+	s.pdMap[1].evictionCount = 2
+	s.pdMap[1].consecutiveMisses = 1
+
+	if err := s.UpdateFromFIE(makeFIEFull(1, net.ParseIP("198.51.100.1"), net.ParseIP("198.51.100.2"))); err != nil {
+		t.Fatalf("UpdateFromFIE: %v", err)
+	}
+	if got := s.pdMap[1].evictionCount; got != 0 {
+		t.Errorf("evictionCount = %d, want 0 after a yield", got)
+	}
+	if got := s.pdMap[1].consecutiveMisses; got != 0 {
+		t.Errorf("consecutiveMisses = %d, want 0 after a yield", got)
+	}
+}
+
+// A miss does not reset the count.
+func TestUpdateFromFIE_MissKeepsEvictionCount(t *testing.T) {
+	t.Parallel()
+	s := newTestSchedulerWithConfig(t, []*wire.ProbingDirective{makePDV4(1)}, 1, 3, 3)
+	s.pdMap[1].evictionCount = 2
+
+	if err := s.UpdateFromFIE(makeFIETimeout(1)); err != nil {
+		t.Fatalf("UpdateFromFIE: %v", err)
+	}
+	if got := s.pdMap[1].evictionCount; got != 2 {
+		t.Errorf("evictionCount = %d, want 2 after a single miss", got)
+	}
+}
+
 func TestReplacePD_PoolExhausted(t *testing.T) {
 	t.Parallel()
 	// Active set: pd1 only, no unused pool.
@@ -1098,7 +1190,7 @@ func TestApplyDiff_TombstonedActivePDIsPermanentlyEvicted(t *testing.T) {
 
 	// Simulate pd1's next natural replacement cycle.
 	s.mutex.Lock()
-	s.replacePD(pd1)
+	s.replacePD(pd1, true)
 	s.mutex.Unlock()
 
 	if _, ok := s.pdMap[1]; ok {
@@ -1238,7 +1330,7 @@ func TestApplyDiff_PDsTotalTracksDiff(t *testing.T) {
 
 	// ...only its eviction does.
 	s.mutex.Lock()
-	s.replacePD(s.pdMap[1])
+	s.replacePD(s.pdMap[1], true)
 	s.mutex.Unlock()
 	if got := testutil.ToFloat64(s.metrics.PDsTotal); got != 2 {
 		t.Errorf("expected PDsTotal 2 after pd1's eviction, got %v", got)
@@ -2048,7 +2140,7 @@ func TestNextPD_StalePDDuringWait(t *testing.T) {
 	// would have.
 	time.Sleep(20 * time.Millisecond)
 	s.mutex.Lock()
-	s.replacePD(s.pdMap[1])
+	s.replacePD(s.pdMap[1], true)
 	s.mutex.Unlock()
 
 	if pd := <-resultCh; pd != nil {
@@ -2369,7 +2461,7 @@ func TestKnown_ReleasedOnPermanentEviction(t *testing.T) {
 	}
 
 	s.mutex.Lock()
-	replacement := s.replacePD(s.pdMap[activeID])
+	replacement := s.replacePD(s.pdMap[activeID], true)
 	s.mutex.Unlock()
 
 	if replacement == nil {
@@ -2400,14 +2492,14 @@ func TestReplacePD_RecycledPDRoundTripsThroughPool(t *testing.T) {
 	}
 
 	s.mutex.Lock()
-	second := s.replacePD(s.pdMap[first]) // first is recycled into the pool
+	second := s.replacePD(s.pdMap[first], true) // first is recycled into the pool
 	s.mutex.Unlock()
 	if second == nil {
 		t.Fatal("expected a replacement")
 	}
 
 	s.mutex.Lock()
-	back := s.replacePD(second) // second is replaced by the recycled first
+	back := s.replacePD(second, true) // second is replaced by the recycled first
 	s.mutex.Unlock()
 	if back == nil {
 		t.Fatal("expected the recycled PD to be drawn again")
@@ -2536,7 +2628,7 @@ func TestRecycleOrEvict_EvictsPDThatCannotBePacked(t *testing.T) {
 	s.known[99] = struct{}{}
 
 	s.mutex.Lock()
-	s.recycleOrEvict(pd)
+	s.recycleOrEvict(pd, true)
 	s.mutex.Unlock()
 
 	if _, ok := s.known[99]; ok {
